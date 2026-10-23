@@ -1,0 +1,384 @@
+/*
+ * M0 的样式是刻意"朴素"的。
+ *
+ * 但 token 结构现在就按架构文档 ADR-006 的三层建好：
+ *   L1 Primitive（物理色值） → L2 Semantic（语义） → 组件直接消费 L2
+ * 因为写死 `#2563eb` 的地方，以后换主题要一个个改；
+ * 而写 `var(--ki-accent)` 的地方，加主题只是覆盖一层变量。
+ * Tailwind 在 M2 接入，届时这套变量原封不动地变成 @theme。
+ */
+
+:root {
+  /* L1 · Primitive */
+  --ki-slate-50: #fafafa;
+  --ki-slate-100: #f4f4f5;
+  --ki-slate-200: #e4e4e7;
+  --ki-slate-400: #a1a1aa;
+  --ki-slate-500: #71717a;
+  --ki-slate-700: #3f3f46;
+  --ki-slate-900: #18181b;
+  --ki-blue-500: #2563eb;
+  --ki-blue-50: #eff6ff;
+  --ki-amber-600: #d97706;
+  --ki-red-600: #dc2626;
+
+  /* L2 · Semantic */
+  --ki-bg-canvas: #ffffff;
+  --ki-bg-surface: var(--ki-slate-50);
+  --ki-bg-hover: var(--ki-slate-100);
+  --ki-bg-active: var(--ki-blue-50);
+  --ki-text-primary: var(--ki-slate-900);
+  --ki-text-muted: var(--ki-slate-500);
+  --ki-text-faint: var(--ki-slate-400);
+  --ki-border-subtle: var(--ki-slate-200);
+  --ki-accent: var(--ki-blue-500);
+
+  --ki-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --ki-font-mono: ui-monospace, 'Cascadia Code', Consolas, 'Microsoft YaHei Mono', monospace;
+
+  color-scheme: light;
+  font-family: var(--ki-font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ki-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--ki-bg-canvas);
+}
+
+/* ───────────────────────── 布局 ───────────────────────── */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 48px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-surface);
+  flex: 0 0 auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.brand__mark {
+  color: var(--ki-accent);
+  font-size: 16px;
+}
+
+.brand__name {
+  font-size: 14px;
+}
+
+.brand__tag {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--ki-slate-200);
+  color: var(--ki-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.topbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.stats {
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+  color: var(--ki-text-muted);
+  white-space: nowrap;
+}
+
+.btn {
+  padding: 6px 14px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 6px;
+  background: var(--ki-bg-canvas);
+  color: var(--ki-text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--ki-bg-hover);
+  border-color: var(--ki-slate-400);
+}
+
+.btn:disabled {
+  color: var(--ki-text-faint);
+  cursor: progress;
+}
+
+.banner {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  border-bottom: 1px solid var(--ki-border-subtle);
+}
+
+.banner--error {
+  background: #fef2f2;
+  color: var(--ki-red-600);
+}
+
+.banner--warn {
+  background: #fffbeb;
+  color: var(--ki-amber-600);
+}
+
+.workspace {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ───────────────────────── 侧栏 ───────────────────────── */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  flex: 0 0 300px;
+  min-height: 0;
+  border-right: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-surface);
+}
+
+.sidebar__root {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  font-family: var(--ki-font-mono);
+  font-size: 10px;
+  color: var(--ki-text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0 24px;
+}
+
+.sidebar__placeholder {
+  padding: 24px 16px;
+  color: var(--ki-text-muted);
+  font-size: 13px;
+}
+
+.sidebar__placeholder p {
+  margin: 0 0 8px;
+}
+
+.sidebar__empty {
+  padding: 12px 16px;
+  color: var(--ki-text-muted);
+  font-size: 12px;
+}
+
+/* ───────────────────────── 树 ───────────────────────── */
+
+.tree-branch {
+  display: contents;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 4px 10px 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ki-text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tree-row:hover {
+  background: var(--ki-bg-hover);
+}
+
+.tree-row.is-active {
+  background: var(--ki-bg-active);
+  color: var(--ki-accent);
+  font-weight: 500;
+}
+
+.tree-caret {
+  flex: 0 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ki-text-faint);
+  font-size: 9px;
+  transition: transform 120ms ease;
+}
+
+.tree-caret.is-open {
+  transform: rotate(90deg);
+}
+
+.tree-caret--placeholder {
+  visibility: hidden;
+}
+
+.tree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-row--dir .tree-label {
+  font-weight: 500;
+}
+
+.tree-count {
+  margin-left: auto;
+  padding-left: 8px;
+  color: var(--ki-text-faint);
+  font-family: var(--ki-font-mono);
+  font-size: 10px;
+}
+
+/* ───────────────────────── 内容区 ───────────────────────── */
+
+.content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+.viewer {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.viewer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex: 0 0 auto;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  font-size: 12px;
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--ki-text-muted);
+}
+
+.breadcrumb__sep {
+  margin: 0 4px;
+  color: var(--ki-text-faint);
+}
+
+.viewer__meta {
+  flex: 0 0 auto;
+  font-family: var(--ki-font-mono);
+  font-size: 10px;
+  color: var(--ki-text-faint);
+}
+
+.viewer__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 24px;
+  overflow: auto;
+  font-family: var(--ki-font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  tab-size: 2;
+}
+
+/* ───────────────────────── 欢迎页 ───────────────────────── */
+
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 auto;
+  gap: 12px;
+  padding: 40px;
+  text-align: center;
+  color: var(--ki-text-muted);
+}
+
+.welcome__mark {
+  font-size: 40px;
+  color: var(--ki-accent);
+  opacity: 0.5;
+}
+
+.welcome h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--ki-text-primary);
+  letter-spacing: 0.5px;
+}
+
+.welcome p {
+  max-width: 420px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--ki-text-faint);
+}

@@ -1,0 +1,63 @@
+# ==============================================================================
+# KnowIsle — 忽略规则
+#
+# 唯一原则：只忽略「可以重新生成的产物」和「本机私有的状态」。
+# 凡是「重建它需要网络、需要另一台机器、或者根本重建不出来」的东西，一律入库。
+#
+# 因此 Cargo.lock 与 pnpm-lock.yaml 是刻意提交的 —— 这是应用不是库，
+# 锁文件是构建可复现性的一部分，不是噪音。
+# ==============================================================================
+
+# ---------- Node / 前端构建产物 ----------
+# 无前导斜杠的目录名在任意层级生效，apps/desktop/node_modules 一并覆盖。
+node_modules/
+dist/
+.vite/
+.turbo/
+.cache/
+*.log
+
+# ---------- Rust / Cargo ----------
+# 同时覆盖 cargo workspace 根 target/ 与 apps/desktop/src-tauri/target/。
+# 这个目录能到 5GB+，漏掉一条就会把几万个 .o/.rlib 灌进 object database。
+target/
+
+# ---------- Tauri 生成物 ----------
+# 由 `tauri dev` / `tauri build` 从 capabilities 推导出的 ACL schema，
+# 每次启动都会重写，提交进来只会制造无意义的 diff。
+**/src-tauri/gen/schemas/
+
+# ---------- 项目私有元数据 ----------
+# .knowisle/ 是运行时数据目录（索引库、缓存、快照），可由 Markdown 重建。
+# .workbuddy/ 与 .workbuddy-ai/ 是 AI 协作工具的本地状态与记忆，
+# 两个名字都写，防止将来改名后漏网。
+.knowisle/
+.workbuddy/
+.workbuddy-ai/
+
+# ---------- 本地临时验证 ----------
+# CDP 调试脚本、截图、临时 Vault。属于「我这台机器此刻的现场」，不入库。
+.tmp/
+
+# ---------- 密钥与本地环境（防御性） ----------
+# 当前仓库内没有任何此类文件；这几行是为了将来第一次误提交之前就挡住。
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 编辑器 ----------
+# 注意必须写 .vscode/* 而不是 .vscode/ ：
+# 忽略整个目录后，后面的 ! 例外规则将无法生效。
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/

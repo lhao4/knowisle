@@ -1,0 +1,8 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# Windows 下创建目录符号链接需要开发者模式或管理员权限。
+# hoisted 布局用真实目录代替 symlink，代价是失去 pnpm 的严格隔离，
+# 换来"在任何 Windows 机器上 pnpm install 都不会静默失败"。
+nodeLinker: hoisted

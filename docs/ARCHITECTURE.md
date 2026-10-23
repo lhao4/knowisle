@@ -1,0 +1,1705 @@
+# 知屿 KnowIsle · 技术架构与选型决策文档
+
+> **把知识，安放在自己的岛上。**
+>
+> 文档编号：KI-ARCH-001
+> 状态：**Accepted（已冻结，变更需新增 ADR 并废弃本条）**
+> 适用版本：v0.1 ~ v1.x
+> 最后更新：2026-10-23
+
+---
+
+## 0. 阅读指南
+
+本文不是"技术栈罗列"，而是一份**决策记录**。每一条选型都必须回答三个问题：
+
+1. **在什么约束下做的这个决定？**（Context）
+2. **我们选了什么，为什么是它而不是别的？**（Decision）
+3. **这个决定的代价是什么，我们准备怎么还这笔债？**（Consequences）
+
+没有代价的技术选型是幻觉。凡是本文写"坚决不选"的方案，都不是因为它差，而是因为**它与本项目的某条硬约束结构性冲突**——换句话说，在另一个项目里它可能是正确答案。
+
+### 0.1 五条架构公理（不可协商）
+
+这五条是后面所有 ADR 的推导前提。任何 PR 违反其中一条，直接打回，不需要讨论。
+
+| # | 公理 | 推论 |
+|---|------|------|
+| **A1** | **磁盘上的 Markdown 是唯一真相源。** | 数据库是可随时删除重建的派生索引。任何"只存在 DB 里"的用户内容都是 Bug。 |
+| **A2** | **核心逻辑不依赖 UI。** | `isle` CLI 与 GUI 共享同一个 `ki-core`。core 层代码里不允许出现 `tauri::` 字样。 |
+| **A3** | **编辑态与渲染态是两条独立管线。** | 编辑用 CodeMirror，渲染用 remark/rehype，二者永不互相污染。 |
+| **A4** | **启动关键路径上不允许出现任何插件代码。** | 冷启动只加载"打开一篇笔记"所需的最小闭包。 |
+| **A5** | **所有写操作必须原子且可自愈。** | `tmp → fsync → rename`；崩溃后能靠日志与哈希校验回到一致状态。 |
+
+> 这五条公理的解释：我们卖的不是功能，是**"你的知识不会因为我们的 Bug 而消失"**。这是本地优先产品的全部信誉所在。功能可以少，数据不能丢。
+
+---
+
+## 1. 技术选型对比与决策（ADR）
+
+### ADR-001 · 桌面框架：Tauri 2.0
+
+#### Context
+
+需求里同时出现了三个互相拉扯的约束：
+
+- **本地优先** → 大量文件 IO、全文索引、Git 操作，全部在本地完成，不能靠"转发给 Node 再说"。
+- **多窗口同时编辑预览** → 每个窗口都是一份独立 WebView 实例，框架的边际内存成本被放大 N 倍。
+- **内置一键运行代码** → 需要 spawn 子进程、限制资源、超时杀进程树、捕获 stdout/stderr 流。这是**操作系统级能力**，不是 Web 能力。
+
+#### 对比
+
+| 维度 | Tauri 2.0 | Electron 38 | 权重 |
+|------|-----------|-------------|------|
+| 安装包体积 | **8–15 MB** | 90–150 MB | 中 |
+| 空载常驻内存（Win11） | **~90–140 MB** | ~180–300 MB | 高 |
+| 多窗口边际成本 | 低（共享系统 WebView 进程池） | 高（每窗口 +60~90 MB） | **极高** |
+| 文件 IO / 索引吞吐 | Rust 原生，SQLite 同进程，零序列化 | Node 侧，跨进程转发 | 高 |
+| 进程管控能力（跑代码） | Rust：Job Object / rlimit / PTY / 进程树 kill / cgroup | Node `child_process`，权限模型薄弱，难以做资源限额 | **极高** |
+| WebView 渲染一致性 | **碎片化**：WebView2 / WKWebView / WebKitGTK 三套内核 | 自带 Chromium，像素级一致 | 高（负分） |
+| 调试与排错体验 | 较差（Rust ↔ JS 双层栈，WebView 差异） | 优秀（一套 DevTools 走天下） | 中 |
+| 生态成熟度 | 中（插件数量少，但 2.0 后补齐了 updater/fs/sql 等刚需） | 极高 | 中 |
+| 团队上手成本 | 陡（Rust + 生命周期 + 跨语言错误处理） | 平（纯 JS） | 中 |
+| 长期维护风险 | 中（依赖各平台 WebView 演进） | 低（自控 Chromium） | 中 |
+
+#### Decision
+
+**选用 Tauri 2.0。Rust 作为唯一的核心运行时，前端只做视图。**
+
+核心理由不是"包小"（那只是营销数字），而是这一条：
+
+> **"一键运行代码"要求我们成为进程的所有者（process owner），而不是进程的调用者（caller）。**
+
+Electron 里跑用户代码，你能拿到的是 `spawn()` 返回的一个 pid。想限制它只能用 256MB 内存？想让它 10 秒后连同所有子孙进程一起死？想给它一个干净的 PID namespace？在 Node 里你要么依赖第三方 native addon，要么放弃。而在 Rust 里，`tokio::process` + Windows Job Object / Unix `setrlimit` + `process_group(0)` + `killpg` 是标准库级别的能力，写出来不到 200 行，且**可以在 CI 里被单元测试覆盖**。
+
+第二个理由：本地优先产品的性能天花板由**索引器**决定。10 万篇笔记的首次索引、增量重建、FTS5 写入，走 Rust + `rusqlite` 是纯内存操作；走 Electron 则要跨越 `renderer → main → native` 三跳，每跳一次结构化克隆。这不是优化问题，是架构问题。
+
+#### Consequences（代价与偿还计划）
+
+| 代价 | 缓解措施 |
+|------|----------|
+| **WebView 碎片化**：WebKitGTK 在 Linux 上对新 CSS 特性支持滞后 6–18 个月 | ① 明确支持矩阵：Windows 10 1809+ / macOS 12+ / Ubuntu 22.04+（WebKitGTK 4.1）。② CI 三平台跑 Playwright 视觉回归。③ 建立"基线特性白名单"，禁用 `:has()`、`subgrid`、`@container style()` 等非全平台特性，由 ESLint 插件静态拦截。 |
+| Rust 开发效率低于 TS | 严格分层：Rust 只写"IO + 算法 + 状态机"，绝不写业务 UI 逻辑。领域层 `ki-core` 保持纯函数风格，测试覆盖率要求 ≥ 85%。 |
+| 双语言调试成本 | 统一错误模型：Rust 侧 `KiError` 序列化为 tagged union，前端拿到 `code` 而非解析 message。所有跨语言调用在 `tauri-specta` 生成的类型约束下编译期校验。 |
+| 插件生态贫瘠 | 不依赖 Tauri 官方插件做业务，只用作外壳（updater / single-instance / global-shortcut）。业务能力全部自建。 |
+
+#### 坚决不选
+
+- ❌ **Electron** —— 不是因为"它慢"，而是因为它的内存模型与"多窗口 + 常驻后台索引"直接冲突；且进程管控能力不足以支撑可信的代码执行沙箱。
+- ❌ **Flutter Desktop** —— 自绘 UI 意味着整个 Markdown 渲染、文本选择、输入法（IME）组合、无障碍全部要重写。中文输入法在自绘引擎里是长期流血点。
+- ❌ **纯 Web + PWA** —— 无法访问文件系统目录、无法跑代码、无法做真正的 Git。与"本地优先"根本矛盾。
+- ❌ **Wails / Neutralino** —— 同类但生态与 2.0 之后的工程化程度（updater、移动端、权限模型）明显落后。
+
+---
+
+### ADR-002 · 前端框架：React 19
+
+#### Context
+
+一个反直觉的事实：**这个项目 70% 的前端复杂度不在"写 UI"，而在"托管别人的重型 UI"**。
+
+画板、思维导图、电子表格、PDF 标注——这四个都是"轮子已经造好了，你只需要把它塞进来并且别让它把主程序搞崩"的典型场景。选框架的第一优先级不是"谁的运行时更快"，而是**"谁能让这些重型库以最小摩擦落地"**。
+
+#### 对比
+
+| 维度 | React 19 | Vue 3.5 | Svelte 5 |
+|------|----------|---------|----------|
+| 重型可视化库一等公民支持 | **Excalidraw / tldraw / xyflow(React Flow) / Univer(表格) 全部 React 原生** | 需社区 wrapper，版本滞后 | 需 wrapper 或 iframe 隔离 |
+| 细粒度更新模型 | 需手动（编译器 + 状态外置） | Proxy 响应式，自动依赖收集 | 编译期信号，最优 |
+| 首屏运行时体积（gzip） | ~45 KB | ~34 KB | ~10 KB |
+| 与 CodeMirror 6 的集成范式 | 命令式桥接（`useRef` + `EditorView`），模式成熟稳定 | 成熟 | 成熟 |
+| 大列表 / 虚拟滚动 | TanStack Virtual 一等 | 有 | 有 |
+| 生态广度（a11y、dnd、图表、表单） | 最大 | 大 | 小 |
+| 招聘 / 贡献者池 | 最大 | 大 | 小 |
+| 长期演进风险 | 中（RSC 方向有分歧，但 SPA 路线稳定） | 低 | 中（团队规模小，Svelte 5 迁移刚完成） |
+
+#### Decision
+
+**选用 React 19 + TypeScript 5.x，SPA 模式（不使用 RSC / SSR）。**
+
+决定性理由：**`Excalidraw`、`tldraw`、`xyflow`、`Univer` 这四个库，构成了我们"高级组件"需求的 80%。它们都是 React 原生实现，且内部深度依赖 React 的调度与 Portal 机制。** 在 Vue/Svelte 里用它们，你要么等社区 wrapper（滞后 6–12 个月，且遇到 bug 无人修），要么用 iframe 隔离（跨 iframe 的剪贴板、拖拽、焦点管理是地狱）。
+
+而 React 的已知短板——"re-render 太多"——在我们这个场景里有一个**结构性解法**：
+
+> **编辑器文档状态永不进入 React 状态树。**
+
+CodeMirror 的 `EditorState` 是它自己的响应式系统，输入一个字符只触发它内部的 transaction，与 React 的调和完全无关。React 只负责"渲染编辑器外壳"（工具栏、状态栏、标签页），而这些组件的更新频率是**秒级**而非**毫秒级**。我们不需要 React 快，我们只需要它**别挡路**。
+
+#### Consequences
+
+| 代价 | 缓解措施 |
+|------|----------|
+| 默认 re-render 策略粗放 | ① 三条硬规则：编辑器内容不进 React；滚动/拖拽/光标位置用 `ref` + 订阅；跨组件高频通信走外部 store 的 `subscribe` 而非 context。② CI 引入 React DevTools Profiler 基线，PR 触发 render 次数回归检测。 |
+| 包体积大于 Svelte | 路由级 + 插件级 code split；主 chunk 预算 350KB（gzip），CI 卡口。 |
+| `useEffect` 心智负担 | 用 TanStack Query 接管所有异步 IPC（不再手写 `useEffect` 做数据获取），用 Zustand 接管全局状态，把 `useEffect` 的用途压缩到"DOM 副作用"一类。 |
+
+#### 坚决不选
+
+- ❌ **Vue 3** —— 语言本身更优雅，但在"重型第三方库托管"这个决定性维度上，我们要为每个库付一次适配成本。这不划算。
+- ❌ **Svelte 5** —— 运行时最优雅、体积最小。但生态是硬伤：贡献者池小一个数量级，插件作者更可能写 React 版本。
+- ❌ **Next.js / Nuxt / SvelteKit** —— 我们是桌面应用，没有服务端。引入 SSR 框架只为拿到路由和构建，代价是整条 RSC/边缘运行时的心智负担。**用 Vite + React Router（或 TanStack Router）即可。**
+- ❌ **Web Components 作为主架构** —— 样式隔离很香，但状态管理与生态几乎为零，且与 CodeMirror 的命令式 API 配合别扭。仅用于**插件样式隔离**（见 2.4）。
+
+---
+
+### ADR-003 · 编辑器内核：CodeMirror 6
+
+#### Context
+
+这是全项目**最不可逆**的一个决定。编辑器内核决定了：Vim 模式能做到什么程度、10 万字文档能不能流畅、多窗口能不能开得起、Live Preview 能不能实现。
+
+需求给出的三个关键词是：**Vim 支持、Markdown 性能、多窗口**。这三个词已经把答案锁死了，但我们仍然要论证一遍。
+
+#### 对比
+
+| 维度 | CodeMirror 6 | Monaco Editor | ProseMirror |
+|------|--------------|---------------|-------------|
+| 文档模型 | 平衡树（Text rope）+ 增量解析（Lezer） | 行数组 + 全文 tokenizer | Schema 化节点树 |
+| 打开 10 万字 Markdown | **~80 ms** | ~400 ms | ~600 ms+（需全文 parse） |
+| 单实例常驻内存 | **~6–10 MB** | ~60–120 MB | ~30 MB |
+| 10 个实例同时存在 | 可行（~80 MB） | 不可行（~1 GB） | 勉强（~300 MB） |
+| Vim 模式 | **`@replit/codemirror-vim` 一等支持**，与 CM6 事务模型深度整合 | `monaco-vim` 社区维护，长期滞后，与官方 API 打架 | `prosemirror-vim` 残缺，选择/撤销语义不匹配 |
+| 源码即真相 | **天然**（缓冲区就是文本） | 天然 | **需 round-trip，有损** |
+| 所见即所得 | 通过 Decoration / Widget 叠加实现（Live Preview） | 不适合 | 天生擅长 |
+| 包体积（gzip） | **~200 KB**（按需引入语言包） | ~5 MB | ~350 KB |
+| 可扩展性 | 极高（Extension 组合，函数式） | 中（API 面窄，改不动） | 高（但受 Schema 约束） |
+| 多光标 / 折叠 / 搜索 | 内置 | 内置 | 需自行实现 |
+
+#### Decision
+
+**选用 CodeMirror 6 作为唯一的主编辑内核。ProseMirror 仅允许作为插件内部的局部编辑器，永不做主文档模型。**
+
+三条理由，按重要性排序：
+
+**① Markdown 的真相是纯文本，任何"解析成富文本树再序列化回来"的方案都会吃掉用户的东西。**
+
+ProseMirror 的世界观是"文档是一棵有 Schema 的树"。这在富文本里是优点，在 Markdown 里是灾难：frontmatter、HTML 片段、非标准表格、`<details>` 折叠块、注释 `<!-- -->`、行内 LaTeX 边界、缩进敏感的嵌套列表——每一项都要在 Schema 里建模，每一项 round-trip 都可能丢字符或重排空白。
+
+用户打开一篇 Markdown，看到的是他写的样子；保存后文件 diff 应该**只有他改的那几行**。这是本地优先产品的底线（Git 同步直接依赖它，见 3.5）。ProseMirror 做不到这个保证，CodeMirror 6 天然就是。
+
+**② Vim 模式不是"加分项"，是"筛选器"。**
+
+`@replit/codemirror-vim` 是把 Vim 的 keymap 编译成 CM6 的 Transaction 序列，因此 Vim 的 `dG`、`ci"`、宏录制、`.` 重复，都能和 CM6 的撤销栈、多光标、语法高亮正确协同。`monaco-vim` 是外部补丁，很多操作绕过了 Monaco 的编辑模型，导致撤销栈错乱——这是 Vim 用户第一个小时就会发现的问题。
+
+**③ 多窗口是内存问题，而 Monaco 的单位内存成本高一个数量级。**
+
+用户开 6 个窗口对比笔记是常见操作。CM6 每实例 ~8MB，6 个 = 48MB；Monaco 每实例 ~80MB，6 个 = 480MB，还没算 Chromium/WebView 本身。在"多窗口同时编辑预览"这条需求上，Monaco 直接出局。
+
+#### 关键设计：Live Preview 的实现方式
+
+我们不采用"源码模式 / 预览模式"二选一，而是**单缓冲区 + Decoration 叠加**：
+
+```
+EditorState.doc  ← 唯一真相（纯 Markdown 文本）
+       │
+       ├── Lezer Markdown 语法树（增量解析，viewport 优先）
+       │
+       └── Decoration 层：
+             · 标题 → 字号/字重（ViewPlugin）
+             · 图片/表格/公式 → Widget（替换渲染，光标进入时还原为源码）
+             · 语法符号 → 淡化（cursor-line 内高亮，其余隐藏）
+```
+
+核心约束：**Decoration 永远是"视图层投影"，绝不回写文档**。这意味着无论 Live Preview 多花哨，`Ctrl+S` 写出去的一定是用户敲的那个纯文本。这条约束也是 A3 公理的落地形式。
+
+#### Consequences
+
+| 代价 | 缓解措施 |
+|------|----------|
+| 富文本能力需要自己搭 | 建立 `packages/editor` 内部 DSL：`defineBlockRenderer()` 统一注册 Widget，避免每个语法各写一套。表格编辑走"光标进入时切换为轻量 grid 编辑器"的局部方案。 |
+| 大文档的 Decoration 计算可能卡顿 | 严格 viewport 优先：只对可视区 ±2000px 计算 Decoration；超过 500KB 的文档自动降级为"纯源码模式"并提示。 |
+| 没有开箱的 Markdown LSP | 自建 `ki-lint`：基于 Lezer 树做规则检查（死链、重复标题、frontmatter schema 校验），跑在 Worker 里。 |
+
+#### 坚决不选
+
+- ❌ **Monaco** —— 它是"代码编辑器"，不是"知识库编辑器"。5MB 体积、每实例 80MB 内存、Vim 支持残缺，三个硬伤各自致命。
+- ❌ **ProseMirror / Tiptap 作为主内核** —— 会让我们失去"纯文本真相"，进而破坏 Git 同步与用户信任。**Tiptap 允许作为某个插件的内部编辑器**（例如"可视化表格"或"卡片式大纲"），但不允许触碰 `.md` 文件。
+- ❌ **Slate.js** —— 维护活跃度与稳定性不足，文档模型同样是富文本树，问题同 ProseMirror。
+- ❌ **自研 contenteditable 编辑器** —— 这是一条用两年时间重新发现"为什么大家都用现成内核"的路。
+- ❌ **Electron + VS Code 的 Monaco 复用（Theia 路线）** —— 见 ADR-001。
+
+---
+
+### ADR-004 · 本地存储：SQLite + rusqlite（无 ORM）
+
+#### Context
+
+数据库承担三个角色，性质完全不同：
+
+1. **元数据索引**（标题、标签、时间、链接图）→ 关系型，需要 JOIN。
+2. **全文检索**（中文分词！）→ FTS5。
+3. **操作日志 / 历史版本索引** → 追加写，需要事务。
+
+三者都在本地，单进程，单用户。这个场景下 ORM 的价值（屏蔽多数据库差异、团队协作规范、复杂关联加载）几乎全部不成立，而它的成本（编译摩擦、N+1、失控的 SQL、难以使用 SQLite 特有能力）全部成立。
+
+#### 对比
+
+| 方案 | 类型安全 | 迁移 | FTS5 / 自定义分词 | 构建摩擦 | 异步模型 | 结论 |
+|------|----------|------|-------------------|----------|----------|------|
+| **rusqlite + refinery + 手写 Repository** | 手写映射（编译期保证） | refinery 内嵌，随二进制走 | **完全掌控** | **低**（bundled feature，零系统依赖） | 同步（配 `spawn_blocking`） | ✅ **选用** |
+| Diesel | 编译期最强 | 需 `diesel_cli` | 需绕开 DSL 写裸 SQL | 高（宏重、编译慢、错误信息晦涩） | 同步 | ❌ |
+| SeaORM | 运行期 + 部分编译期 | 内置 | 受限（难注册 tokenizer） | 中（被迫引入 tokio 全栈） | 异步 | ❌ |
+| sqlx | 编译期（需 `DATABASE_URL` 或 `.sqlx` 离线缓存） | 需外部工具 | 受限 | **中高**（离线缓存极易与 schema 漂移，贡献者首跑必踩坑） | 异步 | ❌ |
+| Prisma / Drizzle | 优秀 | 优秀 | 不支持 FTS5 自定义分词 | 极高（需要 Node 侧持有 DB） | — | ❌ 架构错位 |
+
+#### Decision
+
+**`rusqlite`（`bundled` feature）+ `refinery` 迁移 + 手写 Repository 层。**
+
+关键考量是**中文全文检索**。FTS5 内置的 `unicode61` 分词器对中文是**按字切分**的——搜"知识库"会命中任何包含"知""识""库"三个字的文档，召回率 100%，准确率接近 0。这是国产知识库产品的头号体验杀手。
+
+我们的方案是**双通道索引**：
+
+```sql
+-- 通道 A：原文 + unicode61（服务英文与代码标识符）
+CREATE VIRTUAL TABLE note_fts USING fts5(
+    title, body, tags,
+    content='',                       -- 外部内容表，不重复存储
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- 通道 B：jieba 预分词后的影子列（服务中文）
+-- body_tokens = "知识 库 本地 优先 架构 设计"
+CREATE VIRTUAL TABLE note_fts_zh USING fts5(
+    title_tokens, body_tokens,
+    content='',
+    tokenize='unicode61'
+);
+```
+
+写入时用 `jieba-rs` 做一次分词（10 万字约 40ms，跑在索引线程池），查询时用同样的分词器处理 query，两条通道结果用 RRF（Reciprocal Rank Fusion）融合排序。
+
+> 为什么不用 FTS5 的 custom tokenizer 接口？因为那要求把 jieba 注册进 SQLite 的 C 层，跨平台编译（尤其 Windows MSVC + wasm 目标）麻烦，且无法在 WASM 版复用。预分词落库是"用存储换简单性"的经典权衡，代价是索引体积 +35%，完全可接受。
+
+#### PRAGMA 基线（不可省略）
+
+```sql
+PRAGMA journal_mode = WAL;        -- 读写并发，崩溃安全
+PRAGMA synchronous = NORMAL;      -- WAL 下足够安全，性能提升 3-5x
+PRAGMA foreign_keys = ON;         -- 默认是 OFF，必须显式开
+PRAGMA busy_timeout = 5000;       -- 避免索引线程与 UI 线程互锁
+PRAGMA temp_store = MEMORY;
+PRAGMA mmap_size = 268435456;     -- 256MB，加速大库顺序读
+PRAGMA cache_size = -65536;       -- 64MB page cache
+```
+
+#### Consequences
+
+| 代价 | 缓解措施 |
+|------|----------|
+| 手写映射样板代码 | 用 `#[derive(FromRow)]` 宏（自研 60 行）+ Repository trait 收敛；每个表只允许一个 Repository 拥有写权限。 |
+| 无编译期 SQL 校验 | 单测里对每个 Repository 跑真实 SQLite（`tempfile` + 内存库），覆盖率 100%；CI 里跑 `EXPLAIN QUERY PLAN` 断言无 `SCAN TABLE`（除 FTS）。 |
+| 同步 API 阻塞 async 运行时 | 所有 DB 调用走 `tokio::task::spawn_blocking`，且使用独立连接池（`r2d2_sqlite`），UI 线程永不直连。 |
+
+#### 坚决不选
+
+- ❌ **任何 ORM** —— 我们的表只有约 15 张，但需要 ATTACH、partial index、FTS5、触发器、自定义排序规则。ORM 在这里是纯负资产。
+- ❌ **JSON 文件存元数据** —— 10k 笔记的元数据 JSON 约 30MB，每次启动全量 parse 要 400ms+，且无法做增量更新。SQLite 就是"结构化的 JSON"，没有理由不用。
+- ❌ **IndexedDB / localStorage 作为主存储** —— 数据在 WebView 的 profile 目录里，用户备份、迁移、跨设备同步全部失控。违反 A1。
+- ❌ **LMDB / RocksDB / sled** —— 键值存储做不了"按标签 + 时间 + 全文"的复合查询，最终还是要建倒排索引，等于重写 SQLite。
+
+---
+
+### ADR-005 · 前端状态管理：Zustand + TanStack Query
+
+#### Context
+
+前端的"状态"其实是五种完全不同的东西，混在一起管理是绝大多数编辑器项目后期失控的根源：
+
+| 状态类型 | 例子 | 更新频率 | 归属 |
+|----------|------|----------|------|
+| 文档状态 | 当前笔记的文本、选区、撤销栈 | 每次击键 | **CodeMirror `EditorState`** |
+| 服务端态 | 笔记列表、标签树、搜索结果 | 秒级 | TanStack Query |
+| 全局 UI 态 | 侧栏展开、当前 tab、命令面板开关 | 秒级 | Zustand |
+| 瞬态交互态 | 拖拽位置、滚动偏移、鼠标坐标 | 每帧 | `ref` + 直接 DOM 操作 |
+| 跨窗口态 | 窗口布局、焦点笔记 | 事件驱动 | Tauri event + 持久化 |
+
+#### Decision
+
+**分层治理，绝不合并成一个 store。**
+
+```ts
+// 1. 文档态：不进 React
+const view = new EditorView({ state: EditorState.create({ doc, extensions }) });
+// React 只持有 ref，永不 setState
+
+// 2. 服务端态：TanStack Query
+const { data: notes } = useQuery({
+  queryKey: ['notes', folderId],
+  queryFn: () => invoke('note::list', { folderId }),
+  staleTime: 30_000,
+});
+
+// 3. 全局 UI 态：Zustand + slice 切分
+export const useUIStore = create<UIState>()(
+  subscribeWithSelector((set) => ({ /* ... */ }))
+);
+
+// 4. 高频瞬态：ref + 订阅，零 re-render
+useEffect(() => view.scrollDOM.addEventListener('scroll', onScroll, { passive: true }), []);
+```
+
+**关键设计：core → UI 的单向事件流。** Rust 侧任何状态变更（文件被外部修改、索引完成、Git 同步进度）通过 `emit` 推送，前端在 `main.tsx` 里统一订阅，路由到 Query 的 `invalidateQueries` 或 Zustand 的 action。**前端不做轮询。**
+
+#### 坚决不选
+
+- ❌ **Redux Toolkit** —— 样板代码与"服务端态"的缺失，让我们要手写缓存、失效、重试。2026 年了，不该再手写这些。
+- ❌ **MobX** —— 隐式依赖追踪在**多人插件**场景下不可控：插件的 observable 会意外触发宿主的 reaction，且难以在错误边界里回滚。
+- ❌ **Jotai / Recoil** —— 原子化在表单场景很美，在文档级应用里会退化成"一张全局变量表 + 隐式依赖图"，调试成本高于收益。
+- ❌ **Context 传递高频状态** —— Context 变更会让整棵子树重渲染，这是 React 性能事故的第一大来源。
+- ❌ **把编辑器内容放进任何 React store** —— 违反则直接导致每次击键全树重渲染。这是 Code Review 的红线。
+
+---
+
+### ADR-006 · 样式与主题：Tailwind CSS v4 + 三层 Design Token
+
+#### Context
+
+"主题自定义"这条需求，本质要求是：**在不重新编译、不重启的前提下，让整个应用（包括第三方插件）换一套视觉。**
+
+这排除了所有"编译期固化颜色"的方案。
+
+#### 对比
+
+| 方案 | 运行时换肤 | 与插件隔离 | 体积/性能 | 开发效率 | 结论 |
+|------|-----------|-----------|-----------|----------|------|
+| **Tailwind v4 + CSS Variables** | ✅ 改 `:root` 变量即可 | ✅ Shadow DOM 内注入 token 副本 | 优秀（原子类，purge 后极小） | 高 | ✅ **选用** |
+| CSS-in-JS（Emotion / styled-components） | ✅ | ⚠️ 与 Shadow DOM 冲突 | 差（运行时样式计算，每 keystroke 生成类名） | 中 | ❌ |
+| SCSS + 变量 | ❌ 编译期固化 | — | 优秀 | 中 | ❌ |
+| UnoCSS | ✅ | ✅ | 优秀 | 高（但预设生态小于 Tailwind） | ⚠️ 备选 |
+| 纯 CSS Modules | ✅（变量） | ✅ | 优秀 | 中 | ⚠️ 可与 Tailwind 并用 |
+
+#### Decision
+
+**Tailwind CSS v4（CSS-first 配置）+ 三层 Design Token 体系。**
+
+```css
+/* L1 · Primitive：物理色板，永不被组件直接引用 */
+:root {
+  --ki-blue-500: oklch(0.62 0.19 254);
+  --ki-slate-900: oklch(0.21 0.02 258);
+}
+
+/* L2 · Semantic：语义层，主题只覆写这一层 */
+:root, [data-theme="light"] {
+  --ki-bg-canvas: var(--ki-slate-50);
+  --ki-bg-surface: #fff;
+  --ki-text-primary: var(--ki-slate-900);
+  --ki-text-muted: var(--ki-slate-500);
+  --ki-border-subtle: oklch(0.92 0.005 258);
+  --ki-accent: var(--ki-blue-500);
+}
+
+[data-theme="dark"] {
+  --ki-bg-canvas: oklch(0.18 0.015 258);
+  --ki-bg-surface: oklch(0.22 0.015 258);
+  --ki-text-primary: oklch(0.95 0.005 258);
+  --ki-text-muted: oklch(0.66 0.01 258);
+}
+
+/* L3 · Component：组件级微调，允许主题精细控制 */
+:root {
+  --ki-editor-cursor: var(--ki-accent);
+  --ki-editor-selection: oklch(0.62 0.19 254 / 0.18);
+  --ki-sidebar-item-active-bg: oklch(0.62 0.19 254 / 0.10);
+}
+```
+
+Tailwind v4 的 `@theme` 直接映射到 CSS 变量，因此：
+
+```html
+<div class="bg-[var(--ki-bg-surface)] text-[var(--ki-text-primary)]">
+```
+
+**主题 = 一份 JSON，只覆写 L2/L3。**
+
+```ts
+export interface ThemeDefinition {
+  id: string;                       // "ki.solarized-dark"
+  name: string;                     // "Solarized Dark"
+  base: 'light' | 'dark';           // 决定原生控件（滚动条、菜单）的明暗
+  tokens: Partial<Record<`--ki-${string}`, string>>;
+  syntax?: Record<string, string>;  // CodeMirror 高亮色
+}
+```
+
+应用主题 = 注入一个 `<style id="ki-theme">` + 设置 `data-theme` 属性。**零重载，零重编译。**
+
+**插件样式隔离**：插件渲染在 Shadow DOM 内，宿主在 `shadowRoot` 上注入一份 token 的 CSS 变量副本。插件用 `var(--ki-*)` 就自动跟随主题；想绕过则自己写死颜色（后果自负）。这比 `iframe` 轻，比 `scoped CSS` 强。
+
+#### 坚决不选
+
+- ❌ **CSS-in-JS** —— 运行时样式计算在"多窗口 × 多编辑器实例 × 每次击键"的组合下是灾难；且与 CodeMirror 直接操作 DOM 的生命周期冲突。
+- ❌ **SCSS 变量做主题** —— 编译期固化，无法运行时切换。SCSS 可以用于**构建期的 mixin 复用**，但不承担主题职责。
+- ❌ **Ant Design / MUI 作为主 UI 库** —— 它们的样式体系自带强主张（主题变量、组件结构），与"深度自定义 + 插件生态"冲突。改用 **Radix UI（headless）+ 自研样式**，只借无障碍与交互逻辑。
+- ❌ **`styled-jsx` / Vue SFC scoped 思路** —— 与 React 生态和 Shadow DOM 都不合。
+
+---
+
+### 1.7 选型边界总表
+
+这张表是本文档的**执行摘要**。任何偏离此表的 PR 需要先改这张表。
+
+| 领域 | ✅ 我们选了什么 | ❌ 我们坚决不选什么 |
+|------|----------------|---------------------|
+| 桌面壳 | Tauri 2.0（Rust 核心 + 系统 WebView） | Electron、Flutter Desktop、PWA、Wails |
+| 前端框架 | React 19 + TypeScript，Vite 构建，SPA | Vue、Svelte、Next.js/Nuxt、Web Components 主架构 |
+| 路由 | TanStack Router（类型安全，无服务端） | React Router 的 data loader 模式、任何 SSR 方案 |
+| 编辑内核 | CodeMirror 6（唯一主内核） | Monaco、ProseMirror/Tiptap 主内核、Slate、自研 contenteditable |
+| 文档模型 | 纯 Markdown 文本 + Lezer 增量语法树 | 富文本节点树、任何有损 round-trip 方案 |
+| 本地库 | SQLite（rusqlite bundled）+ WAL + FTS5 | 任何 ORM、IndexedDB 主存储、LMDB/RocksDB、JSON 文件元数据 |
+| 迁移 | refinery（编译期内嵌 SQL） | 运行时下载迁移脚本、`diesel_cli` |
+| 中文分词 | jieba-rs 预分词 + FTS5 双通道 + RRF 融合 | 仅用 unicode61（中文召回失准）、Elasticsearch（杀鸡用牛刀） |
+| 前端状态 | Zustand（UI 态）+ TanStack Query（IPC 态）+ CM6 EditorState（文档态） | Redux、MobX、Jotai/Recoil、Context 传高频状态 |
+| 样式 | Tailwind v4 + 三层 CSS 变量 Token | CSS-in-JS、SCSS 变量主题、Ant Design/MUI 主库 |
+| UI 原语 | Radix UI（headless）+ 自研样式 | 任何带强视觉主张的组件库 |
+| 渲染管线 | remark/rehype → HTML → 沙箱 iframe；Paged.js 分页 | 编辑器内直接渲染 PDF、html2canvas/jsPDF |
+| PDF 导出 | 隐藏 WebView 打印 API / Paged.js + 平台原生 PDF | 前端 canvas 截图、Electron 打印依赖 |
+| Git 实现 | `git2`（libgit2），设备分支 + 三方合并 | `gitoxide`（merge 支持不全，暂缓）、shell 调用 `git` 二进制（跨平台与错误处理差） |
+| 插件运行时 | L0 React.lazy / L1 Extism(WASM) / L2 Sidecar | 任意执行未签名 JS 插件、`eval`、主进程内 `require` |
+| 测试 | Vitest + Playwright + `cargo test` + 三平台 CI 视觉回归 | 只测 happy path、只在单平台 CI |
+| 包管理 | pnpm workspace + Cargo workspace | npm/yarn（monorepo 性能差）、单一巨型 crate |
+
+### 1.8 版本矩阵（基线）
+
+| 组件 | 版本 | 锁定理由 |
+|------|------|----------|
+| Rust | 1.82+ (edition 2021) | `async fn in trait` 稳定 |
+| Tauri | 2.x | 2.0 的 IPC 重写带来 3–5x 大 payload 提升 |
+| React | 19.x | `use()` + Actions，配合 TanStack Query |
+| TypeScript | 5.6+ | 类型收窄与 `satisfies` |
+| CodeMirror | 6.x (`@codemirror/*` 各自最新) | 无版本锁定，语义化发布稳定 |
+| Tailwind CSS | 4.x | CSS-first 配置，`@theme` 直连变量 |
+| SQLite | 3.45+（rusqlite bundled） | `jsonb_*` 与 FTS5 稳定 |
+| Node | 22 LTS | 构建工具链 |
+
+---
+
+## 2. 系统架构设计
+
+### 2.1 分层模型：六边形 + 端口适配
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  适配器层 (Adapters)                                         │
+│  ├─ apps/desktop  → Tauri Commands（GUI 的唯一入口）          │
+│  ├─ crates/ki-cli → isle 子命令（终端 / CI 的唯一入口）        │
+│  └─ apps/web      → 未来：只读分享页（同一套 core）            │
+├─────────────────────────────────────────────────────────────┤
+│  应用层 (Application / Use Cases)                            │
+│  NoteService · SearchService · SyncService · PluginHost      │
+│  —— 编排事务、发领域事件、做权限校验，不含 UI 概念             │
+├─────────────────────────────────────────────────────────────┤
+│  领域层 (Domain · ki-core)                                   │
+│  Note · Vault · Link · Tag · Asset · Conflict                │
+│  —— 纯 Rust，无 IO，无 async，无 tauri。可被 100% 单测        │
+├─────────────────────────────────────────────────────────────┤
+│  基础设施层 (Infrastructure)                                 │
+│  ki-store(SQLite) · ki-vault(fs+watcher) · ki-git            │
+│  ki-search(FTS5) · ki-render · ki-plugin(WASM)               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**依赖方向严格单向向内。** `ki-core` 的 `Cargo.toml` 里不允许出现 `tauri`、`tokio`、`rusqlite`、`git2`。这条规则由 CI 的 `cargo-deny` + 自定义脚本强制检查——**架构约束必须是可执行的，否则它只是文档里的一句话。**
+
+为什么值得这样拆？因为 `isle` CLI 不是"顺便做的命令行工具"，它是**架构健康度的探针**：
+
+```bash
+isle note list --tag rust --since 7d
+isle search "本地优先" --json | jq '.[].path'
+isle export --format pdf --out ./dist
+isle sync --dry-run
+```
+
+如果 CLI 能实现全部核心能力而不碰 GUI 代码，说明领域层是真的解耦了。如果某天发现"这个功能只能在 GUI 里做"，那一定是架构被侵蚀了。
+
+### 2.2 本地优先（Local-First）的工程实现
+
+"本地优先"不是"数据存在本地"这么廉价。它是一组**可验证的工程约束**：
+
+| 约束 | 验证方式 |
+|------|----------|
+| 断网可用 | CI 在 `--offline` 网络命名空间下跑完整 E2E |
+| 无账号可用 | 首次启动不出现任何登录/注册界面 |
+| 数据可迁移 | `isle export --raw` 产出纯文件树，无专有格式 |
+| 索引可重建 | 删除 `index.sqlite` 后功能完整，仅首次搜索变慢 |
+| 崩溃不丢数据 | 随机 `kill -9` 注入测试（`cargo test --features chaos`） |
+
+#### 写路径（Write Path）
+
+```
+① UI 意图
+   invoke('note::save', { noteId, content })
+        │
+② 校验（core）
+   · 路径规范化，拒绝 `..` 穿越与符号链接逃逸
+   · 大小上限（默认 50MB）、编码校验（必须是合法 UTF-8）
+   · 乐观并发：比对传入的 baseHash 与磁盘当前 hash
+        │
+③ 原子落盘（ki-vault）
+   write(.knowisle/tmp/<uuid>.md)
+   fsync(file) → rename(tmp, target) → fsync(parent_dir)
+        │
+④ 事务化记账（ki-store，单事务）
+   UPDATE note SET content_hash, size, mtime, updated_at
+   INSERT INTO oplog(op, note_id, payload, device_id, ts)
+        │
+⑤ 广播
+   emit('note://saved', { noteId, hash, mtime })
+        │
+⑥ 异步索引（debounce 250ms，后台线程池）
+   jieba 分词 → 更新 note_fts / note_fts_zh → 重建该笔记的出链
+   → emit('search://indexed', { noteId })
+```
+
+**为什么必须 `fsync` 目录？** 因为 `rename` 只保证"目录项更新是原子的"，不保证它已落盘。断电后可能出现"文件内容在，但目录项丢失"或反之。Windows 上 `rename` 是 `MoveFileEx`，需要 `MOVEFILE_WRITE_THROUGH`；macOS/Linux 上必须 `fsync(dirfd)`。这是一个 90% 的笔记应用都没做对的细节，也是"用户说我的笔记凭空消失了"类事故的根因。
+
+#### 读路径（Read Path）
+
+**元数据走 DB，正文走文件。**
+
+```
+列表/大纲/标签树/反链  →  SQLite（毫秒级，带索引）
+正文内容              →  按需 readFile（不常驻内存，LRU 缓存 20 篇）
+搜索结果摘要           →  FTS5 snippet()（DB 内存一份分词文本，不存原文）
+```
+
+不在 DB 里存全文原文，是为了避免"文件改了但 DB 没跟上"的双写不一致。DB 里只存**派生数据**（分词文本、摘要、哈希），派生数据错了可以重建，原文错了就是事故。
+
+#### 外部变更检测
+
+用户在 VS Code 里改了一个文件、或者 `git pull` 拉下来 30 个改动——我们必须感知并正确处理。
+
+```
+notify (inotify / FSEvents / ReadDirectoryChangesW)
+   → 事件去抖（250ms）+ 路径归一化
+   → 批量比对 mtime + size（快速路径）
+   → 哈希比对（慢速路径，仅 mtime 变化时）
+   → 分类处理：
+        · 内容变化且当前未编辑  → 静默重载 + 更新索引
+        · 内容变化且当前正在编辑 → 标记"磁盘已更新"，状态栏提示，不打断输入
+        · 文件删除但编辑器有未保存内容 → 转为"孤立缓冲区"，提示另存
+        · 文件重命名 → 更新 note_id 映射，修复所有入链
+```
+
+**注意**：`notify` 在 Windows 上对"保存时先删后建"的编辑器（很多编辑器这么干）会连发 `Remove` + `Create` 两个事件。必须做**路径级合并**，否则每次外部保存都会触发一次"文件被删除"的误报。
+
+#### 崩溃恢复
+
+| 故障 | 恢复机制 |
+|------|----------|
+| 进程被 kill | WAL 自动回滚未提交事务；`hot-exit` 缓冲区（每 1.5s 落盘脏 buffer 到 `.knowisle/session/`）在启动时比对 hash，提示恢复 |
+| 断电 | `fsync` 保证已确认的写不丢；未确认的写最多丢 1.5s 输入（hot-exit 间隔） |
+| 索引损坏 | `index.sqlite` 整删重建（`isle reindex`，10k 笔记约 20s）；启动时 `PRAGMA quick_check` 检测 |
+| Git 仓库损坏 | 检测到 `.git` 异常 → 自动降级为"本地模式"，不阻塞编辑，引导用户修复 |
+| 磁盘写满 | 写前检查可用空间，低于 500MB 时横幅警告；写入失败时保留 tmp 文件并提示路径 |
+
+### 2.3 UI 与 Core 的分离设计
+
+#### 仓库结构
+
+```
+knowisle/
+├── Cargo.toml                    # workspace
+├── crates/
+│   ├── ki-core/                  # 领域模型（纯，无 IO）
+│   ├── ki-store/                 # SQLite 仓储 + refinery 迁移
+│   ├── ki-vault/                 # 文件系统、原子写、watcher
+│   ├── ki-search/                # FTS5 + jieba + RRF
+│   ├── ki-git/                   # 同步引擎（git2）
+│   ├── ki-render/                # md → html → pdf
+│   ├── ki-plugin/                # Extism WASM 宿主
+│   └── ki-cli/                   # isle 二进制
+├── apps/
+│   └── desktop/
+│       ├── src-tauri/            # Tauri 适配器（薄！）
+│       └── src/                  # React UI
+├── packages/
+│   ├── ui/                       # 设计系统（token + Radix 封装）
+│   ├── editor/                   # CodeMirror 6 封装
+│   ├── sdk/                      # 插件 SDK（TS 类型 + 运行时）
+│   └── bindings/                 # tauri-specta 自动生成，禁止手改
+└── docs/
+    └── ARCHITECTURE.md
+```
+
+`src-tauri` 里的代码应当**薄到无聊**——每个 command 就是"解包参数 → 调 service → 序列化结果"，不超过 15 行。业务逻辑一旦出现在这里，就说明它跑错了层。
+
+#### IPC 契约：类型由 Rust 单向生成
+
+手写两套类型（Rust struct + TS interface）是 bug 的温床。我们用 `tauri-specta` 从 command 签名生成 TypeScript：
+
+```rust
+#[tauri::command]
+#[specta::specta]
+pub async fn note_save(
+    state: State<'_, AppState>,
+    note_id: NoteId,
+    content: String,
+    base_hash: Option<ContentHash>,
+) -> Result<SaveResult, KiError> { ... }
+```
+
+生成：
+
+```ts
+export function note_save(noteId: string, content: string, baseHash: string | null): Promise<SaveResult>
+```
+
+CI 里跑 `pnpm bindings:check`，如果生成结果与提交的 `bindings.ts` 不一致则**构建失败**。这保证了"前端调用的 API 一定存在且类型正确"。
+
+> **命令命名偏差（M0 实测修正）**：本文早期写的是 `domain::action` 形式（如 `note::save`），但 Tauri 的 `#[tauri::command]` 要求命令名必须是合法的 Rust 函数名，`::` 不可用。实际约定改为 **`domain_action`**：`vault_scan`、`note_read`、`vault_save`。语义不变，只是分隔符从 `::` 变成 `_`。
+>
+> **另一条 M0 实测结论**：所有阻塞型命令必须走 `tauri::async_runtime::spawn_blocking`。`async fn` 命令跑在 tokio 核心线程上，一次 500ms 的目录扫描会阻塞其它命令与事件循环，表现为"点按钮之后整个界面卡住"。这条规则适用于所有文件 IO、SQLite 查询、Git 操作。
+
+#### 错误模型
+
+```rust
+#[derive(Serialize, thiserror::Error)]
+#[serde(tag = "code", content = "detail")]
+pub enum KiError {
+    #[error("note not found")]
+    NoteNotFound { id: String },
+    #[error("conflict detected")]
+    Conflict { path: String, local_hash: String, disk_hash: String },
+    #[error("vault locked")]
+    VaultLocked { by: String },
+    #[error("io error")]
+    Io { message: String, path: Option<String> },
+    // ...
+}
+```
+
+前端拿到的是 `{ code: "Conflict", detail: {...} }`，用 `switch (err.code)` 做映射。**永远不要 `err.message.includes('not found')`** —— 那是把国际化、日志格式、用户文案三者耦合在一起的经典错误。
+
+#### 三条铁律
+
+1. **前端不得直接读写 Vault 文件系统。** 不启用 `@tauri-apps/plugin-fs` 的写权限。所有写操作必须经过 core，因为只有 core 会做路径校验、原子写、oplog 记账。
+2. **core 不认识 `tauri::AppHandle`。** 通过 `trait EventSink { fn emit(&self, e: DomainEvent); }` 抽象。测试里注入 `Vec<DomainEvent>` 断言事件序列；Tauri 适配器里注入真实 handle。
+3. **派生数据一律由 core 计算。** 前端不许遍历全部笔记算标签树，不许自己解析 Markdown 建反链。前端是渲染器，不是计算器。
+
+### 2.4 插件化架构：让重型功能不拖慢启动
+
+#### 核心问题
+
+画板（Excalidraw ~400KB）、思维导图（~300KB）、PDF 标注（pdf.js ~1.2MB + worker）、电子表格（Univer ~2MB）——这四个加起来接近 4MB。如果它们进入主 bundle，冷启动会被拖到 3 秒以上。
+
+#### 三级插件模型
+
+| 级别 | 形态 | 典型例子 | 隔离强度 | 加载时机 |
+|------|------|----------|----------|----------|
+| **L0 · 内置懒模块** | `React.lazy` + 动态 `import()`，独立 chunk | 画板、思维导图、PDF 标注、表格、AI 面板、历史版本对比 | 同进程 + ErrorBoundary + Shadow DOM | 激活事件触发时 |
+| **L1 · WASM 插件** | Extism（wasmtime），用户可从市场安装 | 自定义导出器、格式化规则、语言分词器、主题包 | **强**（能力制，只能调 host functions） | 命令触发 / 启动时（仅 manifest） |
+| **L2 · Sidecar 进程** | 独立可执行文件，stdio/JSON-RPC 通信 | 本地 LLM 推理、headless 渲染、代码执行运行时 | **OS 级** | 按需 spawn，空闲 5min 后回收 |
+
+**L0 不是"插件"，是"我们自己写的、但假装是插件的模块"。** 它存在的意义是强制我们遵守插件契约——如果内置功能都必须走注册表才能挂载，那么第三方插件就一定能挂载。**用同一套 API 吃自己的狗粮，是插件系统不腐烂的唯一办法。**
+
+#### 插件清单（Manifest）
+
+```jsonc
+{
+  "id": "knowisle.canvas",
+  "name": "画板",
+  "version": "1.0.0",
+  "engines": { "knowisle": ">=0.4.0" },
+  "main": "dist/index.js",              // L1 时为 wasm 路径
+
+  // 激活事件：只有命中才加载代码。空数组 = 启动即加载（仅核心插件允许）
+  "activationEvents": [
+    "onEditor:ext:.canvas",
+    "onCommand:canvas.new",
+    "onView:canvas.gallery"
+  ],
+
+  // 贡献点：插件向宿主"声明"自己扩展了什么
+  "contributes": {
+    "editors":    [{ "extensions": [".canvas"], "priority": 100 }],
+    "commands":   [{ "id": "canvas.new", "title": "新建画板", "keybinding": "mod+shift+c" }],
+    "views":      [{ "id": "canvas.gallery", "location": "sidebar", "icon": "palette" }],
+    "exporters":  [{ "id": "canvas.png", "for": [".canvas"] }],
+    "slashItems": [{ "trigger": "/canvas", "title": "插入画板" }]
+  },
+
+  // 能力声明：默认全部关闭，按需申请
+  "capabilities": [
+    "vault:read",
+    "vault:write:assets",
+    "clipboard:write",
+    "net:none"
+  ]
+}
+```
+
+**权限模型的关键设计：默认拒绝。** 插件不声明 `net:fetch` 就发不出任何 HTTP 请求（L1 由 WASM host 拦截，L0 由 CSP + 宿主代理拦截）。这不是安全洁癖，而是用户信任的基础——一个本地知识库应用如果让插件偷偷把笔记上传，产品就死了。
+
+#### 启动预算与加载策略
+
+```
+t0    主进程启动，加载 Rust core，打开 SQLite（WAL 已有，~15ms）
+t0+80ms   WebView 创建，加载主 chunk（目标 ≤350KB gzip）
+t0+250ms  首屏骨架渲染，读取最近打开的笔记元数据
+t0+400ms  编辑器实例化，CodeMirror + Markdown 语言包（~200KB）
+t0+600ms  ✅ 可输入（P95 目标）
+
+后台（不阻塞）：
+  requestIdleCallback → 预取 L0 插件 chunk（fetch + compile，但【不 eval】）
+  索引线程池 → 增量索引上次会话遗留的脏笔记
+  Git 服务 → 延迟 3s 后检查远端（可配置关闭）
+```
+
+**"预取但不执行"是关键。** `import()` 的 `fetch` + `compile` 阶段可以在空闲时完成（省下后续 200-400ms），但模块顶层代码（`eval` 阶段）必须等到真正激活——因为很多库在 `import` 时会注册全局副作用、申请 WebGL 上下文、甚至发起网络请求。
+
+**硬规则：任何插件不得在模块顶层做 IO。** 由 SDK 提供 `activate(ctx)` 生命周期，所有初始化必须放在里面。
+
+#### 隔离与容错
+
+| 风险 | 对策 |
+|------|------|
+| 插件抛异常白屏 | 每个插件渲染点包 `<PluginBoundary>`：捕获错误 → 显示"该插件崩溃，点击重载" → 主程序继续运行 |
+| 插件样式污染 | Shadow DOM 挂载，宿主注入 token 变量副本；不允许插件写 `document.head` |
+| 插件阻塞主线程 | 计算密集任务（思维导图布局、PDF 解析、Diff）**必须**进 Web Worker；SDK 提供 `ctx.runInWorker()` |
+| 插件内存泄漏 | 卸载时强制 `view.destroy()` + `worker.terminate()`；开发模式下提供泄漏检测面板 |
+| 插件死循环 | 命令调用超时 5s → 提示 + 允许强制卸载（L0 无法真正 kill，但可以隔离 UI 并重载窗口） |
+| 插件版本不兼容 | `engines.knowisle` 语义化版本校验，不满足则禁用并在插件页显示原因 |
+
+#### EditorHost：自定义编辑器的统一入口
+
+```
+用户双击 assets/xxx.canvas
+   ↓
+EditorHost.resolve(path)
+   ↓ 查 registry（按扩展名 + priority）
+   ├─ 命中 L0/L1 插件 → <Suspense> 显示骨架 → 挂载插件编辑器
+   └─ 未命中 → 回落 CodeMirror 纯文本编辑器（永不失败）
+```
+
+**"永不失败"是设计原则**：任何文件都必须能被打开，哪怕只能看到乱码。这比"优雅地报错"更重要——用户要的是"我的文件还在"。
+
+### 2.5 渲染管线：编辑 ≠ 渲染
+
+这是本项目最容易被做错的地方。绝大多数 Markdown 编辑器的技术债，都来自"试图用编辑器解决渲染问题"。
+
+```
+┌── 管线 ①：编辑 ──────────────────────────────────┐
+│  .md 文本 → CodeMirror 6 → Lezer 增量语法树       │
+│           → Decoration/Widget 投影（Live Preview）│
+│  特性：60fps、光标精确、可撤销、纯文本真相          │
+└───────────────────────────────────────────────────┘
+
+┌── 管线 ②：预览 ──────────────────────────────────┐
+│  .md 文本 → remark-parse → mdast → 插件转换       │
+│           → rehype（数学/代码高亮/图表）          │
+│           → HTML 字符串 → 沙箱 iframe 渲染         │
+│  特性：完整 HTML 能力、可嵌入 iframe、CSP 隔离      │
+└───────────────────────────────────────────────────┘
+
+┌── 管线 ③：导出 ──────────────────────────────────┐
+│  管线② 的 HTML + 打印 CSS + Paged.js 分页        │
+│           → 隐藏 WebView → 平台 PDF API           │
+│  特性：与预览像素级一致、矢量文字、可选中           │
+└───────────────────────────────────────────────────┘
+```
+
+三条管线**共享同一个 Markdown 解析器版本**（`remark` 的 AST 是唯一中间表示），但**绝不共享 DOM**。预览区是 `iframe sandbox="allow-same-origin"`，禁 inline script，禁 `allow-top-navigation`——因为用户可能粘贴任意 HTML。
+
+#### 分页预览的实现
+
+"分页预览"（Paged Preview）不是"把预览区拉窄"，而是**用打印媒体查询渲染真实分页**：
+
+```css
+@page {
+  size: A4;
+  margin: 20mm 18mm;
+  @bottom-center { content: counter(page) " / " counter(pages); }
+}
+
+.page-break { break-after: page; }
+h2, h3 { break-after: avoid; }      /* 标题不与正文分离 */
+pre, table, figure { break-inside: avoid; }
+```
+
+用 [Paged.js](https://pagedjs.org/) 在预览 iframe 里做 polyfill，把连续文档切成 `.pagedjs_page` 块。**预览看到的分页 = 导出的 PDF 分页**，因为用的是同一份 HTML + 同一份 CSS。这是"所见即所得"在导出场景的唯一正确实现。
+
+#### PDF 导出决策
+
+| 路径 | 方案 | 保真度 | 依赖 | 用途 |
+|------|------|--------|------|------|
+| **主路径** | 隐藏 WebView 加载 paged HTML → 平台原生 PDF API（Win: WebView2 `PrintToPdfAsync`；macOS: `WKWebView.createPDF`；Linux: sidecar headless chromium） | ★★★★★（CSS 全保真） | 无额外体积 | 默认 |
+| 备选路径 | Typst sidecar：md → typst → PDF | ★★★★（排版精美，但丢自定义 CSS） | +30MB | "论文/书籍排版"模式 |
+| 降级路径 | 调用系统打印对话框，用户选"另存为 PDF" | ★★★★ | 无 | 平台 API 不可用时 |
+
+**坚决不做**：`html2canvas` + `jsPDF`（文字变图片、不可选中、体积爆炸、中文换行错乱）、前端 `window.print()`（无法控制分页与页眉页脚，且会打印整个应用界面）。
+
+### 2.6 一键运行代码：可信执行的分级设计
+
+这是 Tauri 选型回报最大的功能，也是最容易做出安全事故的功能。
+
+#### 执行分级
+
+| 级别 | 运行时 | 隔离 | 适用 | 默认 |
+|------|--------|------|------|------|
+| **L1 · WASM** | Python (Pyodide) / JS (QuickJS) / Lua | 内存沙箱，无文件系统，无网络 | 教学示例、算法演示、数据处理 | ✅ **默认** |
+| **L2 · 进程** | 系统已安装的 node/python/deno/bun | 子进程 + 工作目录隔离 + 资源限额 | 需要真实依赖的场景 | 需用户确认 |
+| **L3 · 容器** | Docker / Podman | 完全隔离 | 不可信代码、复杂依赖 | 需显式开启 |
+
+**为什么默认 WASM？** 因为"为了跑一行 `print("hello")` 而让用户装 Python"是不可接受的产品体验。Pyodide 冷启动约 2s（首次需下载 ~10MB，之后缓存），足够覆盖 90% 的笔记内代码场景。需要 `pandas` 读本地 CSV？那就升级到 L2，此时用户已经在写真实代码了，愿意配置环境。
+
+#### L2 进程执行的硬约束
+
+```rust
+// 伪代码：资源限额 + 进程树回收
+let mut cmd = tokio::process::Command::new(runtime);
+cmd.current_dir(sandbox_dir)              // .knowisle/run/<uuid>/
+   .env_clear()                           // 清空环境变量
+   .envs(allowed_env)                     // 仅 PATH / HOME / LANG
+   .stdin(Stdio::null())
+   .stdout(Stdio::piped())
+   .stderr(Stdio::piped());
+
+#[cfg(unix)]
+unsafe { cmd.pre_exec(|| { setrlimit(RLIMIT_AS, 512MB); setsid(); Ok(()) }); }
+
+#[cfg(windows)]
+// 使用 Job Object: JOB_OBJECT_LIMIT_PROCESS_MEMORY + KILL_ON_JOB_CLOSE
+```
+
+配套限制：
+
+| 资源 | 限制 | 超限行为 |
+|------|------|----------|
+| 墙钟时间 | 10s（可配 1–60s） | SIGKILL 整个进程组 |
+| 内存 | 512MB | OOM kill |
+| 输出 | 1MB（stdout+stderr 合计） | 截断 + 提示 |
+| 文件写入 | 仅沙箱目录，1GB 配额 | 拒绝写入 |
+| 网络 | L2 默认放行（用户代码），L3 默认禁止 | 可配置 |
+| 进程数 | 32 | 拒绝 fork |
+
+**输出必须流式回传**：`run://stdout` 事件逐块推送到 UI，而不是等进程结束一次性返回。用户跑一个 `for i in range(1000000): print(i)` 时，如果等结束才显示，体验就是"卡死"。
+
+#### 结果持久化
+
+运行结果**不写回 Markdown 源文件**（那会污染用户的文本），而是存在 `.knowisle/cache/run/<noteId>/<blockHash>.json`。渲染时通过 Decoration Widget 在代码块下方展示。这样：
+- 文件 diff 干净（Git 同步友好）
+- 结果可缓存（同一代码块不重复跑）
+- 用户可选择"折叠/展开/固定显示"
+
+### 2.7 性能预算（CI 卡口）
+
+没有数字的性能目标是许愿。以下指标在 CI 中作为**构建阻断条件**：
+
+| 指标 | 目标 | 测量方式 |
+|------|------|----------|
+| 冷启动到可输入 | ≤ 600ms (P95, Win11 / M1) | 埋点上报到 CI 基准库 |
+| 打开 10k 笔记 Vault | ≤ 1.2s | E2E 脚本 |
+| 全局搜索响应 | ≤ 60ms (P95) | 基准测试（`criterion`） |
+| 击键到像素 | ≤ 16ms (P99) | Playwright + PerformanceObserver |
+| 10 万字文档滚动 | 60fps 稳定 | 帧率采样 |
+| 安装包体积 | ≤ 20MB | CI 产物检查 |
+| 空载 RSS | ≤ 150MB | 进程采样 |
+| 主 chunk（gzip） | ≤ 350KB | `vite-bundle-visualizer` |
+
+---
+
+## 3. 数据模型与存储设计
+
+### 3.1 Vault 物理结构
+
+Vault 就是一个普通文件夹。用户可以用 Finder/资源管理器打开它、用 `git` 操作它、用其他编辑器编辑它。**我们不发明专有格式，这是本地优先的底线。**
+
+```
+my-vault/
+├── .knowisle/                      # 应用元数据（部分进 Git，见下表）
+│   ├── vault.json                  # VaultConfig（共享配置，进 Git）
+│   ├── workspace.json              # 窗口/标签布局（设备级，不进 Git）
+│   ├── device.json                 # 设备 ID + 设备分支名（不进 Git）
+│   ├── index.sqlite                # 派生索引（不进 Git，可重建）
+│   ├── index.sqlite-wal
+│   ├── session/                    # 崩溃恢复缓冲区（不进 Git）
+│   ├── cache/
+│   │   ├── thumbs/                 # 图片缩略图
+│   │   ├── render/                 # 预览渲染缓存
+│   │   └── run/                    # 代码块执行结果
+│   ├── history/                    # 本地历史版本（内容寻址，不进 Git）
+│   │   ├── objects/ab/ab3f9c...    # 去重后的内容块
+│   │   └── index.sqlite            # note_id → (ts, hash) 映射
+│   ├── plugins/                    # 已安装插件（配置进 Git，二进制走 release）
+│   └── tmp/                        # 原子写的临时区（启动时清空）
+│
+├── notes/                          # 📝 主 Markdown 目录（用户可自由重组）
+│   ├── inbox/
+│   │   └── 2026-10-23 随手记.md
+│   ├── projects/
+│   │   └── knowisle/
+│   │       ├── 架构决策.md
+│   │       ├── 竞品分析.md
+│   │       └── assets/             # 笔记级附件（可选，跟随笔记移动）
+│   │           └── 架构草图.png
+│   └── daily/
+│       └── 2026/
+│           └── 10/
+│               └── 2026-10-23.md
+│
+├── assets/                         # 🖼 全局附件（内容寻址，不可变）
+│   ├── images/
+│   │   └── 2026/10/a3/
+│   │       └── a3f9c1e8...b7.png   # 文件名 = sha256 前 32 位
+│   └── files/
+│       └── 2026/10/7d/
+│           └── 7d2e4a91...0c.pdf
+│
+├── templates/                      # 📋 笔记模板
+│   ├── daily.md
+│   ├── meeting.md
+│   └── book-review.md
+│
+├── .gitattributes
+├── .gitignore
+└── README.md
+```
+
+#### 进 Git 的边界（关键！）
+
+| 路径 | 进 Git | 理由 |
+|------|--------|------|
+| `notes/**` `assets/**` `templates/**` | ✅ | 用户内容，必须同步 |
+| `.knowisle/vault.json` | ✅ | 共享配置（目录约定、链接风格、忽略规则） |
+| `.knowisle/workspace.json` | ❌ | 设备相关（窗口尺寸、打开哪些 tab），同步会导致多端互相覆盖 |
+| `.knowisle/device.json` | ❌ | 每台设备唯一，同步会让两台机器抢同一个设备分支 |
+| `.knowisle/index.sqlite*` | ❌ | 派生数据，体积大（可达 200MB），二进制冲突无法合并 |
+| `.knowisle/cache/**` | ❌ | 纯缓存 |
+| `.knowisle/session/**` | ❌ | 崩溃恢复，纯本地 |
+| `.knowisle/history/**` | ❌ | 分钟级快照，会让仓库爆炸（Git 已经有自己的历史） |
+| `.knowisle/plugins/*/dist/**` | ❌ | 二进制产物，走 Release 分发 |
+
+```gitignore
+# .knowisle/.gitignore（放在子目录里，自动作用于其下）
+index.sqlite*
+workspace.json
+device.json
+session/
+cache/
+history/
+tmp/
+plugins/*/dist/
+```
+
+#### `.gitattributes`：跨平台同步的隐形护栏
+
+```gitattributes
+# 统一换行符，否则 Windows 与 macOS 每次同步都会产生"整个文件都改了"的假 diff
+* text=auto eol=lf
+
+# Markdown 明确按文本处理
+*.md text eol=lf
+
+# 二进制文件禁止 diff/merge（它们本来就不该冲突，因为内容寻址）
+*.png binary
+*.jpg binary
+*.pdf binary
+*.sqlite binary
+*.woff2 binary
+
+# 冲突时保留双方（仅用于追加型文件）
+CHANGELOG.md merge=union
+```
+
+**没有这个文件，多端 Git 同步在第一天就会崩。** Windows 的 CRLF 与 macOS 的 LF 会让 Git 认为每个文件都变了，一次同步产生几千个冲突——这是绝大多数"Obsidian + Git 同步"用户放弃的直接原因。
+
+### 3.2 文件命名与链接规范
+
+| 规则 | 决策 | 理由 |
+|------|------|------|
+| 笔记文件名 | 保留用户输入的原名，仅去除 `\/:*?"<>|` | 中文用户需要中文文件名；slug 化会破坏可读性 |
+| 重名处理 | `标题.md` → `标题 2.md`（而非加 hash） | 人类可读优先 |
+| 附件命名 | **内容寻址**：`sha256(content)[0..32].ext` | ① 天然去重 ② 永不可能冲突（Git 同步零冲突） ③ 重命名不产生 diff ④ 可 GC |
+| 附件目录 | `assets/images/<yyyy>/<mm>/<hash前2位>/` | 单目录文件数控制在 ~1000，避免文件系统性能退化 |
+| Markdown 内链接 | **相对路径 + POSIX 分隔符** | `![](../../assets/images/2026/10/a3/a3f9.png)` 在任何平台、任何 Git 客户端都能解析 |
+| Wiki 链接 | `[[笔记标题]]` 允许书写，索引时解析为 `note_id`，**导出时编译为相对路径** | 书写体验与可移植性兼得 |
+| 重命名笔记 | 更新 DB 中的 `note_id → path` 映射 + 批量修复所有入链 | 用户不需要关心链接是否失效 |
+
+> **为什么不把附件内联成 base64？** 因为 10 张图就能让一个 md 文件变成 20MB，Git diff 爆炸，编辑器卡顿，且无法在外部工具中打开。附件必须独立成文件。
+
+### 3.3 核心 TypeScript Interface
+
+```ts
+/* ───────────────────────── 基础类型 ───────────────────────── */
+
+/** UUID v7：时间有序，天然适合做主键与游标分页 */
+export type VaultId = string;
+export type NoteId = string;
+export type DeviceId = string;
+
+/** 内容哈希，带算法前缀便于未来迁移（blake3 等） */
+export type ContentHash = `sha256:${string}`;
+
+/** ISO 8601 with timezone，永远存 UTC */
+export type Timestamp = string;
+
+/* ───────────────────────── Vault 配置 ───────────────────────── */
+
+export interface VaultConfig {
+  schemaVersion: number;
+  id: VaultId;
+  name: string;
+  createdAt: Timestamp;
+
+  /** 目录约定（相对 Vault 根，POSIX 分隔符） */
+  paths: {
+    notes: string;        // 默认 "notes"
+    assets: string;       // 默认 "assets"
+    templates: string;    // 默认 "templates"
+  };
+
+  /** 附件策略 */
+  attachment: {
+    /** content-addressed：全局去重，Git 友好（推荐） */
+    /** alongside-note：附件跟随笔记目录，便于单独分享 */
+    mode: 'content-addressed' | 'alongside-note';
+    hashLength: number;          // 默认 32
+    dedupe: boolean;             // 默认 true
+    maxSizeMb: number;           // 单文件上限，默认 100
+  };
+
+  /** 链接风格 */
+  link: {
+    style: 'wikilink' | 'markdown';
+    /** 导出时是否把 wikilink 编译为相对路径 */
+    compileOnExport: boolean;
+  };
+
+  /** 索引与搜索 */
+  index: {
+    enableChinese: boolean;      // jieba 分词开关
+    excludeGlobs: string[];      // 不索引的路径
+    maxFileSizeKb: number;       // 超过则只索引元数据
+  };
+
+  sync: SyncConfig;
+}
+
+export interface SyncConfig {
+  enabled: boolean;
+  remote: string | null;         // "git@github.com:me/vault.git"
+  /** 集成分支：所有设备最终汇入这里 */
+  branch: string;                // "main"
+  /** 设备分支：每台设备独有，避免并发 push 互相拒绝 */
+  deviceBranch: string;          // "device/<deviceId>"
+
+  autoCommit: {
+    enabled: boolean;
+    idleMs: number;              // 编辑停止多久后提交，默认 30_000
+    maxIntervalMs: number;       // 最长多久强制提交一次，默认 600_000
+    onBlur: boolean;             // 窗口失焦时提交
+    onClose: boolean;            // 关闭时提交
+  };
+
+  pull: {
+    strategy: 'rebase';          // 只允许 rebase，禁止 merge commit 污染历史
+    intervalMs: number;          // 自动拉取间隔，0 = 仅手动
+    onStartup: boolean;
+  };
+
+  conflict: {
+    /** conflict-file：生成冲突副本，原文件保留本地版本（推荐，永不丢数据） */
+    /** prefer-local / prefer-remote：静默取舍，有丢数据风险 */
+    policy: 'conflict-file' | 'prefer-local' | 'prefer-remote';
+    /** 二进制/JSON 等无法三方合并的文件 */
+    binaryPolicy: 'keep-both' | 'prefer-local' | 'prefer-remote';
+  };
+}
+
+/* ───────────────────────── 笔记元数据 ───────────────────────── */
+
+export interface NoteMeta {
+  id: NoteId;
+  vaultId: VaultId;
+
+  /** Vault 相对路径，POSIX 分隔符。重命名时更新，id 不变 */
+  path: string;
+
+  title: string;
+  aliases: string[];
+  tags: string[];
+
+  createdAt: Timestamp;
+  updatedAt: Timestamp;         // 文件 mtime，非 DB 写入时间
+
+  contentHash: ContentHash;
+  size: number;
+  wordCount: number;
+
+  /** 原始 frontmatter，不做 schema 约束（用户自定义字段） */
+  frontmatter: Record<string, unknown>;
+
+  /** 出链（由索引器解析） */
+  outgoingLinks: NoteId[];
+  /** 入链数量（反链列表按需查询，不内联） */
+  backlinkCount: number;
+
+  isPinned: boolean;
+  isTrashed: boolean;
+  trashedAt: Timestamp | null;
+  /** 回收站中原始路径，用于恢复 */
+  originalPath: string | null;
+}
+
+/* ───────────────────────── 用户设置（设备级） ───────────────────────── */
+
+export interface UserSettings {
+  schemaVersion: number;
+
+  appearance: AppearanceSettings;
+  editor: EditorSettings;
+  keymap: KeymapSettings;
+  ai: AiSettings;
+  advanced: AdvancedSettings;
+}
+
+export interface AppearanceSettings {
+  /** 内置主题 id 或用户主题 id */
+  themeId: string;
+  /** 跟随系统明暗 */
+  followSystem: boolean;
+  /** 用户主题覆盖（L2/L3 token） */
+  customTokens: Record<string, string>;
+  uiFontSize: number;
+  /** 用户自定义 CSS，注入到主窗口（不含插件 Shadow DOM） */
+  customCss: string;
+  reducedMotion: boolean;
+}
+
+export interface EditorSettings {
+  vimMode: boolean;
+  /** 显示行号 */
+  lineNumbers: boolean;
+  lineWrapping: 'none' | 'viewport' | 'column';
+  wrapColumn: number;
+
+  /** Live Preview：语法符号淡化 + Widget 渲染 */
+  livePreview: boolean;
+  /** 光标所在行始终显示源码（Live Preview 的逃生舱） */
+  sourceOnCursorLine: boolean;
+  typewriterMode: boolean;
+  /** 专注模式：淡化非当前段落 */
+  focusMode: boolean;
+
+  fontSize: number;
+  fontFamily: string;
+  tabSize: number;
+  spellcheck: boolean;
+
+  runCode: {
+    /** wasm：零依赖，默认；process：需系统运行时；container：需 Docker */
+    defaultSandbox: 'wasm' | 'process' | 'container';
+    timeoutMs: number;          // 默认 10_000
+    memoryLimitMb: number;      // 默认 512
+    showOutputInline: boolean;
+  };
+}
+
+export interface KeymapSettings {
+  preset: 'default' | 'vim' | 'emacs' | 'vscode';
+  /** 用户覆盖，格式 "mod+k mod+s": "command.id" */
+  overrides: Record<string, string>;
+}
+
+export interface AiSettings {
+  /** API Key 存系统钥匙串（keyring），绝不写入 settings.json */
+  provider: 'openai' | 'anthropic' | 'ollama' | 'custom';
+  baseUrl: string | null;
+  model: string;
+  /** 本地优先：默认不发送任何笔记内容到远端 */
+  allowRemoteContext: boolean;
+  /** 检索增强的 top-k */
+  ragTopK: number;
+}
+
+export interface AdvancedSettings {
+  /** 关闭遥测（默认关闭，且不提供开启入口） */
+  telemetry: false;
+  /** 索引线程数，0 = 自动（CPU 核数 - 1） */
+  indexThreads: number;
+  /** 开发者模式：显示插件性能面板 */
+  devMode: boolean;
+  logLevel: 'error' | 'warn' | 'info' | 'debug';
+}
+
+/* ───────────────────────── 主题 ───────────────────────── */
+
+export interface ThemeDefinition {
+  id: string;
+  name: string;
+  author?: string;
+  /** 决定原生控件（滚动条、窗口标题栏、菜单）的明暗 */
+  base: 'light' | 'dark';
+  /** 只允许覆写 --ki-* 前缀的变量 */
+  tokens: Record<`--ki-${string}`, string>;
+  /** CodeMirror 语法高亮 */
+  syntax?: {
+    keyword?: string;
+    string?: string;
+    comment?: string;
+    function?: string;
+    variable?: string;
+    number?: string;
+    heading?: string;
+    link?: string;
+    code?: string;
+  };
+}
+
+/* ───────────────────────── 插件清单 ───────────────────────── */
+
+export interface PluginManifest {
+  id: string;                   // "knowisle.canvas"（反向域名）
+  name: string;
+  version: string;              // semver
+  description?: string;
+  author?: string;
+  license?: string;
+  icon?: string;
+
+  engines: { knowisle: string };  // ">=0.4.0"
+
+  /** L1 插件为 .wasm 路径；L0 内置模块为 JS chunk */
+  main: string;
+  kind: 'builtin' | 'wasm' | 'sidecar';
+
+  /** 空数组表示启动即加载（仅 builtin 核心插件允许） */
+  activationEvents: ActivationEvent[];
+
+  contributes: {
+    editors?: Array<{ extensions: string[]; priority: number }>;
+    commands?: Array<{ id: string; title: string; keybinding?: string }>;
+    views?: Array<{ id: string; location: 'sidebar' | 'panel' | 'tab'; icon?: string }>;
+    exporters?: Array<{ id: string; for: string[]; label: string }>;
+    slashItems?: Array<{ trigger: string; title: string; description?: string }>;
+    themes?: ThemeDefinition[];
+  };
+
+  /** 能力声明，默认全部拒绝 */
+  capabilities: PluginCapability[];
+}
+
+export type ActivationEvent =
+  | `onEditor:ext:${string}`     // "onEditor:ext:.canvas"
+  | `onCommand:${string}`
+  | `onView:${string}`
+  | `onStartup`
+  | `onVaultOpen`;
+
+export type PluginCapability =
+  | 'vault:read'
+  | 'vault:write:notes'
+  | 'vault:write:assets'
+  | 'clipboard:read'
+  | 'clipboard:write'
+  | 'net:fetch'
+  | 'shell:exec';
+```
+
+### 3.4 SQLite Schema 要点
+
+```sql
+-- 笔记元数据（真相在文件，这里是索引）
+CREATE TABLE note (
+  id            TEXT PRIMARY KEY,           -- uuid v7
+  vault_id      TEXT NOT NULL,
+  path          TEXT NOT NULL UNIQUE,       -- vault 相对路径，POSIX
+  title         TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  size          INTEGER NOT NULL,
+  word_count    INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  is_pinned     INTEGER NOT NULL DEFAULT 0,
+  is_trashed    INTEGER NOT NULL DEFAULT 0,
+  trashed_at    TEXT,
+  original_path TEXT,
+  frontmatter   TEXT                        -- JSON，便于 json_extract 查询
+);
+CREATE INDEX idx_note_updated ON note(updated_at DESC) WHERE is_trashed = 0;
+CREATE INDEX idx_note_path    ON note(path);
+
+-- 全文索引（双通道：原文 + 中文预分词）
+CREATE VIRTUAL TABLE note_fts USING fts5(
+  title, body, tags, content='', tokenize='unicode61 remove_diacritics 2'
+);
+CREATE VIRTUAL TABLE note_fts_zh USING fts5(
+  title_tokens, body_tokens, content='', tokenize='unicode61'
+);
+
+-- 标签（层级用 path 表达：tech/rust/async）
+CREATE TABLE tag (
+  id    INTEGER PRIMARY KEY,
+  name  TEXT NOT NULL,
+  path  TEXT NOT NULL UNIQUE,
+  color TEXT
+);
+CREATE TABLE note_tag (
+  note_id TEXT NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+  tag_id  INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+  PRIMARY KEY (note_id, tag_id)
+);
+
+-- 链接图（反链查询）
+CREATE TABLE link (
+  source_id TEXT NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+  target_id TEXT,                            -- 解析失败时为 NULL（死链）
+  target_raw TEXT NOT NULL,                  -- 原始 "[[xxx]]"
+  kind      TEXT NOT NULL,                   -- 'wiki' | 'markdown' | 'embed'
+  PRIMARY KEY (source_id, target_raw)
+);
+CREATE INDEX idx_link_target ON link(target_id) WHERE target_id IS NOT NULL;
+
+-- 附件（内容寻址）
+CREATE TABLE asset (
+  hash       TEXT PRIMARY KEY,               -- sha256
+  path       TEXT NOT NULL,
+  mime       TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE asset_ref (
+  note_id TEXT NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+  hash    TEXT NOT NULL REFERENCES asset(hash),
+  PRIMARY KEY (note_id, hash)
+);
+
+-- 历史版本索引（内容块去重存储）
+CREATE TABLE history (
+  id      INTEGER PRIMARY KEY,
+  note_id TEXT NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+  ts      TEXT NOT NULL,
+  hash    TEXT NOT NULL,                     -- 指向 history/objects/
+  size    INTEGER NOT NULL,
+  reason  TEXT NOT NULL                      -- 'auto' | 'manual' | 'pre-restore'
+);
+CREATE INDEX idx_history_note_ts ON history(note_id, ts DESC);
+
+-- 操作日志（撤销栈持久化 + 跨设备归因 + 合并后语义修复）
+CREATE TABLE oplog (
+  id        INTEGER PRIMARY KEY,
+  ts        TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  op        TEXT NOT NULL,                   -- 'create'|'update'|'rename'|'delete'|'restore'
+  note_id   TEXT,
+  payload   TEXT NOT NULL,                   -- JSON
+  synced    INTEGER NOT NULL DEFAULT 0
+);
+
+-- 待处理冲突
+CREATE TABLE conflict (
+  id         INTEGER PRIMARY KEY,
+  note_id    TEXT,
+  path       TEXT NOT NULL,
+  kind       TEXT NOT NULL,                  -- 'text' | 'json' | 'binary'
+  local_hash TEXT,
+  remote_hash TEXT,
+  created_at TEXT NOT NULL,
+  resolved_at TEXT
+);
+
+-- 插件状态
+CREATE TABLE plugin_state (
+  plugin_id TEXT NOT NULL,
+  key       TEXT NOT NULL,
+  value     TEXT NOT NULL,
+  PRIMARY KEY (plugin_id, key)
+);
+```
+
+**Schema 设计要点**：
+
+- **`note.path` 唯一但 `note.id` 稳定**。重命名只改 `path`，所有链接、历史、标签、收藏都绑在 `id` 上，永不断裂。
+- **`frontmatter` 存 JSON**。用户自定义字段无法预知 schema，用 SQLite 的 `json_extract(frontmatter, '$.status')` 做查询，需要时再建生成列 + 索引。
+- **`link.target_id` 允许 NULL**。死链是常态（用户先写链接再建笔记），索引器在目标出现时回填。这是"双向链接"能用的前提。
+- **`oplog` 不只是日志**。它是撤销栈的持久化（重启后仍能 `Ctrl+Z`）、跨设备归因（"这条笔记上周是谁改的"）、以及合并后语义修复的依据。
+
+### 3.5 Git 同步策略：把冲突从"事故"降级为"数据"
+
+#### 问题定义
+
+先说清楚 Git 为什么不是同步引擎：
+
+| Git 的能力 | 同步需要的能力 | 差距 |
+|-----------|---------------|------|
+| 提交是显式的 | 编辑应该自动留痕 | 需要自动提交策略 |
+| 冲突是**阻断式**的（工作区进入 `MERGING` 状态） | 用户必须能继续工作 | 需要把冲突降级为数据 |
+| 二进制冲突无法合并 | 附件不能冲突 | 需要内容寻址从结构上消灭冲突 |
+| 历史是"版本"粒度 | 用户要"分钟"粒度 | 需要独立的历史系统 |
+| 分支是给多人协作用的 | 多设备本质是"一个人多个身份" | 需要设备分支模型 |
+
+绝大多数"Markdown + Git 同步"方案的失败，都是因为把 Git 当成了 Dropbox 用。
+
+#### 分支模型：一设备一分支
+
+```
+origin/main       ●──────●──────────●──────────●
+                   \      \          \          \
+device/mac          ●──●   \          \          \
+                            \          \          \
+device/win                   ●────●     \          \
+                                        \          \
+device/linux                             ●────●─────●
+```
+
+**规则**：
+
+1. 每台设备有唯一 `deviceBranch`（`device/<uuid>`），存在 `.knowisle/device.json`（不进 Git）。
+2. 设备**只在自己分支上提交**，永不直接提交 `main`。
+3. 同步 = `fetch` → `rebase device/* onto origin/main` → 若成功则 `merge --ff-only` 到 `main` → `push`。
+4. `push` 被拒（别人先推了）→ 回到步骤 3，指数退避重试，最多 3 次。
+5. 任何一步失败 → 工作区保持干净（rebase 失败会 `--abort`），用户继续编辑，下次重试。
+
+**为什么不是"所有设备都提交 main"？** 因为并发 push 会被拒绝，用户被迫在 GUI 里处理 rebase；而 `git pull --rebase` 一旦冲突，工作区进入半完成状态，普通用户无法恢复。设备分支把"本地历史"和"集成"解耦，任何一次失败都能 `reset --hard origin/main` 回到安全点。
+
+#### 提交策略
+
+| 参数 | 决策 | 理由 |
+|------|------|------|
+| 触发时机 | 编辑停止 30s / 窗口失焦 / 关闭 / 手动 | 避免每个字符一个 commit |
+| 提交粒度 | 一次"编辑会话"= 一个 commit | 历史可读 |
+| 消息格式 | `[device:macbook] auto: 3 notes (+42/-7)` | 机器可解析前缀 + 人类可读摘要 |
+| 暂存策略 | `git add -A` 但尊重 `.gitignore` 与用户 `index.excludeGlobs` | 不遗漏新文件 |
+| 禁止操作 | `push --force`（除显式"修复同步"流程）、`commit --amend` 已推送提交、`rebase` 已推送的 `main` | 保护协作与历史 |
+| 大文件 | 超过 5MB 提示启用 Git LFS（可选） | 避免仓库膨胀 |
+
+#### 冲突解决：分层降级
+
+| 文件类型 | 策略 | 用户感知 |
+|----------|------|----------|
+| **Markdown** | `git merge-file -p --diff3` 三方合并。失败时：保留本地版本为原文，远端版本写成 `<name>.conflict-<device>-<ts>.md`，同时在 `conflict` 表记录 | 侧栏出现"1 个待处理冲突"徽标，点击进入并排对比 |
+| **附件**（内容寻址） | **结构上不可能冲突**（同名 = 同内容） | 无感 |
+| **`vault.json`** | 字段级合并：标量键按 `updatedAt` 取新；数组键取并集；对象键递归 | 无感 |
+| **插件配置** | 同 `vault.json` | 无感 |
+| **其他二进制** | `keep-both`：两份都留，加后缀 | 提示"发现重复文件" |
+
+**核心洞察：把冲突从"阻断式失败"降级为"可事后处理的数据"。**
+
+用户的编辑流永远不被打断。冲突被记录、被展示、被用户择机处理。这比"弹一个对话框说 merge conflict，请打开终端解决"要好一万倍——后者是给开发者用的，我们的用户是写笔记的人。
+
+#### 历史版本：与 Git 彻底解耦
+
+用户要的"历史版本"是**分钟级**的（"我十分钟前删的那段话"），Git 是**会话级**的。用 Git 做历史版本会导致：仓库爆炸、用户看到一堆无意义的 commit、`git gc` 后历史丢失。
+
+独立实现：
+
+```
+.knowisle/history/
+├── objects/
+│   ├── a3/a3f9c1e8b7d2...        # 内容块（同内容只存一份，硬链接去重）
+│   └── 7d/7d2e4a910c5f...
+└── index.sqlite                   # history(note_id, ts, hash, size)
+```
+
+**保留策略**（滑动窗口）：
+
+| 时间范围 | 保留粒度 | 单笔记上限 |
+|----------|----------|-----------|
+| 最近 24 小时 | 每 5 分钟 | 288 条 |
+| 最近 7 天 | 每天 1 条（当日最后一版） | 7 条 |
+| 最近 30 天 | 每周 1 条 | 4 条 |
+| 30 天以上 | 仅手动标记的里程碑 | 不限 |
+
+**存储优化**：内容寻址 + 硬链接。修改 10 次、每次改一行，只多存 10 个小对象（未改动部分共享）。10k 笔记运行一年，历史库通常 < 500MB。
+
+#### 同步状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+
+    Idle --> Dirty: 文件落盘
+    Dirty --> Committing: idle 30s / 失焦 / 手动
+
+    Committing --> Fetching: 本地提交成功
+    Committing --> Error: 提交失败（锁/磁盘）
+
+    Fetching --> Rebasing: 远端有新提交
+    Fetching --> Pushing: 远端无变化
+    Fetching --> Offline: 网络不可达
+
+    Rebasing --> Merging: 存在冲突
+    Rebasing --> Pushing: 干净快进
+
+    Merging --> ConflictRecorded: 写冲突副本 + conflict 表
+    ConflictRecorded --> Pushing: 冲突已降级为数据
+
+    Pushing --> Idle: push 成功
+    Pushing --> Fetching: 非快进，退避重试
+    Pushing --> Error: 认证失败 / 重试超限
+
+    Offline --> Idle: 保留本地提交，稍后重试
+    Error --> Idle: 用户处理
+
+    Idle --> Syncing_Manual: 用户点击同步
+    Syncing_Manual --> Fetching
+```
+
+#### 跨设备"语义合并"（oplog 的隐藏价值）
+
+纯文本三方合并有时会产生语义错误。典型场景：
+
+- 设备 A 把 `笔记A.md` 重命名为 `笔记B.md`
+- 设备 B 同时修改了 `笔记A.md` 的内容
+- Git 看到的是 "delete + add" 与 "modify"，可能产生冲突或丢失重命名
+
+我们用 `oplog` 做**事后修复**：合并完成后，扫描两端的 oplog，发现"同一 note_id 在两端分别发生 rename 与 update"，则自动把 A 的路径 + B 的内容合并成一个正确结果，并在 `conflict` 表留一条"已自动修复"记录。
+
+这是"操作日志 + 文件真相"双轨制的最大收益：**Git 负责字节，oplog 负责语义。**
+
+### 3.6 备份、迁移与逃生舱
+
+| 场景 | 方案 |
+|------|------|
+| 手动备份 | `isle export --raw --out ./backup` 产出纯文件树（无任何专有格式） |
+| 定时备份 | 设置里可开启"每日快照"，写 `~/.knowisle/backups/<vault>/<date>.zip`（不含 index.sqlite） |
+| 迁移到新机器 | 复制 Vault 文件夹（或 `git clone`）+ 首次启动自动 `reindex` |
+| 版本升级 | `schemaVersion` 单调递增，refinery 迁移单向执行；启动前自动备份 `vault.json` |
+| 降级（用户装回旧版） | 检测到 `schemaVersion` 高于当前版本 → 拒绝打开，提示升级（**绝不静默降级，那会毁数据**） |
+| 完全逃离 | 删掉 `.knowisle/` 目录，剩下的就是一堆 `.md` 和图片。**这是我们对用户的承诺。** |
+
+---
+
+## 4. 附录
+
+### 4.1 关键决策速查
+
+| 问题 | 答案 | 一句话理由 |
+|------|------|-----------|
+| 用什么壳？ | Tauri 2.0 | 只有它能安全地做进程管控 |
+| 用什么框架？ | React 19 | 重型可视化库全是 React 原生 |
+| 用什么编辑器？ | CodeMirror 6 | 纯文本真相 + 真 Vim + 低内存 |
+| 数据存哪？ | SQLite（派生）+ 文件（真相） | 索引可重建，内容不可丢 |
+| 用什么 ORM？ | **不用**，rusqlite + 手写 Repository | 需要 FTS5 与 PRAGMA 的完全控制 |
+| 状态怎么管？ | Zustand + TanStack Query + CM6 EditorState | 五种状态分层治理 |
+| 主题怎么做？ | Tailwind v4 + 三层 CSS 变量 | 运行时换肤的唯一正解 |
+| 插件怎么隔离？ | L0 lazy / L1 WASM / L2 Sidecar | 启动路径上零插件代码 |
+| Git 怎么同步？ | 设备分支 + rebase + 冲突降级为文件 | Git 不是同步引擎，要围着它设计 |
+| 历史版本？ | 内容寻址快照，与 Git 解耦 | 分钟级需求，Git 是会话级 |
+
+### 4.2 未决问题与演进路线
+
+| # | 问题 | 当前倾向 | 触发条件 |
+|---|------|----------|----------|
+| Q1 | 实时协作（两人同时编辑一篇） | 不做。CRDT 会产生非 Git 友好的状态，破坏"纯文本真相" | 若做，作为插件 + 独立 `.crdt` 侧车文件，不改 `.md` |
+| Q2 | 移动端 | 只读 + 快速捕获（Tauri 2.0 支持 iOS/Android） | v1.0 之后 |
+| Q3 | Web 分享页 | `apps/web` 复用 `ki-core` 编译为 WASM，只读渲染 | 需要分享功能时 |
+| Q4 | 本地 AI（RAG） | Sidecar + llama.cpp / Ollama，索引复用现有 FTS + 向量列 | v0.8 |
+| Q5 | 协同画板 | 单独 `.canvas` JSON 文件（Excalidraw 格式），不做实时同步 | 有明确需求时 |
+| Q6 | `gitoxide` 替换 `git2` | 观察中。gix 的 merge 支持尚不完整 | gix 支持三方合并时 |
+| Q7 | 多 Vault 同时打开 | 支持，每个 Vault 独立 SQLite 连接池 | v0.6 |
+
+### 4.3 架构图
+
+```mermaid
+flowchart TB
+    subgraph L1["① 表现层 · WebView · React 19"]
+        direction LR
+        SHELL["App Shell<br/>命令面板 / 侧栏 / 分栏 / 标签页"]
+        EDITOR["EditorHost<br/>CodeMirror 6 实例池"]
+        PREVIEW["Preview iframe<br/>sandbox + CSP"]
+        LAZY["L0 懒加载插件区<br/>画板 / 思维导图 / PDF / 表格"]
+        STORE["Zustand（UI 态）<br/>TanStack Query（IPC 态）"]
+    end
+
+    subgraph L2["② 桥接层 · IPC 契约"]
+        IPC["invoke 命令 · tauri-specta 生成类型<br/>DomainEvent 单向推送 · 大对象走 raw bytes"]
+    end
+
+    subgraph L3["③ 应用层 · Use Cases"]
+        UC1["NoteService"]
+        UC2["SearchService"]
+        UC3["SyncService"]
+        UC4["PluginHost"]
+        UC5["RenderService"]
+        UC6["RunnerService"]
+    end
+
+    subgraph L4["④ 领域层 · ki-core（纯 Rust，无 IO）"]
+        DOM["Note · Vault · Link · Tag · Asset · Conflict<br/>不变量校验 · 领域事件"]
+    end
+
+    subgraph L5["⑤ 基础设施层"]
+        FS["ki-vault<br/>原子写 tmp→fsync→rename<br/>notify watcher"]
+        DB[("SQLite · WAL<br/>rusqlite + FTS5 + jieba")]
+        GIT["ki-git · git2<br/>设备分支 / rebase / 三方合并"]
+        RENDER["ki-render<br/>remark → HTML → Paged.js"]
+        WASH["ki-plugin · Extism<br/>WASM 沙箱"]
+        PROC["Runner<br/>WASM / 进程 / 容器"]
+        HIST["history<br/>内容寻址快照"]
+    end
+
+    subgraph L6["⑥ 外部世界"]
+        VAULT[("Vault 目录<br/>notes/ assets/ templates/")]
+        REMOTE[("Git Remote")]
+        RUNTIME["系统运行时 / Docker / Pyodide"]
+        AI["LLM 端点<br/>本地或远端"]
+    end
+
+    SHELL --> STORE
+    EDITOR --> STORE
+    PREVIEW --> STORE
+    LAZY --> STORE
+    STORE <--> IPC
+
+    IPC <--> UC1
+    IPC <--> UC2
+    IPC <--> UC3
+    IPC <--> UC4
+    IPC <--> UC5
+    IPC <--> UC6
+
+    UC1 --> DOM
+    UC2 --> DOM
+    UC3 --> DOM
+    UC4 --> DOM
+    UC5 --> DOM
+
+    DOM --> FS
+    DOM --> DB
+    UC3 --> GIT
+    UC5 --> RENDER
+    UC4 --> WASH
+    UC6 --> PROC
+    UC1 --> HIST
+
+    FS --> VAULT
+    GIT --> VAULT
+    GIT --> REMOTE
+    PROC --> RUNTIME
+    WASH --> AI
+
+    classDef ui fill:#e8f0fe,stroke:#4285f4,color:#0b1f3a
+    classDef bridge fill:#fff4e5,stroke:#f59e0b,color:#3d2600
+    classDef app fill:#e6f4ea,stroke:#34a853,color:#0b2e13
+    classDef domain fill:#fce8e6,stroke:#ea4335,color:#3c0a06
+    classDef infra fill:#f3e8fd,stroke:#9334e6,color:#25103d
+    classDef ext fill:#f1f3f4,stroke:#5f6368,color:#1f1f1f
+
+    class SHELL,EDITOR,PREVIEW,LAZY,STORE ui
+    class IPC bridge
+    class UC1,UC2,UC3,UC4,UC5,UC6 app
+    class DOM domain
+    class FS,DB,GIT,RENDER,WASH,PROC,HIST infra
+    class VAULT,REMOTE,RUNTIME,AI ext
+```
+
+**读图要点**：
+
+1. **所有箭头向内**。`ki-core` 不知道 Tauri、不知道 SQLite、不知道 React。它是唯一可以被完整单测的层。
+2. **`STORE <--> IPC` 是唯一的跨语言边界**。没有第二条通路——前端不能绕过它去碰文件系统。
+3. **`LAZY` 不在启动关键路径上**。它在 `EditorHost` 解析扩展名时才被动态 `import()`。
+4. **`PREVIEW` 是独立的 iframe**，与 `EDITOR` 共享解析器版本，但不共享 DOM。
+5. **`HIST` 独立于 `GIT`**。历史版本是分钟级的本地能力，同步是会话级的网络能力，两者不耦合。
+
+---
+
+<div align="center">
+
+**知屿 KnowIsle** · 把知识，安放在自己的岛上。
+
+*本文件是架构的唯一真相源。修改它之前，先写一个新的 ADR。*
+
+</div>

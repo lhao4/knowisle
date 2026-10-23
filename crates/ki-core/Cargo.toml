@@ -1,0 +1,11 @@
+[package]
+name = "ki-core"
+description = "知屿 KnowIsle 领域模型：纯数据与不变量，零 IO、零 tauri 依赖"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

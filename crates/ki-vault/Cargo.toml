@@ -1,0 +1,16 @@
+[package]
+name = "ki-vault"
+description = "知屿 KnowIsle 的 Vault 文件系统层：扫描、路径安全、读取"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ki-core = { workspace = true }
+serde = { workspace = true }
+walkdir = { workspace = true }
+dunce = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

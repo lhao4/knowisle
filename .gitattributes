@@ -1,0 +1,17 @@
+# 统一换行符。没有这一行，Windows 与 macOS 之间每次同步都会
+# 产生"整个文件都改了"的假 diff —— 架构文档 3.1 已记录该决策。
+* text=auto eol=lf
+
+*.md text eol=lf
+*.rs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.sqlite binary
+*.woff2 binary
