@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use ki_core::FileNode;
-use ki_vault::{read_note, resolve_in_vault, scan_vault, ScanOptions};
+use ki_vault::{read_note, resolve_in_vault, scan_vault, ScanOptions, MAX_SAFE_DEPTH};
 use tempfile::TempDir;
 
 /// 把树里所有文件节点的 `path` 收集成排序后的数组，便于断言。
@@ -279,4 +279,142 @@ fn does_not_follow_symlinks() {
 
     let result = scan_vault(root, &ScanOptions::default()).expect("软链不应导致扫描失败");
     assert_eq!(collect_files(&result.tree), vec!["real/a.md".to_string()]);
+}
+
+/* ───────────────── 深度上限：极端入参不得让递归失控 ───────────────── */
+
+/// 造一条 `levels` 层目录链，最深处放一篇笔记，返回最深目录的相对路径。
+fn deep_fixture(root: &Path, levels: usize) -> String {
+    try_deep_fixture(root, levels).expect("创建深层夹具失败")
+}
+
+/// 同上，但建不出来时返回 `None` 而不是 panic。
+///
+/// 用于"比上限还深"的夹具：Windows 未启用长路径时 MAX_PATH 会拦在
+/// 约 100 层，那时这是环境限制而非代码缺陷，调用方应当跳过而不是失败。
+fn try_deep_fixture(root: &Path, levels: usize) -> Option<String> {
+    let mut rel = String::new();
+    for i in 0..levels {
+        if i > 0 {
+            rel.push('/');
+        }
+        rel.push('d');
+    }
+    let dir_path = root.join(&rel);
+    fs::create_dir_all(&dir_path).ok()?;
+    fs::write(dir_path.join("note.md"), "# deep\n").ok()?;
+    Some(rel)
+}
+
+fn depth_of(node: &FileNode) -> usize {
+    node.children
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|child| 1 + depth_of(child))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 深度测试专用参数：关掉剪空目录，否则断言会被"目录被剪掉"污染。
+fn opts_with_depth(max_depth: usize) -> ScanOptions {
+    ScanOptions {
+        max_depth,
+        prune_empty_dirs: false,
+        ..ScanOptions::default()
+    }
+}
+
+#[test]
+fn extreme_max_depth_keeps_every_level_and_does_not_crash() {
+    let dir = TempDir::new().unwrap();
+    let deepest = deep_fixture(dir.path(), 10);
+
+    let result =
+        scan_vault(dir.path(), &opts_with_depth(usize::MAX)).expect("极端 max_depth 不应导致失败");
+
+    assert_eq!(result.total_files, 1);
+    assert_eq!(
+        depth_of(&result.tree),
+        11,
+        "10 层目录 + 最深处的文件 = 11 条边；收敛只该削掉超限深度，不该误伤正常夹具"
+    );
+    assert!(
+        collect_files(&result.tree).contains(&format!("{deepest}/note.md")),
+        "最深处的笔记必须仍在树里"
+    );
+}
+
+#[test]
+fn extreme_max_depth_matches_default_behaviour() {
+    let dir = TempDir::new().unwrap();
+    deep_fixture(dir.path(), 6);
+
+    let with_default = scan_vault(dir.path(), &ScanOptions::default()).unwrap();
+    let with_extreme = scan_vault(
+        dir.path(),
+        &ScanOptions {
+            max_depth: usize::MAX,
+            ..ScanOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        collect_files(&with_default.tree),
+        collect_files(&with_extreme.tree),
+        "在远未触及上限的库上，usize::MAX 与默认值必须完全等价"
+    );
+    assert_eq!(with_default.total_dirs, with_extreme.total_dirs);
+}
+
+#[test]
+fn small_max_depth_truncates_the_walk() {
+    let dir = TempDir::new().unwrap();
+    deep_fixture(dir.path(), 10);
+
+    let result = scan_vault(dir.path(), &opts_with_depth(3)).unwrap();
+
+    assert_eq!(depth_of(&result.tree), 3, "树深必须正好卡在 3");
+    assert_eq!(result.total_files, 0, "笔记在第 10 层，应被深度上限截断");
+}
+
+#[test]
+fn max_depth_zero_yields_an_empty_tree() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "a/b.md", "# b\n");
+
+    let result = scan_vault(dir.path(), &opts_with_depth(0)).unwrap();
+
+    assert_eq!(result.total_files, 0);
+    assert_eq!(result.total_dirs, 0);
+    assert!(result.tree.children.unwrap_or_default().is_empty());
+}
+
+/// 端到端证明 clamp 真的接上了：造一条比 `MAX_SAFE_DEPTH` 更深的链，
+/// 传 `usize::MAX`，树深必须被硬砍在 `MAX_SAFE_DEPTH`。
+///
+/// 这条是唯一能抓住"有人把 `clamp_depth` 删了"的用例。建不出这么深的
+/// 夹具时（Windows 未开长路径）跳过——环境限制，不是代码缺陷。
+#[test]
+fn max_depth_is_clamped_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    let levels = MAX_SAFE_DEPTH + 8;
+
+    if try_deep_fixture(dir.path(), levels).is_none() {
+        eprintln!("跳过：当前文件系统建不出 {levels} 层目录");
+        return;
+    }
+
+    let result = scan_vault(dir.path(), &opts_with_depth(usize::MAX)).unwrap();
+
+    assert_eq!(
+        depth_of(&result.tree),
+        MAX_SAFE_DEPTH,
+        "请求 {levels} 层，实际必须被砍在 {MAX_SAFE_DEPTH} 层"
+    );
+    assert_eq!(
+        result.total_files, 0,
+        "唯一的笔记在第 {levels} 层，超出上限后不该出现在树里"
+    );
 }

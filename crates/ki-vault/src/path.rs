@@ -1,14 +1,26 @@
-//! 路径规范化与越界防护。
+//! 路径规范化、越界防护与读写边界。
 //!
-//! 这两个函数看起来微不足道，却是 Windows 上最容易被低估的两个坑：
+//! 这里有三个看起来微不足道、却决定安全边界的细节：
 //!
 //! 1. **分隔符**：`Path::to_string_lossy()` 在 Windows 上返回 `notes\a.md`。
 //!    只要这个反斜杠漏到前端一次，`path` 作为 Map key 就会分裂成两份。
 //! 2. **UNC 前缀**：`std::fs::canonicalize` 在 Windows 上返回 `\\?\E:\vault\...`。
 //!    它和对话框返回的 `E:\vault` 做 `starts_with` 比较会永远为 false，
 //!    于是所有"路径是否在 Vault 内"的检查静默失效。
+//! 3. **重解析点**：`canonicalize` 会穿透软链与 junction 返回真实落点。
+//!    这既是防线（逃逸链接解析后落在库外，被 `starts_with` 拒绝），
+//!    也是陷阱（最终组件是内部软链时，写入会落到另一篇笔记上）。
 //!
-//! 解决方案：所有路径转换只走 `to_posix`，所有规范化只走 `dunce::canonicalize`。
+//! 约定：所有路径转换只走 [`to_posix`]，所有规范化只走 `dunce::canonicalize`，
+//! 所有路径语法校验只走 `validate_rel`。
+//!
+//! # 读与写是两条不同的边界
+//!
+//! [`resolve_in_vault`] 用于**读**，允许路径穿过软链——因为穿透之后仍然要求落在
+//! Vault 内，"库内软链指向库内文件"只是软链的正常语义，不是漏洞。
+//!
+//! [`resolve_for_write`] 用于**写**，禁止最终组件是重解析点。原因见该函数的文档。
+//! 两者共用 `validate_rel` 做语法校验，规则只有一份。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -36,16 +48,15 @@ pub fn to_posix(rel: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// 把前端传来的 Vault 相对路径解析为绝对路径，并保证它没有逃出 Vault。
+/// 路径**语法**校验：只判断这段字符串有没有可能指向 Vault 内部，不碰文件系统。
 ///
-/// 这是所有"按路径读写"操作的唯一入口。绕过它直接 `root.join(user_input)`
-/// 等于把任意文件读取漏洞交给前端。
-pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
-    if rel.is_empty() {
-        return Ok(root.to_path_buf());
-    }
-
-    // NUL 字节会让底层 syscall 直接报错，提前拒绝并给出明确错误。
+/// 读写两条路径共用，确保规则只有一份——两份慢慢漂移的校验等于没有校验。
+///
+/// 拒绝的东西：
+/// - `NUL` 字节（会让底层 syscall 直接报错，提前拒掉好给出明确错误）
+/// - 绝对路径与带根路径（含 Windows 盘符、UNC、`\\?\` verbatim 前缀）
+/// - 任何非 `Normal` / `CurDir` 的组件，其中 `ParentDir` 就是防目录穿越的第一道闸
+fn validate_rel(rel: &str) -> Result<&Path, KiError> {
     if rel.contains('\0') {
         return Err(KiError::PathEscape {
             path: rel.to_owned(),
@@ -61,11 +72,10 @@ pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
         });
     }
 
-    // 逐段校验：只放行普通片段与 `.`。
-    // `..` 会落到 `_` 分支被拒绝，这是防目录穿越的第一道闸。
     for component in rel_path.components() {
         match component {
             Component::Normal(_) | Component::CurDir => {}
+            // `..` 落到这里被拒绝；`Prefix`（如 `C:foo` 这种盘符相对路径）同样拒绝。
             _ => {
                 return Err(KiError::PathEscape {
                     path: rel.to_owned(),
@@ -73,6 +83,38 @@ pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
             }
         }
     }
+
+    Ok(rel_path)
+}
+
+/// 把前端传来的 Vault 相对路径解析为绝对路径，并保证它没有逃出 Vault。
+///
+/// 这是所有"按路径**读**"操作的唯一入口。绕过它直接 `root.join(user_input)`
+/// 等于把任意文件读取漏洞交给前端。
+///
+/// # 软链语义
+///
+/// 路径上的软链会被 `canonicalize` 穿透，因此：
+/// - 链接指向**库外** → 解析结果落在库外 → 被 `starts_with` 拒绝。
+/// - 链接指向**库内** → 解析结果仍在库内 → 放行。这是软链的正常语义，
+///   不是漏洞：目标本来就在库里，按真实路径一样读得到。
+///
+/// 注意 `starts_with` 是**组件比较**而非字符串前缀比较，
+/// 所以 `vault-evil` 不会被误判为 `vault` 的子路径。
+///
+/// # 已知边界：TOCTOU
+///
+/// 检查（`canonicalize` + `starts_with`）与使用（`fs::read`）之间存在时间窗。
+/// 要在窗口内做手脚，攻击者需要对 Vault 目录有写权限——而那时他直接改笔记更省事。
+/// 因此这里不做 fd 级校验（`O_NOFOLLOW` / `GetFinalPathNameByHandle` 二次确认），
+/// 收益与复杂度不成比例。这是**有意识的取舍**，不是遗漏。
+///
+/// # 写入请用 [`resolve_for_write`]
+///
+/// 本函数要求目标**已存在**（`canonicalize` 的前提），因此无法用于新建笔记。
+/// 写入路径的额外约束见 [`resolve_for_write`]。
+pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
+    let rel_path = validate_rel(rel)?;
 
     // 第二道闸：解析符号链接后必须仍在 Vault 内。
     // 没有这一步，Vault 里一个指向 `C:\Windows` 的软链就能让任意读取成立。
@@ -87,4 +129,72 @@ pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
     }
 
     Ok(canonical)
+}
+
+/// 把 Vault 相对路径解析为**可写入**的绝对路径。
+///
+/// 与 [`resolve_in_vault`] 的三点不同，每一点都对应一个真实的失败场景：
+///
+/// 1. **目标文件可以不存在**（新建笔记），但父目录必须存在。
+///    `resolve_in_vault` 依赖 `canonicalize`，天然做不到这一点。
+/// 2. **父目录**被 `canonicalize` 后仍必须在 Vault 内——与读路径同一把闸。
+/// 3. **最终组件若已存在且是重解析点（软链 / junction / 挂载点），直接拒绝。**
+///
+/// 第 3 点不是洁癖，是两条具体的伤害：
+///
+/// - **数据完整性**：`a.md -> b.md`（两者都在库内）。若放行，`note_save("a.md")`
+///   会静默改写 `b.md`——用户以为在编辑 A，实际改坏了 B。两个文件都在库里，
+///   用户不会怀疑边界，所以这种 bug 比逃逸更难被发现。
+/// - **安全**：`a.md` 是指向库外的软链时，`fs::write` 会顺着它写到 Vault 之外，
+///   而"父目录在库内"的检查照样通过。这是"只检查父目录"最典型的漏法。
+///
+/// # 已知边界
+///
+/// - **硬链接无法在路径层识别**：硬链接和普通文件在路径上完全等价，要区分必须
+///   比对 inode / file index，超出本函数的职责。这是路径层的固有局限。
+/// - **TOCTOU 同上**：检查与写入之间仍有时间窗，取舍理由见 [`resolve_in_vault`]。
+pub fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
+    let rel_path = validate_rel(rel)?;
+
+    // 没有文件名意味着目标是目录本身或空路径，写入无意义。
+    let file_name = rel_path.file_name().ok_or_else(|| KiError::PathEscape {
+        path: rel.to_owned(),
+    })?;
+
+    let canonical_root = dunce::canonicalize(root)
+        .map_err(|e| KiError::io(root.to_string_lossy().into_owned(), &e))?;
+
+    // 父目录必须已存在：写入不会顺手替用户造目录，那属于上层的产品决策。
+    let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
+    let canonical_parent =
+        dunce::canonicalize(canonical_root.join(parent_rel)).map_err(|e| KiError::io(rel, &e))?;
+
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(KiError::PathEscape {
+            path: rel.to_owned(),
+        });
+    }
+
+    let target = canonical_parent.join(file_name);
+
+    // 最终组件是重解析点就拒绝。`symlink_metadata` 不跟随链接，
+    // 所以这里读到的是链接自身而非目标——正是我们要判断的东西。
+    // Windows 上 junction 也会被 `is_symlink()` 判为 true（已实测）。
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return Err(KiError::PathEscape {
+                path: rel.to_owned(),
+            });
+        }
+        // 目标是目录时提前给出可读错误，而不是让 `fs::write` 抛一个裸 OS 错误。
+        if file_type.is_dir() {
+            return Err(KiError::Io {
+                path: rel.to_owned(),
+                message: "目标是目录，不能当文件写入".to_owned(),
+            });
+        }
+    }
+
+    Ok(target)
 }

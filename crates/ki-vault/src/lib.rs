@@ -9,5 +9,5 @@
 pub mod path;
 pub mod scan;
 
-pub use path::{resolve_in_vault, to_posix};
-pub use scan::{read_note, scan_vault, ScanOptions};
+pub use path::{resolve_for_write, resolve_in_vault, to_posix};
+pub use scan::{read_note, scan_vault, ScanOptions, MAX_SAFE_DEPTH};
