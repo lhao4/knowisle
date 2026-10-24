@@ -1,13 +1,17 @@
 import { markdown } from '@codemirror/lang-markdown'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
-import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
-import { EditorState } from '@codemirror/state'
+import { HighlightStyle, syntaxHighlighting, syntaxTree } from '@codemirror/language'
+import { EditorState, type Range } from '@codemirror/state'
 import {
+  Decoration,
   EditorView,
+  ViewPlugin,
   drawSelection,
   highlightActiveLine,
   keymap,
   lineNumbers,
+  type DecorationSet,
+  type ViewUpdate,
 } from '@codemirror/view'
 import { tags } from '@lezer/highlight'
 import { useEffect, useImperativeHandle, useRef, type Ref } from 'react'
@@ -39,16 +43,117 @@ const IPC_COALESCE_MS = 300
  * 必须用 `HighlightStyle` 而不是在 CSS 里写 `.tok-heading`——
  * CM6 生成的是混淆过的类名（`ͼ1a` 之类），文档里的 `tok-*` 只是旧版本的痕迹。
  * 这里让颜色指向 CSS 变量，主题切换仍然只改一层 token。
+ *
+ * # 这里**不**写字号
+ *
+ * 字号交给行装饰（见下方 `headingLineClass`），原因在 `HeaderMark`：
+ * `@lezer/markdown` 把 `#` 单独映射成 `tags.processingInstruction`，
+ * 它比 `ATXHeading1/...` 更具体，所以标题正文放大到 1.6em 时 `#` 仍是 13px——
+ * 视觉上像渲染错误。行级字号才能让整行（含标记）等比缩放。
  */
 const kiHighlightStyle = HighlightStyle.define([
   { tag: tags.heading, fontWeight: '600', color: 'var(--ki-text-primary)' },
+  // 六级最轻，靠"更小 + 更淡"与前五级分开。字号不在这里（见上方说明），
+  // 但 `HighlightStyle` 命中最具体的那条时会**整条替换**父标签规则，
+  // 所以字重必须跟着写一遍，否则 H6 会掉回 400。
+  { tag: tags.heading6, fontWeight: '600', color: 'var(--ki-text-muted)' },
   { tag: tags.strong, fontWeight: '600' },
   { tag: tags.emphasis, fontStyle: 'italic' },
   { tag: [tags.link, tags.url], color: 'var(--ki-accent)' },
-  { tag: [tags.monospace, tags.processingInstruction], color: 'var(--ki-text-muted)' },
+  // 只上色。底色交给 `InlineCode` 的 mark 装饰：`CodeText`（围栏代码块的内容）
+  // 也映射到同一个 `monospace` tag，在这里加背景会让代码块每行出现一块
+  // 只覆盖文字宽度的灰底，看起来像坏掉。
+  { tag: tags.monospace, color: 'var(--ki-text-primary)' },
+  { tag: [tags.processingInstruction, tags.labelName], color: 'var(--ki-text-muted)' },
   { tag: tags.quote, color: 'var(--ki-text-muted)' },
   { tag: tags.list, color: 'var(--ki-accent)' },
 ])
+
+/** 行内代码的底色（只覆盖 `` `code` `` 本身，不碰围栏代码块）。 */
+const inlineCodeMark = Decoration.mark({ class: 'cm-ki-inline-code' })
+
+/**
+ * 行装饰：标题字号 + 引用块左边线。
+ *
+ * 两者都必须落在**行**上：
+ *
+ * - 引用块要跟着整块走（含块内空行），给行内 span 加 border 会在换行处断成锯齿。
+ * - 标题要让 `#` 与正文一起缩放，理由见 `kiHighlightStyle` 的注释。
+ *
+ * 类名是我们自己起的，CM6 不会混淆它（被混淆的是它内部生成的语法 token 类名）。
+ * 字号/颜色都指向 `--ki-*` token，主题切换只改一层。
+ */
+function headingLineClass(level: string): string {
+  return `cm-ki-h${level}`
+}
+
+function buildDecorations(view: EditorView): DecorationSet {
+  const { doc } = view.state
+  /** 行首 → 该行要挂的类名。一行可能同时是引用块与标题（`> # 标题`）。 */
+  const lineClasses = new Map<number, string[]>()
+  const marks: Range<Decoration>[] = []
+
+  const addLine = (pos: number, cls: string) => {
+    const from = doc.lineAt(pos).from
+    const classes = lineClasses.get(from)
+    if (classes === undefined) lineClasses.set(from, [cls])
+    else if (!classes.includes(cls)) classes.push(cls)
+  }
+
+  for (const { from, to } of view.visibleRanges) {
+    syntaxTree(view.state).iterate({
+      from,
+      to,
+      enter: (node) => {
+        const heading = /^(?:ATX|Setext)Heading([1-6])$/.exec(node.name)
+        if (heading !== null) {
+          addLine(node.from, headingLineClass(heading[1]))
+          return
+        }
+        if (node.name === 'InlineCode') {
+          marks.push(inlineCodeMark.range(node.from, node.to))
+          return
+        }
+        if (node.name === 'Blockquote') {
+          // 嵌套引用会命中同一个 Blockquote 多次（`> > a` 是两层），按行首去重。
+          const first = doc.lineAt(node.from).number
+          const last = doc.lineAt(Math.max(node.from, node.to - 1)).number
+          for (let n = first; n <= last; n += 1) addLine(doc.line(n).from, 'cm-ki-quote')
+        }
+      },
+    })
+  }
+
+  const ranges: Range<Decoration>[] = marks
+  for (const [from, classes] of lineClasses) {
+    ranges.push(Decoration.line({ class: classes.join(' ') }).range(from))
+  }
+  // `sort` 交给 Decoration.set：可见区间与嵌套层级都不保证按位置递增。
+  return Decoration.set(ranges, true)
+}
+
+const markdownDecorations = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet
+
+    constructor(view: EditorView) {
+      this.decorations = buildDecorations(view)
+    }
+
+    update(update: ViewUpdate) {
+      // 第三个条件不能省：Lezer 是增量异步解析的，编辑后树可能在下一次
+      // update（不是 viewport 变化）才补齐，少了它会漏画新出现的引用块。
+      if (
+        update.docChanged ||
+        update.viewportChanged ||
+        syntaxTree(update.state) !== syntaxTree(update.startState)
+      ) {
+        this.decorations = buildDecorations(update.view)
+      }
+    }
+  },
+  { decorations: (v) => v.decorations },
+)
 
 export interface NoteEditorHandle {
   /** 编辑器里此刻的完整正文。切换笔记前用它把最后几个字捞出来。 */
@@ -212,6 +317,7 @@ export function NoteEditor({
           ]),
           markdown(),
           syntaxHighlighting(kiHighlightStyle),
+          markdownDecorations,
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (!update.docChanged) return

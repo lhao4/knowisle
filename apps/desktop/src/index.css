@@ -31,10 +31,21 @@
   --ki-text-muted: var(--ki-slate-500);
   --ki-text-faint: var(--ki-slate-400);
   --ki-border-subtle: var(--ki-slate-200);
+  --ki-border-quote: var(--ki-slate-400);
+  --ki-bg-code: var(--ki-slate-200);
   --ki-accent: var(--ki-blue-500);
 
   --ki-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --ki-font-mono: ui-monospace, 'Cascadia Code', Consolas, 'Microsoft YaHei Mono', monospace;
+
+  /* 标题字号：CM6 的行装饰按级挂 `cm-ki-hN`，六级各自一档。
+   * 用 em 是刻意的——基准字号在 `.cm-content` 上，改一处全体等比缩放。 */
+  --ki-font-h1: 1.6em;
+  --ki-font-h2: 1.4em;
+  --ki-font-h3: 1.22em;
+  --ki-font-h4: 1.08em;
+  --ki-font-h5: 1em;
+  --ki-font-h6: 0.92em;
 
   color-scheme: light;
   font-family: var(--ki-font-sans);
@@ -423,32 +434,50 @@ body {
   border-left-color: var(--ki-accent);
 }
 
-/* Markdown 语法高亮：只做"结构可见"，不做"配色表演"。 */
-.editor .cm-content .tok-heading {
-  font-weight: 600;
-  color: var(--ki-text-primary);
+/* Markdown 语法高亮：只做"结构可见"，不做"配色表演"。
+ *
+ * 颜色与字重**全部**在 `NoteEditor.tsx` 的 `HighlightStyle.define` 里；
+ * 字号与引用块左边线走行装饰，类名由 `Decoration` 挂上来（我们自己的名字）。
+ * 这里不写 `.tok-*`——CM6 给语法 token 生成的是混淆类名（`ͼo`），
+ * 手写的 `.tok-heading` 匹配不到任何元素，是旧版本留下的死代码。
+ */
+
+/* 标题字号：整行（含 `#` 标记）等比缩放，见 NoteEditor 里的说明。 */
+.editor .cm-line.cm-ki-h1 {
+  font-size: var(--ki-font-h1);
 }
 
-.editor .cm-content .tok-strong {
-  font-weight: 600;
+.editor .cm-line.cm-ki-h2 {
+  font-size: var(--ki-font-h2);
 }
 
-.editor .cm-content .tok-emphasis {
-  font-style: italic;
+.editor .cm-line.cm-ki-h3 {
+  font-size: var(--ki-font-h3);
 }
 
-.editor .cm-content .tok-link,
-.editor .cm-content .tok-url {
-  color: var(--ki-accent);
+.editor .cm-line.cm-ki-h4 {
+  font-size: var(--ki-font-h4);
 }
 
-.editor .cm-content .tok-monospace {
-  font-family: var(--ki-font-mono);
-  background: var(--ki-bg-surface);
+.editor .cm-line.cm-ki-h5 {
+  font-size: var(--ki-font-h5);
 }
 
-.editor .cm-content .tok-quote {
-  color: var(--ki-text-muted);
+.editor .cm-line.cm-ki-h6 {
+  font-size: var(--ki-font-h6);
+}
+
+/* 引用块左边线：整块连续，块内空行也算。 */
+.editor .cm-line.cm-ki-quote {
+  border-left: 2px solid var(--ki-border-quote);
+  padding-left: 10px;
+}
+
+/* 行内代码底色：只挂在 `InlineCode` 上，围栏代码块不受影响。 */
+.editor .cm-ki-inline-code {
+  padding: 1px 2px;
+  border-radius: 3px;
+  background: var(--ki-bg-code);
 }
 
 /* ───────────────────────── 欢迎页 ───────────────────────── */
