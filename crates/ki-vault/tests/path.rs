@@ -69,12 +69,17 @@ fn sibling_directory_with_shared_prefix_is_rejected() {
     assert!(format!("{err:?}").contains("PathEscape"), "实际 {err:?}");
 }
 
-/// 库内软链**不是**漏洞：解析后仍在库内，按真实路径一样读得到。
+/// 库内软链**同样**被拒绝：可见边界与可读边界必须是同一条线。
 ///
-/// 这条用例的作用是防止将来有人"为了安全"把软链一律禁掉——
-/// 那属于策略变更，需要单独讨论，不该顺手做。
+/// 这条用例是 B-12 的结论，此前它的断言是反的（库内链接放行）。
+/// 当时不构成逃逸——目标本来就在库里——但扫描器 `follow_links(false)`
+/// 根本看不见 `link/`，于是 `note_read("link/ok.md")` 读得通、侧栏里却没有这个目录。
+/// 一旦有了编辑器，这就从「读得到但看不见」升级成「改得到但看不见」。
+///
+/// 如果将来要支持软链，必须**两边一起改**（扫描器显示链接 + 解析器放行），
+/// 而不是只放开一边。
 #[test]
-fn symlink_to_inside_is_allowed() {
+fn symlink_to_inside_is_rejected_too() {
     let vault = TempDir::new().unwrap();
     fs::create_dir_all(vault.path().join("sub")).unwrap();
     fs::write(vault.path().join("sub").join("ok.md"), "INSIDE").unwrap();
@@ -84,12 +89,13 @@ fn symlink_to_inside_is_allowed() {
         "目录链接"
     );
 
-    let resolved = resolve_in_vault(vault.path(), "link/ok.md").expect("库内链接应当放行");
-    assert_eq!(fs::read_to_string(&resolved).unwrap(), "INSIDE");
-    assert!(
-        resolved.ends_with(Path::new("sub").join("ok.md")),
-        "解析结果必须落到真实路径，实际 {resolved:?}"
-    );
+    let err = resolve_in_vault(vault.path(), "link/ok.md")
+        .expect_err("库内软链也必须拒绝，否则可见边界与可读边界不一致");
+    assert!(format!("{err:?}").contains("PathEscape"), "实际 {err:?}");
+
+    // 真实路径仍然读得到——拒绝的是"穿过链接"，不是"读这个文件"。
+    let real = resolve_in_vault(vault.path(), "sub/ok.md").expect("真实路径必须放行");
+    assert_eq!(fs::read_to_string(&real).unwrap(), "INSIDE");
 }
 
 #[test]

@@ -159,6 +159,17 @@ body {
 .banner--warn {
   background: #fffbeb;
   color: var(--ki-amber-600);
+  /* 冲突横幅里带一个按钮，所以不能只用 pre-wrap 排文本。 */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.btn--small {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font-size: 12px;
 }
 
 .workspace {
@@ -342,6 +353,102 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   tab-size: 2;
+}
+
+/* ───────────────────────── 编辑器（CodeMirror 6） ───────────────────────── */
+
+/*
+ * CM6 的主题走 CSS 变量，不写 JS 主题对象。
+ *
+ * 理由与整个文件一致：写死 `#2563eb` 的地方换主题要一个个改，
+ * 写 `var(--ki-accent)` 的地方只覆盖一层变量。CM6 的 `.cm-*` 类名是稳定 API，
+ * 官方文档明确说"用 CSS 定制主题"是受支持的路径之一。
+ */
+
+.editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.editor .cm-editor {
+  height: 100%;
+  background: var(--ki-bg-canvas);
+  font-family: var(--ki-font-mono);
+  font-size: 13px;
+}
+
+.editor .cm-editor.cm-focused {
+  /* CM6 默认给聚焦态加 outline，与整体视觉冲突，去掉后靠光标位置表达焦点。 */
+  outline: none;
+}
+
+.editor .cm-scroller {
+  line-height: 1.7;
+  overflow: auto;
+}
+
+.editor .cm-content {
+  padding: 24px;
+  caret-color: var(--ki-accent);
+}
+
+.editor .cm-line {
+  /* 中文与等宽拉丁混排时，行高比字体行高更可靠。 */
+  padding: 0;
+}
+
+.editor .cm-gutters {
+  background: var(--ki-bg-canvas);
+  border-right: 1px solid var(--ki-border-subtle);
+  color: var(--ki-text-faint);
+  font-size: 11px;
+}
+
+.editor .cm-activeLine {
+  background: var(--ki-bg-surface);
+}
+
+.editor .cm-activeLineGutter {
+  background: var(--ki-bg-surface);
+  color: var(--ki-text-muted);
+}
+
+.editor .cm-selectionBackground,
+.editor .cm-content ::selection {
+  background: var(--ki-bg-active) !important;
+}
+
+.editor .cm-cursor {
+  border-left-color: var(--ki-accent);
+}
+
+/* Markdown 语法高亮：只做"结构可见"，不做"配色表演"。 */
+.editor .cm-content .tok-heading {
+  font-weight: 600;
+  color: var(--ki-text-primary);
+}
+
+.editor .cm-content .tok-strong {
+  font-weight: 600;
+}
+
+.editor .cm-content .tok-emphasis {
+  font-style: italic;
+}
+
+.editor .cm-content .tok-link,
+.editor .cm-content .tok-url {
+  color: var(--ki-accent);
+}
+
+.editor .cm-content .tok-monospace {
+  font-family: var(--ki-font-mono);
+  background: var(--ki-bg-surface);
+}
+
+.editor .cm-content .tok-quote {
+  color: var(--ki-text-muted);
 }
 
 /* ───────────────────────── 欢迎页 ───────────────────────── */

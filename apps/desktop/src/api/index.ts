@@ -24,6 +24,7 @@ export type {
   NodeKind,
   NoteContent,
   SaveResult,
+  SaveState,
   ScanResult,
 } from './bindings'
 
@@ -39,9 +40,25 @@ export const noteRead = commands.noteRead
  * `content` 是**完整正文**，不是增量；父目录必须已存在（不会代建）。
  * 写入是原子的，崩溃只会看到旧内容或新内容。
  *
- * M1 只提供能力，还没接编辑器——UI 入口在 M2。
+ * 这是"无条件覆盖"：不做冲突检查。编辑器请用 {@link noteEdit}。
  */
 export const noteSave = commands.noteSave
+
+/**
+ * 提交一次编辑，由 Rust 侧的节流器决定何时落盘（1.5 秒）。
+ *
+ * `baseMtime` 传打开这篇笔记时 `noteRead` 返回的 mtime，
+ * 只在切换文档时被采信一次——基线随后由 Rust 随每次成功落盘向前推进。
+ *
+ * 返回 {@link SaveState}：是否有内容未落盘、最近一次落盘的 mtime、最近一次错误。
+ */
+export const noteEdit = commands.noteEdit
+
+/** 立刻落盘，不等节流周期。切换笔记、关窗前调用。 */
+export const noteFlush = commands.noteFlush
+
+/** 查询保存状态，不触发写入。只在前端 `dirty` 为真时轮询。 */
+export const noteStatus = commands.noteStatus
 
 /**
  * 健康检查：确认 Rust 侧真的起来了。

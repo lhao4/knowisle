@@ -20,8 +20,19 @@ use specta::Type;
 /// 前端要写 `switch (err.code)`，就必须知道 `code` 的全部取值以及每个取值下
 /// `detail` 的形状。手写这份联合类型等于把错误模型抄了两遍；`Type` 让它只有一份。
 /// 新加一个变体而前端没跟上时，`tsc` 会直接报错，而不是在运行时落到 default 分支。
-#[derive(Debug, thiserror::Error, Serialize, Type)]
-#[serde(tag = "code", content = "detail", rename_all = "SCREAMING_SNAKE_CASE")]
+///
+/// # 两套 rename
+///
+/// `rename_all` 管**变体名**（`Io` → `"IO"`），`rename_all_fields` 管**字段名**
+/// （`expected_mtime` → `"expectedMtime"`）。两者分开是因为变体要 SCREAMING_SNAKE
+/// 才好在 `switch` 里读，而字段要和其它所有类型一样是 camelCase。
+#[derive(Debug, Clone, thiserror::Error, Serialize, Type)]
+#[serde(
+    tag = "code",
+    content = "detail",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    rename_all_fields = "camelCase"
+)]
 pub enum KiError {
     /// 传入的路径存在，但不是目录。
     #[error("不是目录：{path}")]
@@ -42,6 +53,21 @@ pub enum KiError {
     /// 文件超出单文件大小上限。
     #[error("文件过大（{size} 字节）：{path}")]
     TooLarge { path: String, size: u64 },
+
+    /// 写入时发现磁盘上的文件已被别的程序改过（乐观锁失败）。
+    ///
+    /// 调用方读到的是 `expected_mtime` 那一版，磁盘上现在是 `disk_mtime`
+    /// （`None` 表示文件已经不存在了）。
+    ///
+    /// **抛出本错误时文件一个字节都没被改**：检查发生在写盘之前，
+    /// 磁盘保持原样，由调用方决定"重新加载"还是"强制覆盖"。
+    /// 这条语义很重要——如果先写再报冲突，那冲突就成了"覆盖之后的通知"。
+    #[error("文件已被外部修改：{path}")]
+    Conflict {
+        path: String,
+        expected_mtime: i64,
+        disk_mtime: Option<i64>,
+    },
 
     /// 不应发生的内部错误（后台任务 panic、序列化失败等）。
     #[error("{0}")]

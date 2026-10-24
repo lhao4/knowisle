@@ -8,19 +8,25 @@
 //!    它和对话框返回的 `E:\vault` 做 `starts_with` 比较会永远为 false，
 //!    于是所有"路径是否在 Vault 内"的检查静默失效。
 //! 3. **重解析点**：`canonicalize` 会穿透软链与 junction 返回真实落点。
-//!    这既是防线（逃逸链接解析后落在库外，被 `starts_with` 拒绝），
-//!    也是陷阱（最终组件是内部软链时，写入会落到另一篇笔记上）。
+//!    穿透本身是防线的另一半（逃逸链接解析后落在库外，被 `starts_with` 拒绝），
+//!    但它同时会**抹掉"这段路径是链接"这个事实**——所以要在穿透之前先逐级查一遍。
 //!
 //! 约定：所有路径转换只走 [`to_posix`]，所有规范化只走 `dunce::canonicalize`，
-//! 所有路径语法校验只走 `validate_rel`。
+//! 所有路径语法校验只走 [`validate_rel`]。
 //!
-//! # 读与写是两条不同的边界
+//! # 读写共用同一条可见边界
 //!
-//! [`resolve_in_vault`] 用于**读**，允许路径穿过软链——因为穿透之后仍然要求落在
-//! Vault 内，"库内软链指向库内文件"只是软链的正常语义，不是漏洞。
+//! 扫描器用 `follow_links(false)`，**不进入**任何重解析点——软链条目直接计入 `skipped`。
+//! 解析器（本模块）与它对齐：路径上出现任何重解析点就拒绝。
 //!
-//! [`resolve_for_write`] 用于**写**，禁止最终组件是重解析点。原因见该函数的文档。
-//! 两者共用 `validate_rel` 做语法校验，规则只有一份。
+//! 这条对齐是 B-12 的结论。此前的行为是「扫描器不跟、解析器跟」，于是
+//! `note_read("link/x.md")` 读得通、但 `link/` 在侧栏里根本看不见。
+//! 当时不构成逃逸（目标本来就在库内），但一旦有了编辑器，它就升级成
+//! **「改得到但看不见」**：用户可能在编辑一篇树里不存在的笔记，
+//! 左侧高亮不到任何节点，而且写入会落到另一个路径上。
+//!
+//! 代价是每条路径多 k 次 `symlink_metadata`（k = 路径深度，通常 3–5）。
+//! 相比「可见边界与可读边界不是同一条线」带来的困惑，这个代价是划算的。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -87,6 +93,43 @@ fn validate_rel(rel: &str) -> Result<&Path, KiError> {
     Ok(rel_path)
 }
 
+/// 从库根开始逐级检查 `rel`，任何一级是重解析点（软链 / junction / 挂载点）就拒绝。
+///
+/// # 为什么必须在 `canonicalize` **之前**跑
+///
+/// `canonicalize` 的职责就是把链接穿透成真实落点，穿透完就再也看不出
+/// 「这段路径原本是个链接」了。等它跑完再检查，等于问一个已经把答案改掉的人
+/// 原来的答案是什么。所以顺序是**先逐级查、再规范化**。
+///
+/// # 为什么不存在也算通过
+///
+/// 写路径允许目标文件尚不存在（新建笔记）。`symlink_metadata` 对不存在的路径
+/// 返回 `ENOENT`，那不是"危险"，是"还没有"。真正的存在性要求由调用方
+/// 对**父目录**的 `canonicalize` 负责。
+///
+/// # 为什么用 `symlink_metadata`
+///
+/// 它**不跟随**链接，读到的是链接自身而不是目标——正是这里要判断的东西。
+/// Windows 上 junction 也会被 `is_symlink()` 判为 true（已实测，见
+/// `tests/path.rs` 的 junction 用例）。
+fn reject_reparse_points(root: &Path, rel: &Path, rel_str: &str) -> Result<(), KiError> {
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        current.push(segment);
+        if let Ok(meta) = std::fs::symlink_metadata(&current) {
+            if meta.file_type().is_symlink() {
+                return Err(KiError::PathEscape {
+                    path: rel_str.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 把前端传来的 Vault 相对路径解析为绝对路径，并保证它没有逃出 Vault。
 ///
 /// 这是所有"按路径**读**"操作的唯一入口。绕过它直接 `root.join(user_input)`
@@ -94,18 +137,17 @@ fn validate_rel(rel: &str) -> Result<&Path, KiError> {
 ///
 /// # 软链语义
 ///
-/// 路径上的软链会被 `canonicalize` 穿透，因此：
-/// - 链接指向**库外** → 解析结果落在库外 → 被 `starts_with` 拒绝。
-/// - 链接指向**库内** → 解析结果仍在库内 → 放行。这是软链的正常语义，
-///   不是漏洞：目标本来就在库里，按真实路径一样读得到。
+/// 路径上任何一级是重解析点就直接拒绝，与扫描器 `follow_links(false)` 对齐。
+/// 详见模块文档的「读写共用同一条可见边界」。
 ///
 /// 注意 `starts_with` 是**组件比较**而非字符串前缀比较，
 /// 所以 `vault-evil` 不会被误判为 `vault` 的子路径。
 ///
 /// # 已知边界：TOCTOU
 ///
-/// 检查（`canonicalize` + `starts_with`）与使用（`fs::read`）之间存在时间窗。
-/// 要在窗口内做手脚，攻击者需要对 Vault 目录有写权限——而那时他直接改笔记更省事。
+/// 检查（逐级 `symlink_metadata` + `canonicalize` + `starts_with`）与使用
+/// （`fs::read`）之间存在时间窗。要在窗口内做手脚，攻击者需要对 Vault 目录有
+/// 写权限——而那时他直接改笔记更省事。
 /// 因此这里不做 fd 级校验（`O_NOFOLLOW` / `GetFinalPathNameByHandle` 二次确认），
 /// 收益与复杂度不成比例。这是**有意识的取舍**，不是遗漏。
 ///
@@ -116,11 +158,15 @@ fn validate_rel(rel: &str) -> Result<&Path, KiError> {
 pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
     let rel_path = validate_rel(rel)?;
 
-    // 第二道闸：解析符号链接后必须仍在 Vault 内。
-    // 没有这一步，Vault 里一个指向 `C:\Windows` 的软链就能让任意读取成立。
-    let canonical = dunce::canonicalize(root.join(rel_path)).map_err(|e| KiError::io(rel, &e))?;
     let canonical_root = dunce::canonicalize(root)
         .map_err(|e| KiError::io(root.to_string_lossy().into_owned(), &e))?;
+
+    // 第一道闸：路径上不许有任何重解析点。
+    reject_reparse_points(&canonical_root, rel_path, rel)?;
+
+    // 第二道闸：规范化后必须仍在 Vault 内。
+    // 没有这一步，Vault 里一个指向 `C:\Windows` 的软链就能让任意读取成立。
+    let canonical = dunce::canonicalize(root.join(rel_path)).map_err(|e| KiError::io(rel, &e))?;
 
     if !canonical.starts_with(&canonical_root) {
         return Err(KiError::PathEscape {
@@ -133,20 +179,24 @@ pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
 
 /// 把 Vault 相对路径解析为**可写入**的绝对路径。
 ///
-/// 与 [`resolve_in_vault`] 的三点不同，每一点都对应一个真实的失败场景：
+/// 与 [`resolve_in_vault`] 的两点不同，每一点都对应一个真实的失败场景：
 ///
 /// 1. **目标文件可以不存在**（新建笔记），但父目录必须存在。
 ///    `resolve_in_vault` 依赖 `canonicalize`，天然做不到这一点。
-/// 2. **父目录**被 `canonicalize` 后仍必须在 Vault 内——与读路径同一把闸。
-/// 3. **最终组件若已存在且是重解析点（软链 / junction / 挂载点），直接拒绝。**
+/// 2. **目标是目录时提前报错**，而不是让 `fs::write` 抛一个裸 OS 错误。
 ///
-/// 第 3 点不是洁癖，是两条具体的伤害：
+/// # 重解析点：与读路径同一把闸
+///
+/// 路径上任何一级（含最终组件）是软链 / junction 都拒绝。这不是洁癖，
+/// 是三条具体的伤害：
 ///
 /// - **数据完整性**：`a.md -> b.md`（两者都在库内）。若放行，`note_save("a.md")`
 ///   会静默改写 `b.md`——用户以为在编辑 A，实际改坏了 B。两个文件都在库里，
 ///   用户不会怀疑边界，所以这种 bug 比逃逸更难被发现。
 /// - **安全**：`a.md` 是指向库外的软链时，`fs::write` 会顺着它写到 Vault 之外，
 ///   而"父目录在库内"的检查照样通过。这是"只检查父目录"最典型的漏法。
+/// - **一致性**：扫描器不进入软链，所以软链里的文件在侧栏里根本看不见。
+///   若写入放行，用户就在改一篇"树里不存在"的笔记。
 ///
 /// # 已知边界
 ///
@@ -164,6 +214,9 @@ pub fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
     let canonical_root = dunce::canonicalize(root)
         .map_err(|e| KiError::io(root.to_string_lossy().into_owned(), &e))?;
 
+    // 逐级拒绝重解析点，覆盖父目录与最终组件。
+    reject_reparse_points(&canonical_root, rel_path, rel)?;
+
     // 父目录必须已存在：写入不会顺手替用户造目录，那属于上层的产品决策。
     let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
     let canonical_parent =
@@ -177,18 +230,10 @@ pub fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
 
     let target = canonical_parent.join(file_name);
 
-    // 最终组件是重解析点就拒绝。`symlink_metadata` 不跟随链接，
-    // 所以这里读到的是链接自身而非目标——正是我们要判断的东西。
-    // Windows 上 junction 也会被 `is_symlink()` 判为 true（已实测）。
+    // 目标是目录时提前给出可读错误。重解析点已经在上面的逐级检查里拒掉了，
+    // 这里只剩"普通目录"这一种情况。
     if let Ok(meta) = std::fs::symlink_metadata(&target) {
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            return Err(KiError::PathEscape {
-                path: rel.to_owned(),
-            });
-        }
-        // 目标是目录时提前给出可读错误，而不是让 `fs::write` 抛一个裸 OS 错误。
-        if file_type.is_dir() {
+        if meta.file_type().is_dir() {
             return Err(KiError::Io {
                 path: rel.to_owned(),
                 message: "目标是目录，不能当文件写入".to_owned(),

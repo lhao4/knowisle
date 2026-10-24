@@ -56,6 +56,9 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 原子地把 `content` 写入 Vault 内的 `rel`，返回落盘后的真实大小与 mtime。
 ///
+/// 无条件覆盖：不检查磁盘上的现状。要防"覆盖掉别人刚做的修改"，
+/// 用 [`write_note_checked`]。
+///
 /// # 边界
 ///
 /// 路径校验全部交给 [`resolve_for_write`]：父目录必须在库内且**已存在**
@@ -72,6 +75,34 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 与 [`crate::read_note`] 共用 [`MAX_NOTE_BYTES`]：写不进去的内容，
 /// 也就不该被写进去——能写不能读是一种最难排查的不一致。
 pub fn write_note(root: &Path, rel: &str, content: &str) -> Result<SaveResult, KiError> {
+    write_note_checked(root, rel, content, None)
+}
+
+/// 带乐观锁的原子写：只有磁盘上的 mtime 仍等于 `expected_mtime` 时才写。
+///
+/// `expected_mtime` 为 `None` 时等价于 [`write_note`]（无条件覆盖）。
+///
+/// # 为什么需要它
+///
+/// 自动保存会在用户没有明确动作的情况下写盘。如果用户在 Obsidian 里改了同一篇，
+/// 知屿这边 1.5 秒后把它覆盖掉——丢的是**别人已经保存好的数据**，
+/// 比断电丢自己未保存的输入严重一档。断电只是丢了"还没写的"，
+/// 这个是抹掉了"已经写好的"。
+///
+/// # 语义边界
+///
+/// - 检查发生在写盘**之前**：抛出 [`KiError::Conflict`] 时文件一个字节都没动。
+/// - 只比 mtime，不比内容 hash：算 hash 要把文件整个读一遍，而自动保存每 1.5 秒
+///   触发一次，1MB 的笔记就是每 1.5 秒多读 1MB。mtime 是行业惯例（Obsidian 同款）。
+/// - **已知漏检**：mtime 精度只有 1 秒的文件系统（FAT32、部分网络盘）上，
+///   同一秒内的两次外部修改可能拿到相同 mtime。这是取舍，不是疏忽；
+///   真要补得加 size + 内容抽样，收益与成本不成比例。
+pub fn write_note_checked(
+    root: &Path,
+    rel: &str,
+    content: &str,
+    expected_mtime: Option<i64>,
+) -> Result<SaveResult, KiError> {
     let bytes = content.as_bytes();
     if bytes.len() as u64 > MAX_NOTE_BYTES {
         return Err(KiError::TooLarge {
@@ -81,6 +112,23 @@ pub fn write_note(root: &Path, rel: &str, content: &str) -> Result<SaveResult, K
     }
 
     let target = resolve_for_write(root, rel)?;
+
+    // 冲突检查紧挨着 commit，把 TOCTOU 窗口压到最小。
+    // 文件不存在时 `metadata` 失败，`disk_mtime` 为 None —— 那也属于冲突：
+    // 调用方读到过的文件现在没了，不能当作"新建"静默写出去。
+    if let Some(expected) = expected_mtime {
+        let disk_mtime = std::fs::metadata(&target)
+            .ok()
+            .map(|meta| stat(Some(meta)).1);
+        if disk_mtime != Some(expected) {
+            return Err(KiError::Conflict {
+                path: rel.to_owned(),
+                expected_mtime: expected,
+                disk_mtime,
+            });
+        }
+    }
+
     let parent = target.parent().ok_or_else(|| KiError::PathEscape {
         path: rel.to_owned(),
     })?;

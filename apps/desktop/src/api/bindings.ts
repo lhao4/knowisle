@@ -21,6 +21,42 @@ export const commands = {
 	 */
 	noteSave: (root: string, path: string, content: string) => __TAURI_INVOKE<SaveResult>("note_save", { root, path, content }),
 	/**
+	 *  提交一次编辑，由 Rust 侧的节流器决定何时落盘。
+	 * 
+	 *  # 为什么不是前端定时调 `note_save`
+	 * 
+	 *  前端定时器会被 webview 节流（窗口失焦时降到约 1 次/分钟），
+	 *  用户切去别的应用再回来，中间那段时间根本没保存。放在这里则不受影响。
+	 * 
+	 *  # 参数
+	 * 
+	 *  - `content` 是**完整正文**，不是增量。
+	 *  - `base_mtime` 是打开这篇笔记时 `note_read` 返回的 mtime，
+	 *    **只在切换文档时采信一次**。同一文档的后续调用可以一直传同一个值，
+	 *    基线由 Rust 侧随每次成功落盘向前推进。
+	 * 
+	 *  # 返回值
+	 * 
+	 *  [`SaveState`]：是否有内容未落盘、最近一次落盘的 mtime、最近一次错误。
+	 *  前端据此渲染「已保存 / 未保存 / 冲突」。
+	 */
+	noteEdit: (root: string, path: string, content: string, baseMtime: number | null) => __TAURI_INVOKE<SaveState>("note_edit", { root, path, content, baseMtime }),
+	/**
+	 *  立刻落盘（切换笔记、关窗前调用），不必等节流器的下一个周期。
+	 * 
+	 *  `force` 为真时跳过乐观锁，直接覆盖——对应冲突提示里的「用我的版本覆盖」。
+	 * 
+	 *  返回 `None` 表示本来就没有待落盘的内容。
+	 */
+	noteFlush: (root: string, path: string, force: boolean) => __TAURI_INVOKE<SaveResult | null>("note_flush", { root, path, force }),
+	/**
+	 *  查询保存状态，不触发写入。
+	 * 
+	 *  自动落盘在 Rust 侧异步发生，前端只能靠它知道「什么时候存完了」。
+	 *  只在前端 `dirty` 为真时轮询，空闲时不轮询。
+	 */
+	noteStatus: (root: string, path: string) => __TAURI_INVOKE<SaveState>("note_status", { root, path }),
+	/**
 	 *  健康检查：前端启动时用它确认 IPC 通道是通的。
 	 * 
 	 *  返回 `AppInfo` 而不是 `serde_json::Value`：后者对 specta 是不可描述的，
@@ -85,6 +121,12 @@ export type FileNode = {
  *  前端要写 `switch (err.code)`，就必须知道 `code` 的全部取值以及每个取值下
  *  `detail` 的形状。手写这份联合类型等于把错误模型抄了两遍；`Type` 让它只有一份。
  *  新加一个变体而前端没跟上时，`tsc` 会直接报错，而不是在运行时落到 default 分支。
+ * 
+ *  # 两套 rename
+ * 
+ *  `rename_all` 管**变体名**（`Io` → `"IO"`），`rename_all_fields` 管**字段名**
+ *  （`expected_mtime` → `"expectedMtime"`）。两者分开是因为变体要 SCREAMING_SNAKE
+ *  才好在 `switch` 里读，而字段要和其它所有类型一样是 camelCase。
  */
 export type KiError = 
 /**  传入的路径存在，但不是目录。 */
@@ -108,6 +150,21 @@ export type KiError =
 { code: "TOO_LARGE"; detail: {
 	path: string,
 	size: number,
+} } | 
+/**
+ *  写入时发现磁盘上的文件已被别的程序改过（乐观锁失败）。
+ * 
+ *  调用方读到的是 `expected_mtime` 那一版，磁盘上现在是 `disk_mtime`
+ *  （`None` 表示文件已经不存在了）。
+ * 
+ *  **抛出本错误时文件一个字节都没被改**：检查发生在写盘之前，
+ *  磁盘保持原样，由调用方决定"重新加载"还是"强制覆盖"。
+ *  这条语义很重要——如果先写再报冲突，那冲突就成了"覆盖之后的通知"。
+ */
+{ code: "CONFLICT"; detail: {
+	path: string,
+	expectedMtime: number,
+	diskMtime: number | null,
 } } | 
 /**  不应发生的内部错误（后台任务 panic、序列化失败等）。 */
 { code: "INTERNAL"; detail: string };
@@ -139,6 +196,25 @@ export type SaveResult = {
 	size: number,
 	/**  写入后的 mtime（Unix 毫秒）。 */
 	mtime: number,
+};
+
+/**
+ *  自动保存的当前状态。
+ * 
+ *  每次 `note_edit` 都回传一份，前端据此渲染「已保存 / 未保存 / 出错」。
+ *  把它做成结构体而不是让前端自己推断，是因为「有没有内容没落盘」这个事实
+ *  只有持有待写内容的 Rust 侧知道——前端猜不出来。
+ * 
+ *  只 `Serialize` 不 `Deserialize`：它从 Rust 流向 UI，单向。
+ *  （`last_error` 里是 [`KiError`]，而错误类型本来就不该被反序列化成输入。）
+ */
+export type SaveState = {
+	/**  是否还有内容没落盘。 */
+	dirty: boolean,
+	/**  最近一次成功落盘后的 mtime；本次会话从未落盘时为 `None`。 */
+	lastSavedMtime: number | null,
+	/**  最近一次落盘的错误（典型是 [`KiError::Conflict`]）。落盘成功后清空。 */
+	lastError: KiError | null,
 };
 
 /**

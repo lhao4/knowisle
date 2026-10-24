@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use crate::error::KiError;
+
 /// 树节点类型。序列化为小写字符串：`"dir"` / `"file"`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
@@ -127,6 +129,25 @@ pub struct SaveResult {
     pub size: u64,
     /// 写入后的 mtime（Unix 毫秒）。
     pub mtime: i64,
+}
+
+/// 自动保存的当前状态。
+///
+/// 每次 `note_edit` 都回传一份，前端据此渲染「已保存 / 未保存 / 出错」。
+/// 把它做成结构体而不是让前端自己推断，是因为「有没有内容没落盘」这个事实
+/// 只有持有待写内容的 Rust 侧知道——前端猜不出来。
+///
+/// 只 `Serialize` 不 `Deserialize`：它从 Rust 流向 UI，单向。
+/// （`last_error` 里是 [`KiError`]，而错误类型本来就不该被反序列化成输入。）
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveState {
+    /// 是否还有内容没落盘。
+    pub dirty: bool,
+    /// 最近一次成功落盘后的 mtime；本次会话从未落盘时为 `None`。
+    pub last_saved_mtime: Option<i64>,
+    /// 最近一次落盘的错误（典型是 [`KiError::Conflict`]）。落盘成功后清空。
+    pub last_error: Option<KiError>,
 }
 
 /// `app_ping` 的返回值：IPC 通道的握手信息。

@@ -17,4 +17,4 @@ pub mod error;
 pub mod node;
 
 pub use error::KiError;
-pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, ScanResult};
+pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};

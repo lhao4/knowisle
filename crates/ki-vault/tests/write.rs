@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use common::{skip_unless, try_link_dir, try_link_file};
-use ki_vault::{read_note, scan_vault, write_note, ScanOptions};
+use ki_vault::{read_note, scan_vault, write_note, write_note_checked, ScanOptions};
 use tempfile::TempDir;
 
 /// 目录里除 `keep` 之外的文件名。用来断言"没有留下垃圾"。
@@ -448,4 +448,83 @@ fn readonly_target_behaviour_is_platform_specific() {
         assert!(result.is_ok(), "Unix 上 rename 不受目标只读属性影响");
         assert_eq!(fs::read_to_string(&target).unwrap(), "NEW");
     }
+}
+
+/* ───────────────────── 乐观锁：别把别人刚存的改动抹掉 ───────────────────── */
+
+/// 基线正确：mtime 与磁盘一致时，带检查的写必须成功。
+#[test]
+fn checked_write_succeeds_when_mtime_matches() {
+    let vault = TempDir::new().unwrap();
+    let first = write_note(vault.path(), "a.md", "V1").unwrap();
+
+    let second = write_note_checked(vault.path(), "a.md", "V2", Some(first.mtime))
+        .expect("mtime 一致时应当允许写入");
+    assert_eq!(read_note(vault.path(), "a.md").unwrap().content, "V2");
+    assert_eq!(second.size, 2);
+}
+
+/// 磁盘被外部改过（mtime 变了）时必须拒绝，**并且一个字节都不写**。
+///
+/// 这条用例是自动保存的安全底线：没有它，知屿会在用户不知情的情况下
+/// 覆盖掉 Obsidian 里刚保存的内容。
+#[test]
+fn checked_write_rejects_a_stale_base_and_leaves_the_file_untouched() {
+    let vault = TempDir::new().unwrap();
+    let base = write_note(vault.path(), "a.md", "MINE").unwrap();
+
+    // 模拟外部编辑器写入：内容与 mtime 都变。
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(vault.path().join("a.md"), "THEIRS").unwrap();
+
+    let err = write_note_checked(vault.path(), "a.md", "MINE-EDITED", Some(base.mtime))
+        .expect_err("基线过期必须报冲突");
+
+    match &err {
+        ki_core::KiError::Conflict {
+            path,
+            expected_mtime,
+            disk_mtime,
+        } => {
+            assert_eq!(path, "a.md");
+            assert_eq!(*expected_mtime, base.mtime);
+            assert_ne!(*disk_mtime, Some(base.mtime), "磁盘 mtime 应当已经变了");
+        }
+        other => panic!("应为 Conflict，实际 {other:?}"),
+    }
+
+    assert_eq!(
+        fs::read_to_string(vault.path().join("a.md")).unwrap(),
+        "THEIRS",
+        "冲突时绝不能写盘——否则冲突就成了「覆盖之后的马后炮」"
+    );
+}
+
+/// 目标文件被删掉也算冲突：调用方读到过的文件现在没了，
+/// 不能当成「新建」静默写出去（那会让用户以为恢复了一篇其实被别人删掉的笔记）。
+#[test]
+fn checked_write_reports_conflict_when_the_file_disappeared() {
+    let vault = TempDir::new().unwrap();
+    let base = write_note(vault.path(), "gone.md", "BYE").unwrap();
+    fs::remove_file(vault.path().join("gone.md")).unwrap();
+
+    let err = write_note_checked(vault.path(), "gone.md", "BACK", Some(base.mtime))
+        .expect_err("文件消失应当报冲突");
+    match &err {
+        ki_core::KiError::Conflict { disk_mtime, .. } => {
+            assert_eq!(*disk_mtime, None, "文件不存在时 disk_mtime 必须是 None");
+        }
+        other => panic!("应为 Conflict，实际 {other:?}"),
+    }
+    assert!(!vault.path().join("gone.md").exists(), "不该凭空重建");
+}
+
+/// 不传基线（`None`）时行为与 `write_note` 完全一致：无条件覆盖。
+#[test]
+fn checked_write_without_a_base_is_an_unconditional_overwrite() {
+    let vault = TempDir::new().unwrap();
+    write_note(vault.path(), "a.md", "OLD").unwrap();
+
+    write_note_checked(vault.path(), "a.md", "NEW", None).expect("无基线时应当直接覆盖");
+    assert_eq!(read_note(vault.path(), "a.md").unwrap().content, "NEW");
 }
