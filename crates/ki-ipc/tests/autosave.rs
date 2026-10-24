@@ -338,6 +338,45 @@ fn switching_while_the_worker_is_mid_write_still_flushes_the_previous_note() {
     );
 }
 
+/// 切换文档时上一篇写盘失败，**不能变成死循环**。
+///
+/// `drain_previous` 失败分支的回归用例。`write_job` 出错时会把 job 放回槽位，
+/// 若 drain 用 `continue` 重试，下一轮就会把它原样取出来再写一次，
+/// 同样的内容配同样的基线必然得到同样的错误——永远出不来。
+///
+/// 这条在 Windows CI 上真实发生过：`Test (ki-ipc)` 挂满 13 分钟没动。
+/// 触发条件是「上一个用例的 worker 在槽位被重置后才写完」，它把旧文档的
+/// mtime 记进新槽位，于是切换时的写盘必然冲突。
+#[test]
+fn switching_away_from_a_failing_note_does_not_spin() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let opened = seed(&root, "a.md", "MINE");
+    seed(&root, "b.md", "B0");
+
+    // 外部改过 → 前端手里的基线过期 → 写盘必然冲突。
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(vault.path().join("a.md"), "THEIRS").unwrap();
+
+    edit(&root, "a.md", "MINE-EDITED", Some(opened.mtime));
+    assert!(
+        block_on(note_flush(root.clone(), "a.md".to_owned(), false)).is_err(),
+        "基线过期必须报冲突"
+    );
+
+    // 此刻 pending 里躺着一份写不出去的内容。切换必须立刻返回。
+    // 放到另一个线程里做，这样死循环表现为「超时失败」而不是「测试挂住」——
+    // 挂住的用例在 CI 上只会撞 job 超时，看不出是哪一条。
+    let (tx, rx) = std::sync::mpsc::channel();
+    let switched_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(edit(&switched_root, "b.md", "B-EDITED", None));
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("切换文档时上一篇写盘失败，drain_previous 陷入死循环");
+}
+
 /* ───────────────────── 路径边界 ───────────────────── */
 
 /// 自动保存不能成为绕过路径校验的后门。

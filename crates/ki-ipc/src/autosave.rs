@@ -154,6 +154,12 @@ const JOIN_POLL: Duration = Duration::from_millis(200);
 fn drain_previous() {
     let deadline = Instant::now() + JOIN_TIMEOUT;
     loop {
+        // 上限放在循环顶部：下面的 `continue` 会跳过它，而那条路径
+        // 恰好是唯一可能不收敛的地方（见写失败分支）。
+        if Instant::now() > deadline {
+            return;
+        }
+
         let job = {
             let mut slot = lock();
             if let Some(job) = slot.pending.take() {
@@ -166,16 +172,22 @@ fn drain_previous() {
         };
 
         if let Some(job) = job {
-            // 失败已经记进槽位（`last_error`），这里不再重复处理：
-            // 旧文档写失败不该拦住切换，用户切回来时会看到同一个错误。
-            let _ = lock().write_job(job, false);
+            let outcome = lock().write_job(job, false);
             SHARED.wake.notify_all();
+            if outcome.is_err() {
+                // **不能重试。** `write_job` 失败时会把 job 放回槽位，
+                // 若这里 `continue`，下一轮就会把它原样取出来再写一次，
+                // 同样的内容配同样的基线必然得到同样的错误——死循环。
+                // Windows CI 上 `Test (ki-ipc)` 就是这么挂住的：
+                // 前一个用例留下的过期基线让切换时的写盘必然冲突。
+                //
+                // 内容仍留在槽位里，等用户下次编辑或显式 flush 再试；
+                // 旧文档写失败也不该拦住切换。
+                return;
+            }
             continue;
         }
 
-        if Instant::now() > deadline {
-            return;
-        }
         let slot = lock();
         let (guard, _) = SHARED
             .wake
@@ -382,6 +394,13 @@ pub fn status(root: &Path, path: &str) -> SaveState {
 /// 看不到只在单元测试下存在的符号。
 #[doc(hidden)]
 pub fn reset_for_test() {
+    // 先让上一篇落定，再清槽位。
+    //
+    // 不清就直接 `*slot = Slot::default()` 的话，上一个用例的 worker 可能
+    // 还在写盘：它写完会把**旧文档的 mtime** 记进新槽位（`record_success`
+    // 会推进 `baseline`），于是下一个用例的每一次写盘都拿一个过期的基线去比，
+    // 全部报冲突。这条污染在 Windows CI 上表现为 `drain_previous` 死循环。
+    drain_previous();
     let mut slot = lock();
     *slot = Slot::default();
 }
