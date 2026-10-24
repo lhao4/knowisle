@@ -83,6 +83,20 @@
 - **方案** 库打开时扫一遍 `.knowisle.tmp.*`，删「pid 已不存在」或「mtime 早于 N 小时」的。**不要**改成固定的 `.knowisle/tmp/` 目录——跨目录 rename 会失去原子性。
 - **触发** 第一次有用户报"目录里出现奇怪的 `.knowisle.tmp` 文件"，或做「库健康检查」功能时。不急：它不占数据，只占文件名。
 
+### B-15 旧 e2e 脚本的 `invoke` 桩在 Tauri 2 上**静默失效**
+
+- **来源** M1/M2 的 CDP 验收脚本（`.tmp/cdp-*.mjs`）。旧脚本的套路是「替换 `window.__TAURI_INTERNALS__.invoke`，桩掉原生对话框」。
+- **影响** Tauri 2 把它定义成 `writable: false, configurable: false`，赋值在 sloppy mode 下**不抛错**——脚本以为自己桩上了，实际调的还是真 IPC。症状是「明明桩了却仍走真实路径」，排查方向会被彻底带偏（M1 为此浪费了一轮）。
+- **方案（已采纳）** 不桩任何应用代码：写 `localStorage['knowisle.lastVault']` → `Page.reload`，让应用走自己的「恢复上次打开的库」路径；需要驱动别的入口时点真实 DOM。见 `scripts/perf-m1.mjs` 与 M2 的 `cdp-outline.mjs`。
+- **触发** 写任何新的 CDP 验收脚本时。**这条是硬规则**：任何「替换 `__TAURI_INTERNALS__` 成员」的方案一律不采用，它只会静默失败。
+
+### B-16 autosave 槽位是进程级静态，测量/测试前必须重启应用
+
+- **来源** `crates/ki-ipc/src/autosave.rs` 的 `static SHARED`。M1 性能脚本的文件头写了前置说明，M2 验收时又撞了一次。
+- **影响** 槽位记着 `(root, path)` 与乐观锁基线，**只在「换文档」时重置**。夹具被脚本重写后 mtime 变了，同一个进程里对同一篇的第一次 `Ctrl+S` 必然 `CONFLICT`——看起来像「保存坏了」，其实是乐观锁在正确工作。
+- **方案** 端到端脚本一律在开头重启应用（脚本头部写明）；Rust 侧测试用 `autosave::reset_for_test()`。
+- **触发** 每次跑 `scripts/perf-m1.mjs` 或任何会写盘的 CDP 脚本。判据：出现 `CONFLICT` 且夹具刚被重写过，先重启再怀疑代码。
+
 ---
 
 ## P3 · 想法池（功能冻结期暂缓）
