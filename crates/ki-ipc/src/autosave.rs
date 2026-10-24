@@ -55,6 +55,9 @@ struct Slot {
     /// 是否已有一个线程在等或正在写。
     worker_running: bool,
     last_saved_mtime: Option<i64>,
+    /// 最近一次成功落盘的回执。`note_flush` 在没有待写内容时返回它，
+    /// 这样调用方总能拿到"磁盘上现在是什么"而不是一句"没东西可写"。
+    last_saved: Option<SaveResult>,
     last_error: Option<KiError>,
 }
 
@@ -67,6 +70,7 @@ impl Default for Slot {
             throttle: SaveThrottle::new(),
             worker_running: false,
             last_saved_mtime: None,
+            last_saved: None,
             last_error: None,
         }
     }
@@ -85,15 +89,33 @@ impl Slot {
     /// 失败时**不**推进，否则错误会被静默推迟 1.5 秒。
     fn record_success(&mut self, saved: &SaveResult, now: Instant) {
         self.last_saved_mtime = Some(saved.mtime);
+        self.last_saved = Some(saved.clone());
         self.baseline = Some(saved.mtime);
         self.last_error = None;
         self.throttle.mark_flushed(now);
+    }
+
+    /// 写一次并记账。
+    ///
+    /// `force` 为真时跳过乐观锁（用户在冲突提示里选了「覆盖」）。
+    /// 冲突时把内容放回槽位——用户的字不能就这么丢了。
+    fn write_job(&mut self, job: Job, force: bool) -> Result<SaveResult, KiError> {
+        let expected = if force { None } else { job.expected_mtime };
+        let result = write_note_checked(&job.root, &job.path, &job.content, expected);
+        match &result {
+            Ok(saved) => self.record_success(saved, Instant::now()),
+            Err(err) => {
+                self.pending = Some(job);
+                self.last_error = Some(err.clone());
+            }
+        }
+        result
     }
 }
 
 struct Shared {
     slot: Mutex<Slot>,
-    /// worker 退出或完成一次落盘时唤醒等待者（`note_flush`）。
+    /// worker 退出或完成一次落盘时唤醒等待者（`note_flush` / 切换文档）。
     wake: Condvar,
 }
 
@@ -108,33 +130,92 @@ fn lock() -> std::sync::MutexGuard<'static, Slot> {
     SHARED.slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// 等 worker 收工的上限。超过就放弃等待，宁可让调用方慢一点也不要永久卡住。
+const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 单次等待的切片。用短切片轮询而不是一次等满 5 秒：
+/// `notify_all` 与 `wait` 之间存在丢失唤醒的窗口，短切片让重查足够及时。
+const JOIN_POLL: Duration = Duration::from_millis(200);
+
+/// 把上一篇彻底写完（或确认它已经写完）再切换。
+///
+/// # 为什么不能只 `take` 一次就切
+///
+/// worker 可能**已经**把 pending 取走、正在写。此时 `take` 拿到 `None`，
+/// 若直接切换，槽位就指向了新文档，而 worker 还在写旧文档——它写完之后
+/// 会把"成功"记到新文档头上，而旧文档的内容是否落盘完全没人知道。
+/// 这条竞态在 Windows 上几乎撞不到（写盘慢，`take` 总能先到），
+/// 在 macOS 上第一轮 CI 就撞到了两次。
+///
+/// # 返回值
+///
+/// 放弃等待时（磁盘卡死超过 5 秒）不报错，只是不再等——
+/// 切换文档这件事本身不能被一次写盘卡住。
+fn drain_previous() {
+    let deadline = Instant::now() + JOIN_TIMEOUT;
+    loop {
+        let job = {
+            let mut slot = lock();
+            if let Some(job) = slot.pending.take() {
+                Some(job)
+            } else if slot.worker_running {
+                None
+            } else {
+                return;
+            }
+        };
+
+        if let Some(job) = job {
+            // 失败已经记进槽位（`last_error`），这里不再重复处理：
+            // 旧文档写失败不该拦住切换，用户切回来时会看到同一个错误。
+            let _ = lock().write_job(job, false);
+            SHARED.wake.notify_all();
+            continue;
+        }
+
+        if Instant::now() > deadline {
+            return;
+        }
+        let slot = lock();
+        let (guard, _) = SHARED
+            .wake
+            .wait_timeout(slot, JOIN_POLL)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(guard);
+    }
+}
+
 /// 提交一次编辑：入队、按需起定时线程，返回当前保存状态。
 ///
 /// `base_mtime` 是前端打开这篇笔记时读到的 mtime，**只在切换文档时采信一次**。
 /// 同一文档的后续调用忽略它：基线在 Rust 侧随每次成功落盘向前推进。
 pub fn submit(root: PathBuf, path: String, content: String, base_mtime: Option<i64>) -> SaveState {
+    let target = (root, path);
+    let switching = {
+        let slot = lock();
+        slot.key.as_ref() != Some(&target)
+    };
+
+    if switching {
+        // 这一步在锁外做：它要写盘，持锁写盘会让 worker 和 flush 全部堵住。
+        drain_previous();
+    }
+
     let mut slot = lock();
 
-    let switching = slot.key.as_ref() != Some(&(root.clone(), path.clone()));
-    if switching {
-        // 旧文档还有没落盘的内容：同步写完再切。宁可这一次 IPC 慢 10ms，
-        // 也不要让"切走"变成一次静默的数据丢失。
-        if let Some(job) = slot.pending.take() {
-            let result = write_note_checked(&job.root, &job.path, &job.content, job.expected_mtime);
-            match result {
-                Ok(saved) => slot.record_success(&saved, Instant::now()),
-                Err(err) => slot.last_error = Some(err),
-            }
-        }
-        slot.key = Some((root.clone(), path.clone()));
+    if slot.key.as_ref() != Some(&target) {
+        slot.key = Some(target.clone());
         slot.baseline = base_mtime;
         slot.throttle.reset();
+        // 新文档还没落过盘，也不该继承上一篇的状态与错误。
         slot.last_saved_mtime = None;
+        slot.last_saved = None;
+        slot.last_error = None;
     }
 
     slot.pending = Some(Job {
-        root,
-        path,
+        root: target.0,
+        path: target.1,
         content,
         expected_mtime: slot.baseline,
     });
@@ -143,8 +224,7 @@ pub fn submit(root: PathBuf, path: String, content: String, base_mtime: Option<i
         return slot.state();
     }
 
-    // 到期了才起线程；没到期说明已有一个 worker 在等（但 worker_running 为 false
-    // 表示它刚退出），这时直接起新的即可——新的会先算 deadline 再睡。
+    // 起一个新线程：它会先算 deadline 再决定睡多久。
     slot.worker_running = true;
     drop(slot);
     std::thread::spawn(worker);
@@ -152,15 +232,21 @@ pub fn submit(root: PathBuf, path: String, content: String, base_mtime: Option<i
     lock().state()
 }
 
-/// 立刻落盘，返回落盘结果。
+/// 立刻落盘。
 ///
-/// - `Ok(None)`：没有待落盘内容（已是最新）。
-/// - `Ok(Some(_))`：刚刚写成功。
+/// # 契约
+///
+/// 调用返回后，**调用方提交过的内容一定已经在磁盘上**（除非返回 `Err`）。
+///
+/// - `Ok(Some(result))`：磁盘上是这份内容，`result` 是它的 stat。
+///   可能是这次刚写的，也可能是 worker 刚写完的——对调用方没有区别。
+/// - `Ok(None)`：这篇笔记本次会话从未写过任何东西。
 /// - `Err(_)`：写失败，**内容仍留在槽位里**，下次编辑会重试。
 ///
 /// `force` 为真时跳过乐观锁（用户在冲突提示里选了「覆盖」）。
 pub fn flush(root: &Path, path: &str, force: bool) -> Result<Option<SaveResult>, KiError> {
     let key = (root.to_path_buf(), path.to_owned());
+    let deadline = Instant::now() + JOIN_TIMEOUT;
 
     loop {
         let job = {
@@ -168,54 +254,40 @@ pub fn flush(root: &Path, path: &str, force: bool) -> Result<Option<SaveResult>,
 
             if slot.key.as_ref() != Some(&key) {
                 // 不是当前文档：没有可落盘的内容。
-                // 但要把"这篇曾经写失败"的事实报出去，否则错误永远不会被看见。
                 return Ok(None);
             }
 
             match slot.pending.take() {
-                Some(job) => job,
-                None if slot.worker_running => {
-                    // worker 正在写，等它把 timer_running 放下来。
-                    // 超时兜底：worker 若因为磁盘卡死而长时间不返回，
-                    // 调用方至少要拿到一个"没写完"的答案而不是永久阻塞。
-                    let (guard, timeout) = SHARED
-                        .wake
-                        .wait_timeout(slot, Duration::from_secs(5))
-                        .unwrap_or_else(PoisonError::into_inner);
-                    drop(guard);
-                    if timeout.timed_out() {
-                        return Err(KiError::Internal("等待自动保存完成超时（5 秒）".to_owned()));
-                    }
-                    continue;
-                }
+                Some(job) => Some(job),
+                None if slot.worker_running => None,
                 None => {
                     // 没有待写内容：把上次的错误交出去。
                     // 用 `clone` 而不是 `take`——错误要一直留着，直到下一次成功落盘。
                     // 否则前端调一次 flush 就再也拿不到它，冲突提示会凭空消失。
                     return match slot.last_error.clone() {
                         Some(err) => Err(err),
-                        None => Ok(None),
+                        None => Ok(slot.last_saved.clone()),
                     };
                 }
             }
         };
 
-        let expected = if force { None } else { job.expected_mtime };
-        let result = write_note_checked(&job.root, &job.path, &job.content, expected);
-
-        let mut slot = lock();
-        match &result {
-            Ok(saved) => slot.record_success(saved, Instant::now()),
-            Err(err) => {
-                // 内容放回槽位：用户的字还在编辑器里，但也不能就这么丢了。
-                // 不推进 throttle，所以下一次编辑会立刻重试。
-                slot.pending = Some(job);
-                slot.last_error = Some(err.clone());
-            }
+        if let Some(job) = job {
+            let result = lock().write_job(job, force);
+            SHARED.wake.notify_all();
+            return result.map(Some);
         }
-        SHARED.wake.notify_all();
 
-        return result.map(Some);
+        if Instant::now() > deadline {
+            return Err(KiError::Internal("等待自动保存完成超时（5 秒）".to_owned()));
+        }
+        // worker 正在写：等它收工，然后重查。
+        let slot = lock();
+        let (guard, _) = SHARED
+            .wake
+            .wait_timeout(slot, JOIN_POLL)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(guard);
     }
 }
 
@@ -312,4 +384,15 @@ pub fn status(root: &Path, path: &str) -> SaveState {
 pub fn reset_for_test() {
     let mut slot = lock();
     *slot = Slot::default();
+}
+
+/// 内部状态探针，只给测试用。
+///
+/// 返回 `(是否还有待落盘内容, 是否有线程在跑)`。
+/// 测试需要它来**确定性地**命中"worker 已取走内容、正在写盘"这个窗口——
+/// 靠 sleep 猜时间只能得到概率测试，变异验证时会漏掉目标分支。
+#[doc(hidden)]
+pub fn debug_state_for_test() -> (bool, bool) {
+    let slot = lock();
+    (slot.pending.is_some(), slot.worker_running)
 }

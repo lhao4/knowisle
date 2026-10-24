@@ -107,20 +107,33 @@ fn flush_writes_immediately() {
     assert_eq!(disk(&vault, "a.md"), "FLUSHED");
 }
 
-/// 没有待落盘内容时，flush 返回 `None` 而不是伪造一个结果。
+/// 没有待落盘内容时，flush 报告**磁盘现状**，而不是一句"没东西可写"。
+///
+/// 这条契约的用处：调用方（切换笔记、关窗前）只想知道"我的内容在不在磁盘上"。
+/// 返回 `None` 会让它以为失败了，而实际上内容早就被自动保存写完了——
+/// worker 抢先落盘是常态，不是异常。
 #[test]
-fn flush_without_pending_content_returns_none() {
+fn flush_reports_the_on_disk_state_when_nothing_is_pending() {
     let _guard = serial();
     let vault = TempDir::new().unwrap();
     let root = root_of(&vault);
     seed(&root, "a.md", "OLD");
 
-    // 换文档会先同步落盘旧内容，所以这里 flush 时已经没有 pending 了。
     edit(&root, "a.md", "SYNCED", None);
-    block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+    let first = block_on(note_flush(root.clone(), "a.md".to_owned(), false))
+        .expect("flush 应当成功")
+        .expect("提交过内容，应当有落盘结果");
 
-    let again = block_on(note_flush(root, "a.md".to_owned(), false)).unwrap();
-    assert!(again.is_none(), "没有未落盘内容时应当返回 None");
+    // 等自动保存自己写一遍，确保这次 flush 面对的是"真的没有 pending"。
+    // 不加这个等待，用例是否覆盖到目标分支取决于线程调度——那就成了运气测试。
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 第二次 flush：内容已经在磁盘上，返回同一份 stat。
+    let again = block_on(note_flush(root, "a.md".to_owned(), false))
+        .expect("flush 应当成功")
+        .expect("磁盘上有内容，应当返回它的 stat");
+    assert_eq!(again.mtime, first.mtime, "没有新写入时 mtime 不该变");
+    assert_eq!(disk(&vault, "a.md"), "SYNCED");
 }
 
 /// 连续提交时，磁盘上最终必须是**最后一次**的内容，不是中间某一版。
@@ -277,6 +290,51 @@ fn switching_documents_resets_the_reported_state() {
     assert_eq!(
         state.last_saved_mtime, None,
         "新文档还没落过盘，不该继承上一篇的 mtime"
+    );
+}
+
+/// **切换时 worker 正在写旧文档**，旧内容也必须落盘。
+///
+/// 这条锁的是 `drain_previous` 的存在理由：worker 已经 `take` 走了 pending
+/// 正在写盘，此时若直接切换，槽位就指向了新文档，而旧文档写没写完全没人管。
+/// 更糟的是 worker 写完后会把"成功"记到新文档头上。
+///
+/// 用 1MB 正文把写盘时间拉长，再用 `debug_state_for_test` 等到 worker 把内容
+/// 取走之后才切换——`edit` 一返回就切换的话，worker 往往还没被调度起来，
+/// 目标分支根本走不到（变异验证时确认过这一点）。
+#[test]
+fn switching_while_the_worker_is_mid_write_still_flushes_the_previous_note() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    seed(&root, "a.md", "");
+    seed(&root, "b.md", "");
+
+    let big = "x".repeat(1_000_000);
+    edit(&root, "a.md", &big, None);
+
+    // 等 worker 把内容取走：此后它要么正在写，要么刚写完。
+    // 不再要求"恰好抓到正在写"那一瞬——写盘只要几毫秒，抓那一瞬会变成 flaky，
+    // 而"取走之后"这个状态已经足够让切换与落盘重叠。
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if !autosave::debug_state_for_test().0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !autosave::debug_state_for_test().0,
+        "5 秒内 worker 都没把内容取走，自动保存的定时线程没工作"
+    );
+
+    // 此刻切换：pending 已空，但 worker 手里可能还有活。
+    edit(&root, "b.md", "B", None);
+
+    assert_eq!(
+        disk(&vault, "a.md").len(),
+        1_000_000,
+        "切换文档时必须等旧文档写完，否则 worker 的成果会记到新文档头上"
     );
 }
 
