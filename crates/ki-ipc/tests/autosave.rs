@@ -377,6 +377,89 @@ fn switching_away_from_a_failing_note_does_not_spin() {
         .expect("切换文档时上一篇写盘失败，drain_previous 陷入死循环");
 }
 
+/* ───────────────────── 关窗落盘 ───────────────────── */
+
+/// 关窗路径用的 `flush_slot()` 必须把槽位里的内容写下去。
+///
+/// 它没有参数：`(root, path)` 从槽位自己取。这条用例锁的就是「自己取」——
+/// 一旦有人给它加参数并要求调用方传入，关窗回调就得凭空知道当前是哪一篇，
+/// 而那是不可能的（窗口事件里没有文档信息）。
+#[test]
+fn flush_slot_writes_whatever_the_slot_holds() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    seed(&root, "a.md", "OLD");
+
+    edit(&root, "a.md", "CLOSED", None);
+    // 不等 1.5 秒：关窗就发生在节流窗口之内，这正是要覆盖的场景。
+    autosave::flush_slot();
+
+    assert_eq!(disk(&vault, "a.md"), "CLOSED");
+}
+
+/// 槽位为空（从没编辑过）时，`flush_slot()` 必须立刻返回且不碰磁盘。
+///
+/// 关窗是用户已经不耐烦才按的按钮，这里多一次 `stat` 都是可见的卡顿。
+/// 判据用耗时而不是「有没有调用 fs」：后者要打桩，而这条路径的价值就在于
+/// **什么都不做**，能观测到的只有时间。
+#[test]
+fn flush_slot_returns_immediately_when_the_slot_is_empty() {
+    let _guard = serial();
+    let started = std::time::Instant::now();
+    autosave::flush_slot();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "空槽位的 flush_slot 花了 {elapsed:?}，说明它没有提前返回"
+    );
+}
+
+/// 槽位非空但已经落定（无待写、无 worker）时，同样立刻返回。
+///
+/// 这是「编辑过、但自动保存已经写完」的常态：用户打了字，等了两秒，再关窗。
+/// 此时若还去 `flush()`，会走一遍加锁 → 查 pending → 返回 `last_saved` 的流程，
+/// 结果正确但没必要。
+#[test]
+fn flush_slot_returns_immediately_when_nothing_is_pending() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    seed(&root, "a.md", "OLD");
+
+    edit(&root, "a.md", "SYNCED", None);
+    block_on(note_flush(root, "a.md".to_owned(), false)).unwrap();
+
+    let started = std::time::Instant::now();
+    autosave::flush_slot();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "无待写内容时 flush_slot 花了 {elapsed:?}，说明它没有走提前返回"
+    );
+    assert_eq!(disk(&vault, "a.md"), "SYNCED");
+}
+
+/// 冲突时 `flush_slot()` 不能 panic，也不能覆盖对方的内容。
+///
+/// 关窗路径吞掉错误是刻意的（没有地方展示），但「吞掉」不等于「乱写」：
+/// 乐观锁仍然生效，用户的字留在磁盘外的原因和平时一模一样。
+#[test]
+fn flush_slot_swallows_a_conflict_without_overwriting() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let opened = seed(&root, "a.md", "MINE");
+
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(vault.path().join("a.md"), "THEIRS").unwrap();
+
+    edit(&root, "a.md", "MINE-EDITED", Some(opened.mtime));
+    autosave::flush_slot();
+
+    assert_eq!(disk(&vault, "a.md"), "THEIRS", "冲突时绝不能覆盖外部内容");
+}
+
 /* ───────────────────── 路径边界 ───────────────────── */
 
 /// 自动保存不能成为绕过路径校验的后门。
