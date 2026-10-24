@@ -1,0 +1,124 @@
+name: CI
+
+# 三平台验证是 M0 留下的唯一红灯（MVP-SCOPE：M0 的目的是把跨平台不确定性撞碎）。
+# 这个 workflow 只做「能重复跑出来的事」：编译、静态检查、测试、前端构建。
+# 需要 GUI / 原生对话框 / 真实掉电的验收不在这里，见 docs/M1-KICKOFF.md 第 1 节。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本跟根 package.json 的 packageManager 保持一致，两处一起改。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # --frozen-lockfile：锁文件和 package.json 不一致就失败，而不是悄悄升级依赖。
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm --filter @knowisle/desktop typecheck
+      - run: pnpm --filter @knowisle/desktop lint
+      - run: pnpm --filter @knowisle/desktop build
+
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rust-${{ matrix.os }}
+
+      # 格式与平台无关，只跑一次。
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      # 只 lint 两个纯逻辑 crate：src-tauri 的 clippy 需要 Linux 系统库，
+      # 而它本身几乎没有逻辑，编译验证交给下面的 shell job。
+      - name: Clippy
+        run: cargo clippy -p ki-core -p ki-vault --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p ki-core -p ki-vault
+
+  shell:
+    name: shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            patchelf
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shell-${{ matrix.os }}
+
+      # Tauri 的 generate_context! 要把前端产物嵌进二进制，所以先 build 前端。
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @knowisle/desktop build
+
+      # 编译整个壳（含 tauri / 插件 / capabilities），不打包安装器：
+      # 打包需要签名证书，MVP 阶段不做。
+      - run: cargo build --locked -p knowisle
