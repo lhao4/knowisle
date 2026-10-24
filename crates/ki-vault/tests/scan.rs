@@ -278,11 +278,34 @@ fn rejects_path_traversal() {
     let root = dir.path();
     write_file(root, "a.md", "# a\n");
 
+    // 只放跨平台成立的形态：`..` 与绝对路径在任何平台上都是越界语法。
+    // Windows 专有的反斜杠 / 盘符 / UNC 见下一个用例。
+    let attacks = ["../etc/passwd", "a/../../b", "/etc/passwd"];
+
+    for attack in attacks {
+        let err = resolve_in_vault(root, attack).expect_err(&format!("{attack} 必须被拒绝"));
+        let code = format!("{err:?}");
+        assert!(
+            code.contains("PathEscape"),
+            "{attack} 应该返回 PATH_ESCAPE，实际是 {code}"
+        );
+    }
+}
+
+/// 反斜杠、盘符、UNC 只在 Windows 上是路径分隔语法。
+///
+/// 在 Unix 上它们只是普通文件名字符：`C:\Windows\win.ini` 是一个合法文件名，
+/// 校验会放行，随后因为文件不存在报 `Io`。把这三条塞进跨平台用例里断言
+/// `PathEscape`，会在 Linux / macOS 上稳定假失败——这是第一次三平台 CI 抓出来的。
+#[cfg(windows)]
+#[test]
+fn rejects_windows_style_paths() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(root, "a.md", "# a\n");
+
     let attacks = [
-        "../etc/passwd",
         "..\\..\\windows\\win.ini",
-        "a/../../b",
-        "/etc/passwd",
         "C:\\Windows\\win.ini",
         "\\\\server\\share\\x.md",
     ];
