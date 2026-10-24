@@ -104,25 +104,44 @@ fn editing_after_a_rename_writes_to_the_new_path_only() {
 ///
 /// 槽位键没搬的话，状态查询会返回"这篇没有未落盘内容"——前端于是把
 /// 「保存中…」变成空白，而内容其实还压在槽位里。
+///
+/// # 判据为什么是 `last_saved_mtime` 而不是 `dirty`
+///
+/// `dirty` 取决于"pending 还在不在"，而 worker 可能在两句断言之间就把 pending
+/// 取走并写完——Linux 上实测会（futex 唤醒足够快），Windows / macOS 上慢一点
+/// 就不会。那是一条**概率断言**：它在 CI 的某个平台上红，不是实现坏了，是尺子坏了。
+///
+/// 这里要守的性质是"槽位键搬没搬"，而"落盘发生过"这件事有确定的证据：
+/// 只要写成功过，回执 mtime 就一定记在槽位里，与线程调度无关。于是断言变成
+/// **新路径问得到这次落盘、旧路径问不到**——两条都不依赖时间。
 #[test]
 fn status_follows_the_note_to_its_new_path() {
     let _guard = serial();
     let vault = TempDir::new().unwrap();
     let root = root_of(&vault);
     seed(&root, "a.md", "v1");
+    // 先制造一份待落盘内容：改名之前的 drain 会把它写下去并记账。
+    edit(&root, "a.md", "v2", None);
 
     block_on(note_rename(root.clone(), "a.md".to_owned(), "b".to_owned())).unwrap();
 
-    // 改完名立刻编辑：此刻槽位键必须是 b.md，否则这次编辑会被判成"换文档"。
-    let state = edit(&root, "b.md", "v2", None);
-    assert!(state.dirty, "刚提交的内容应当处于未落盘状态");
+    let fresh = block_on(note_status(root.clone(), "b.md".to_owned())).expect("status 不该失败");
     assert!(
-        block_on(note_status(root.clone(), "b.md".to_owned()))
-            .expect("status 不该失败")
-            .dirty
+        fresh.last_saved_mtime.is_some(),
+        "改名后 status 必须认新路径：旧路径问不到这次落盘，新路径要能问到"
     );
+    let stale = block_on(note_status(root.clone(), "a.md".to_owned())).expect("status 不该失败");
+    assert!(
+        stale.last_saved_mtime.is_none(),
+        "旧路径不该还认得这次落盘——那说明槽位键没搬到新路径"
+    );
+
+    // 改完名立刻编辑：这次编辑必须落在**新路径**的槽位上，而不是另起一篇。
+    let state = edit(&root, "b.md", "v3", None);
+    assert!(state.dirty, "刚提交的内容应当处于未落盘状态");
     block_on(note_flush(root, "b.md".to_owned(), false)).unwrap();
-    assert_eq!(disk(&vault, "b.md"), "v2");
+    assert_eq!(disk(&vault, "b.md"), "v3");
+    assert!(!vault.path().join("a.md").exists(), "旧路径被复活了");
 }
 
 /// worker 已经取走内容、正在写盘时改名：也要等它写完。
