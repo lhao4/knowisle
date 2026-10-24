@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from 'react'
-import { open } from '@tauri-apps/plugin-dialog'
 
 import { TreeNode } from './components/FileTree'
 import { NoteViewer } from './components/NoteViewer'
@@ -7,11 +6,12 @@ import {
   appPing,
   describeError,
   noteRead,
+  pickFolder,
   vaultScan,
   type FileNode,
   type NoteContent,
   type ScanResult,
-} from './lib/ipc'
+} from './api'
 
 export default function App() {
   const [vault, setVault] = useState<ScanResult | null>(null)
@@ -28,16 +28,12 @@ export default function App() {
       .catch((err) => setRuntime(`IPC 未就绪：${describeError(err)}`))
   }, [])
 
-  const pickFolder = useCallback(async () => {
+  const pickVault = useCallback(async () => {
     setError(null)
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: '选择知识库文件夹',
-      })
-      // 用户点了取消：dialog 返回 null，不是错误
-      if (typeof selected !== 'string') return
+      const selected = await pickFolder('选择知识库文件夹')
+      // 用户点了取消：返回 null，不是错误
+      if (selected === null) return
 
       setBusy(true)
       const result = await vaultScan(selected)
@@ -82,7 +78,7 @@ export default function App() {
               {vault.skipped > 0 && ` · 跳过 ${vault.skipped}`}
             </span>
           )}
-          <button type="button" className="btn" onClick={pickFolder} disabled={busy}>
+          <button type="button" className="btn" onClick={pickVault} disabled={busy}>
             {busy ? '扫描中…' : '选择文件夹'}
           </button>
         </div>

@@ -1,4 +1,5 @@
-import { formatBytes, type NoteContent } from '../lib/ipc'
+import type { NoteContent } from '../api'
+import { formatBytes } from '../lib/format'
 
 interface NoteViewerProps {
   note: NoteContent

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { FileNode } from '../lib/ipc'
+import type { FileNode } from '../api'
 
 interface TreeNodeProps {
   node: FileNode
