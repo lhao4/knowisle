@@ -23,8 +23,16 @@ cd "$(dirname "$0")/.."
 
 ROUNDS="${KI_CRASH_ROUNDS:-20}"
 
+# 硬杀机制随平台不同（Unix 是 SIGKILL，Windows 是 TerminateProcess），
+# 输出里写清楚，免得看到一堆 gen= 却不知道验的是哪条路径。
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) PLATFORM="Windows（TerminateProcess）" ;;
+  Darwin)                   PLATFORM="macOS（SIGKILL）" ;;
+  *)                        PLATFORM="Linux（SIGKILL）" ;;
+esac
+
 echo "崩溃一致性测试：${ROUNDS} 轮，每轮写 1MB 后在随机时刻硬杀"
-echo "平台：$(uname -s)   （Unix 用 SIGKILL，Windows 用 TerminateProcess）"
+echo "平台：${PLATFORM}"
 echo
 
 # --ignored：这条用例默认被跳过，因为它要起外部进程且依赖时序

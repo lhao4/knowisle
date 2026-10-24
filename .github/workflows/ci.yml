@@ -86,6 +86,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    # 三平台统一用 bash。Windows runner 的默认 shell 是 pwsh，
+    # 而 pwsh 执行 `./scripts/x.sh` 既不会报错也不会执行——直接"成功"退出，
+    # 于是崩溃一致性测试在 Windows 上曾经是假绿（0.7 秒、零输出）。
+    # 这个 job 里既有 shell 脚本又有 `\` 续行，统一到 bash 比逐个加 shell: 更难漏。
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
