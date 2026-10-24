@@ -21,12 +21,36 @@ use crate::path::{resolve_in_vault, to_posix};
 
 /// 目录级忽略名单：命中即**不再下降**。
 ///
-/// `.knowisle` 是我们自己的元数据目录（索引、缓存、历史），
+/// 名单里的名字分两类，忽略它们的理由并不相同：
+///
+/// - **其他工具的元数据目录**（`.git` / `.obsidian` / `.logseq` / `.trash` /
+///   `.stversions`）：里面装的是别人工具的配置、备份和回收站，不是用户的笔记。
+///   `.obsidian` 与 `logseq` 尤其关键——"打开现有的 Obsidian / Logseq 库"是最主要的
+///   迁移入口，不忽略的话 `.obsidian/plugins/*/README.md`、`logseq/bak/*.md`
+///   会整片混进树里，用户第一眼看到的是一堆别人的文档和重复笔记。
+/// - **构建产物与依赖**（`node_modules` / `target` / `dist` / ...）：误把前端仓库
+///   选成 Vault 时，这些目录能有几十万文件，剪掉它们是性能问题而不只是观感问题。
+///
+/// `.knowisle` 单独说一句：这是我们自己的元数据目录（索引、缓存、历史），
 /// 它永远不该出现在笔记树里——这是"派生数据不属于用户内容"的边界。
+///
+/// 名单是硬编码的，两个方向都会误伤：该忽略的漏了，或者用户真有个叫
+/// `dist`、`logseq` 的笔记目录被静默吞掉。后者目前无法配置，
+/// 见 `docs/BACKLOG.md` 的 B-05。
 const IGNORED_DIRS: &[&str] = &[
+    // 其他工具的元数据与备份
     ".git",
-    "node_modules",
+    ".obsidian",
+    ".logseq",
+    // 不带点的 `logseq` 也要忽略：Logseq 的图谱结构就是 `<graph>/logseq/bak/*.md`，
+    // 里面是 pages 的全量历史副本。误伤面是一个真的叫 `logseq` 的笔记目录——
+    // 概率低，且一旦有人抱怨就走 B-05 的配置化，不要靠加名字解决。
+    "logseq",
+    ".trash",
+    ".stversions",
     ".knowisle",
+    // 构建产物与依赖
+    "node_modules",
     "target",
     "dist",
     ".next",
@@ -82,8 +106,15 @@ pub struct ScanOptions {
     pub follow_links: bool,
     /// 是否剪掉"没有任何笔记"的空目录。
     ///
-    /// M0 默认 `true`（侧栏干净）。M2 引入"新建文件夹"后必须改成 `false`，
-    /// 否则用户新建的空目录会立刻消失。
+    /// 默认 `false`：**磁盘上存在的目录就应该出现在树里**，树不该替用户判断
+    /// 哪个目录值得看。M0 曾经默认 `true`（为了侧栏干净），但 M2 一加"新建文件夹"，
+    /// 用户建完的空目录会立刻从侧栏消失，观感就是丢数据——所以这个默认值
+    /// 在 M2 开工前必须翻过来。提前翻掉，不留地雷。
+    ///
+    /// 代价：纯附件目录（只有图片的 `assets/`）会显示成一个展开后什么都没有的文件夹。
+    /// 将来若觉得吵，**不要改回 `true`**（那会重新引入"新建目录消失"），
+    /// 正确做法是"保留 mtime 在 N 分钟内的空目录"——给新建目录一个宽限期，
+    /// 历史空目录照剪。那时这个字段应该从 `bool` 变成一个小枚举。
     pub prune_empty_dirs: bool,
 }
 
@@ -93,7 +124,7 @@ impl Default for ScanOptions {
             max_files: 20_000,
             max_depth: 32,
             follow_links: false,
-            prune_empty_dirs: true,
+            prune_empty_dirs: false,
         }
     }
 }

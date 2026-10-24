@@ -41,6 +41,14 @@ fn collect_dirs(node: &FileNode) -> Vec<String> {
     out
 }
 
+/// `path` 的任意一段是否等于 `name`（大小写不敏感）。
+///
+/// 忽略名单是**按目录名**生效的，所以断言必须逐段比较。
+/// 用 `starts_with("logseq/")` 这种前缀判断会漏掉嵌套的 `子库/logseq/`。
+fn has_component(path: &str, name: &str) -> bool {
+    path.split('/').any(|part| part.eq_ignore_ascii_case(name))
+}
+
 fn write_file(root: &Path, relative: &str, content: &str) {
     let path = root.join(relative);
     if let Some(parent) = path.parent() {
@@ -111,12 +119,77 @@ fn ignores_vcs_deps_and_metadata_dirs() {
     let dirs = collect_dirs(&result.tree);
     for ignored in [".git", "node_modules", ".knowisle", "target"] {
         assert!(
-            !dirs
-                .iter()
-                .any(|d| d == ignored || d.starts_with(&format!("{ignored}/"))),
-            "{ignored} 不应出现在树里"
+            !dirs.iter().any(|d| has_component(d, ignored)),
+            "{ignored} 不应出现在树里，实际目录：{dirs:?}"
         );
     }
+}
+
+/// Obsidian / Logseq 是最主要的迁移入口，它们的元数据目录里塞满了 `.md`：
+/// 插件自带的 README、回收站里的笔记、`logseq/bak/` 里的全量历史副本。
+/// 不剪掉的话，用户第一次打开自己的库看到的是一堆别人的文档和重复笔记。
+#[test]
+fn ignores_obsidian_and_logseq_metadata() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    write_file(root, "我的笔记.md", "# ok\n");
+    write_file(root, "日记/2026-10-24.md", "# 今天\n");
+
+    // Obsidian：插件 README、workspace 快照、回收站
+    write_file(root, ".obsidian/plugins/foo/README.md", "# 插件文档\n");
+    write_file(root, ".obsidian/workspace.md", "# 不该出现\n");
+    write_file(root, ".trash/删掉的笔记.md", "# 不该出现\n");
+    // 忽略按目录名生效，不只在根下一层
+    write_file(root, "子库/.obsidian/app.md", "# 不该出现\n");
+
+    // Logseq：`logseq/bak/` 是 pages 的全量历史副本，不剪会整片重复
+    write_file(root, "logseq/bak/我的笔记/2026-10-24.md", "# 旧副本\n");
+    write_file(root, "logseq/config.md", "# 不该出现\n");
+    write_file(root, ".logseq/settings.md", "# 不该出现\n");
+
+    // Syncthing 的版本副本
+    write_file(root, ".stversions/我的笔记.md", "# 不该出现\n");
+
+    let result = scan_vault(root, &ScanOptions::default()).unwrap();
+
+    assert_eq!(
+        collect_files(&result.tree),
+        vec!["我的笔记.md".to_string(), "日记/2026-10-24.md".to_string()],
+        "元数据目录里的 .md 一篇都不该进树"
+    );
+
+    let dirs = collect_dirs(&result.tree);
+    for ignored in [".obsidian", ".trash", ".logseq", "logseq", ".stversions"] {
+        assert!(
+            !dirs.iter().any(|d| has_component(d, ignored)),
+            "{ignored} 不应出现在树里（含嵌套层级），实际目录：{dirs:?}"
+        );
+    }
+}
+
+/// 忽略只针对**目录**。叫 `logseq.md` / `target.md` 的笔记是合法文件，
+/// 不该被目录名单连坐——否则用户给自己的笔记起名都要绕开工具的名字。
+#[test]
+fn ignored_dir_names_do_not_shadow_note_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    write_file(root, "logseq.md", "# 关于 logseq 的笔记\n");
+    write_file(root, "target.md", "# 关于 target 的笔记\n");
+    write_file(root, ".obsidian.md", "# 关于 obsidian 的笔记\n");
+
+    let result = scan_vault(root, &ScanOptions::default()).unwrap();
+
+    assert_eq!(
+        collect_files(&result.tree),
+        vec![
+            ".obsidian.md".to_string(),
+            "logseq.md".to_string(),
+            "target.md".to_string(),
+        ],
+        "目录名单不该影响同名的 .md 文件"
+    );
 }
 
 #[test]
@@ -132,8 +205,13 @@ fn keeps_root_even_if_its_name_is_ignored() {
     assert_eq!(collect_files(&result.tree), vec!["note.md".to_string()]);
 }
 
+/// 默认**不剪**空目录：磁盘上有什么，树里就该有什么。
+///
+/// 这条锁的是"新建文件夹不会凭空消失"。M0 曾默认剪掉（为了侧栏干净），
+/// 但 M2 一加"新建文件夹"，用户建完的空目录会立刻消失，观感就是丢数据。
+/// 默认值因此提前翻成 `false`，不留地雷。
 #[test]
-fn prunes_empty_dirs_by_default() {
+fn keeps_empty_dirs_by_default() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
@@ -145,27 +223,36 @@ fn prunes_empty_dirs_by_default() {
     let result = scan_vault(root, &ScanOptions::default()).unwrap();
     let dirs = collect_dirs(&result.tree);
 
-    assert_eq!(
-        dirs,
-        vec!["有笔记".to_string()],
-        "空目录与纯附件目录都应被剪掉"
-    );
+    for expected in ["有笔记", "只有图片", "完全空的目录"] {
+        assert!(
+            dirs.iter().any(|d| d == expected),
+            "{expected} 默认应保留，实际目录：{dirs:?}"
+        );
+    }
+    assert_eq!(dirs.len(), 3, "不该多出别的目录：{dirs:?}");
 }
 
+/// 剪枝是**显式**选项，不是默认行为。开着它时，空目录与纯附件目录都要被剪掉。
 #[test]
-fn can_keep_empty_dirs_when_pruning_disabled() {
+fn prunes_empty_dirs_when_explicitly_enabled() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    fs::create_dir_all(root.join("空目录")).unwrap();
-    write_file(root, "a.md", "# a\n");
+
+    write_file(root, "有笔记/a.md", "# a\n");
+    write_file(root, "只有图片/pic.png", "fake-png");
+    fs::create_dir_all(root.join("完全空的目录")).unwrap();
 
     let opts = ScanOptions {
-        prune_empty_dirs: false,
+        prune_empty_dirs: true,
         ..ScanOptions::default()
     };
     let result = scan_vault(root, &opts).unwrap();
 
-    assert!(collect_dirs(&result.tree).contains(&"空目录".to_string()));
+    assert_eq!(
+        collect_dirs(&result.tree),
+        vec!["有笔记".to_string()],
+        "开启剪枝后，空目录与纯附件目录都应被剪掉"
+    );
 }
 
 #[test]
