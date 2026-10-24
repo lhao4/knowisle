@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { TreeNode } from './components/FileTree'
 import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
+import { Outline, type OutlineHandle } from './components/Outline'
+import type { OutlineItem } from './lib/outline'
 import {
   appPing,
   describeError,
@@ -47,6 +49,14 @@ export default function App() {
   const [flash, setFlash] = useState<string | null>(null)
   const flashTimer = useRef<number | null>(null)
   const editorRef = useRef<NoteEditorHandle>(null)
+  /**
+   * 大纲的标题集合。**低频**：只有标题增删改时才变。
+   *
+   * 当前章节（高亮）刻意不在这里——它每次光标移动都变，走 `outlineRef`
+   * 的句柄直接改 DOM。见 `OutlineHandle` 的注释。
+   */
+  const [outline, setOutline] = useState<OutlineItem[]>([])
+  const outlineRef = useRef<OutlineHandle>(null)
 
   const showFlash = useCallback((text: string) => {
     if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
@@ -95,10 +105,12 @@ export default function App() {
       setVault(result)
       setActiveNote(null)
       setSaveState(null)
+      setOutline([])
       localStorage.setItem(LAST_VAULT_KEY, result.root)
     } catch (err) {
       setVault(null)
       setActiveNote(null)
+      setOutline([])
       setError(describeError(err))
     } finally {
       setBusy(false)
@@ -140,6 +152,9 @@ export default function App() {
 
       try {
         const note = await noteRead(vault.root, node.path)
+        // 先清空再换文档：编辑器重建后会在挂载时把新大纲发上来，中间这一帧
+        // 如果留着上一篇的标题，用户会看到「标题还是上一篇的」闪一下。
+        setOutline([])
         setActiveNote(note)
         setSaveState(null)
         setError(null)
@@ -149,6 +164,11 @@ export default function App() {
     },
     [vault, activeNote],
   )
+
+  /** 大纲点击：把光标送到该标题行，并把这一行滚到视口顶部。 */
+  const jumpTo = useCallback((pos: number) => {
+    editorRef.current?.jumpTo(pos)
+  }, [])
 
   // 有内容没落盘时才轮询。依赖 `dirty` 而不是整个 `saveState`，
   // 否则每次状态更新都会重建 interval，等于没有轮询。
@@ -260,28 +280,33 @@ export default function App() {
 
         <section className="content">
           {vault && activeNote ? (
-            <section className="viewer">
-              <header className="viewer__header">
-                <nav className="breadcrumb" aria-label="路径">
-                  {activeNote.path.split('/').map((segment, index) => (
-                    <span key={`${segment}-${index}`} className="breadcrumb__item">
-                      {index > 0 && <span className="breadcrumb__sep">/</span>}
-                      {segment}
-                    </span>
-                  ))}
-                </nav>
-                <span className="viewer__meta">{saveLabel}</span>
-              </header>
+            <>
+              <section className="viewer">
+                <header className="viewer__header">
+                  <nav className="breadcrumb" aria-label="路径">
+                    {activeNote.path.split('/').map((segment, index) => (
+                      <span key={`${segment}-${index}`} className="breadcrumb__item">
+                        {index > 0 && <span className="breadcrumb__sep">/</span>}
+                        {segment}
+                      </span>
+                    ))}
+                  </nav>
+                  <span className="viewer__meta">{saveLabel}</span>
+                </header>
 
-              <NoteEditor
-                ref={editorRef}
-                root={vault.root}
-                note={activeNote}
-                onStateChange={setSaveState}
-                onError={setError}
-                onSaved={() => showFlash('已保存')}
-              />
-            </section>
+                <NoteEditor
+                  ref={editorRef}
+                  root={vault.root}
+                  note={activeNote}
+                  onStateChange={setSaveState}
+                  onError={setError}
+                  onSaved={() => showFlash('已保存')}
+                  onOutlineChange={setOutline}
+                  outlineRef={outlineRef}
+                />
+              </section>
+              <Outline ref={outlineRef} items={outline} onJump={jumpTo} />
+            </>
           ) : (
             <div className="welcome">
               <div className="welcome__mark">◈</div>

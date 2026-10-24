@@ -480,6 +480,94 @@ body {
   background: var(--ki-bg-code);
 }
 
+/* ───────────────────────── 大纲面板 ───────────────────────── */
+
+/*
+ * 右侧第三栏，固定 240px。
+ *
+ * 不做折叠、不做拖宽：这一轮要验的是「大纲能不能跟上光标」，
+ * 折叠与拖宽各是一个独立的状态机（宽度持久化、双击复位、窄窗口下限），
+ * 加进来只会让验收里的渲染次数多出几个来源。
+ *
+ * 窗口窄时正文被压是**接受**的：minWidth 是 900px，
+ * 300 + 240 + 边距之后正文还有 360px，比任何移动端都宽。
+ */
+
+.outline {
+  display: flex;
+  flex-direction: column;
+  width: 240px;
+  flex: 0 0 240px;
+  min-height: 0;
+  border-left: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-surface);
+}
+
+/* 与 `.viewer__header` 同高，两条下边线才对得齐。 */
+.outline__header {
+  flex: 0 0 auto;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  font-size: 12px;
+  color: var(--ki-text-muted);
+}
+
+.outline__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0 24px;
+}
+
+.outline__item {
+  display: block;
+  width: 100%;
+  padding: 3px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--ki-text-primary);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+/* 层级靠字号/颜色区分，不靠缩进——缩进由内联样式按级别给。 */
+.outline__item[data-level='1'] {
+  font-weight: 600;
+}
+
+.outline__item[data-level='2'] {
+  font-weight: 500;
+}
+
+.outline__item[data-level='5'],
+.outline__item[data-level='6'] {
+  color: var(--ki-text-muted);
+}
+
+.outline__item:hover {
+  background: var(--ki-bg-hover);
+}
+
+/* 必须在级别规则之后：同权重时后者生效，否则 H1 的高亮会被 600 字重吃掉。 */
+.outline__item.is-active {
+  background: var(--ki-bg-active);
+  color: var(--ki-accent);
+  font-weight: 500;
+}
+
+.outline__empty {
+  margin: 0;
+  padding: 16px;
+  color: var(--ki-text-faint);
+  font-size: 12px;
+}
+
 /* ───────────────────────── 欢迎页 ───────────────────────── */
 
 .welcome {

@@ -14,7 +14,7 @@ import {
   type ViewUpdate,
 } from '@codemirror/view'
 import { tags } from '@lezer/highlight'
-import { useEffect, useImperativeHandle, useRef, type Ref } from 'react'
+import { useEffect, useImperativeHandle, useRef, type Ref, type RefObject } from 'react'
 
 import {
   describeError,
@@ -24,6 +24,8 @@ import {
   type NoteContent,
   type SaveState,
 } from '../api'
+import { activeIndexAt, collectOutline, sameHeadingSequence, type OutlineItem } from '../lib/outline'
+import type { OutlineHandle } from './Outline'
 
 /**
  * 把一次按键合并成一次 IPC 的间隔。
@@ -158,6 +160,8 @@ const markdownDecorations = ViewPlugin.fromClass(
 export interface NoteEditorHandle {
   /** 编辑器里此刻的完整正文。切换笔记前用它把最后几个字捞出来。 */
   getContent: () => string
+  /** 把光标送到 `pos` 并把那一行滚到视口顶部。大纲点击走这里。 */
+  jumpTo: (pos: number) => void
 }
 
 interface NoteEditorProps {
@@ -168,12 +172,26 @@ interface NoteEditorProps {
   onError: (message: string | null) => void
   /** 手动保存成功（`Mod-s`）。与轮询出来的「已保存」是两条路径，互不依赖。 */
   onSaved: () => void
+  /**
+   * 低频回调：**只有标题集合变化**时才调。
+   *
+   * 必须是稳定引用（`setState` 或 `useCallback`）——它在挂载时被捕获，
+   * 换身份不会重建编辑器，但也不会生效。
+   */
+  onOutlineChange: (items: OutlineItem[]) => void
+  /**
+   * 高频通道：光标所在章节的变化直接打到面板的 DOM 上。
+   *
+   * 这里刻意**不用回调**：回调必然要配一个 `setState` 才看得见效果，
+   * 而连打 100 个字符就是 100 次渲染。句柄让面板自己做 `classList.toggle`。
+   */
+  outlineRef: RefObject<OutlineHandle | null>
 }
 
 /**
  * CodeMirror 6 编辑器。
  *
- * # 三条设计约束
+ * # 四条设计约束
  *
  * 1. **文档内容不进 React state。** 每次按键都 `setState` 会让 React 重渲染整棵树，
  *    而 CM6 自己维护 `EditorState`。这里只在 ref 里持有 `EditorView`，
@@ -183,6 +201,8 @@ interface NoteEditorProps {
  * 3. **切换笔记时的顺序由上层控制。** 合并窗口（300ms）里可能还有没发出去的字符，
  *    如果上层先 flush 再卸载，那几个字就丢了。所以这里暴露 `getContent()`，
  *    由上层「先取内容 → 发 noteEdit → flush → 再切换」。
+ * 4. **大纲的标题集合与高亮走两条通道。** 前者进 React state（低频），
+ *    后者直接操作 DOM（高频）。合并的那一天，渲染次数就与按键次数同阶了。
  */
 export function NoteEditor({
   root,
@@ -191,6 +211,8 @@ export function NoteEditor({
   onStateChange,
   onError,
   onSaved,
+  onOutlineChange,
+  outlineRef,
 }: NoteEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -203,6 +225,20 @@ export function NoteEditor({
     ref,
     () => ({
       getContent: () => viewRef.current?.state.doc.toString() ?? pendingRef.current ?? '',
+      jumpTo: (pos: number) => {
+        const view = viewRef.current
+        if (view === null) return
+        // 夹紧到文档范围内：大纲是上一帧算出来的，文档刚变短时 pos 可能越界，
+        // 而 `dispatch` 遇到越界的位置会直接抛。
+        const target = Math.max(0, Math.min(pos, view.state.doc.length))
+        view.dispatch({
+          selection: { anchor: target },
+          // `y: 'start'` 才是验收要的「该行滚到顶部」。默认的 `nearest`
+          // 只会保证可见，视觉上像是没跳。
+          effects: EditorView.scrollIntoView(target, { y: 'start' }),
+        })
+        view.focus()
+      },
     }),
     [],
   )
@@ -291,6 +327,68 @@ export function NoteEditor({
       }, IPC_COALESCE_MS)
     }
 
+    /* ───────────────────── 大纲 ───────────────────── */
+
+    /**
+     * 上一次发给 React 的大纲。**只在标题集合变化时被替换**，
+     * 所以它同时是「低频通道」的判重基准和高频通道的查询表。
+     */
+    let lastItems: OutlineItem[] = []
+    /** 上一次的高亮下标。高频路径上它挡住绝大多数无变化的调用。 */
+    let lastActive = -1
+    /** 挂载后是否发过一次。空文档也要发一次，否则上层留着上一篇的标题。 */
+    let emitted = false
+
+    /**
+     * 低频道：**标题序列**变了才调 `onOutlineChange`（一次 React 渲染）。
+     *
+     * # 为什么 `pos` 要就地改，而不是跟着重渲染
+     *
+     * `pos` 是绝对偏移，在正文里打一个字，下面所有标题的 `pos` 都 +1。
+     * 若把它纳入判重，每个字符都会触发一次大纲重渲染——验收 3 会直接挂。
+     * 但它又必须是新鲜的，否则「先打几个字、再点大纲」会跳到偏几个字符的位置。
+     *
+     * 所以拆开：`level`/`text` 是不可变的渲染数据；`pos` 是位置元数据，
+     * 在标题序列不变时就地更新。React 拿到的还是同一批对象，不重渲染，
+     * 但点击时读到的 `pos` 已经是最新的。
+     */
+    const emitOutline = (state: EditorState) => {
+      const items = collectOutline(state)
+      if (emitted && sameHeadingSequence(items, lastItems)) {
+        for (let i = 0; i < items.length; i += 1) lastItems[i].pos = items[i].pos
+        return
+      }
+      emitted = true
+      lastItems = items
+      onOutlineChange(items)
+    }
+
+    /**
+     * 高频通道：光标所在的章节变了才碰 DOM。
+     *
+     * 注意它**只读** `lastItems`，不重新遍历语法树——光标每动一次就收集
+     * 一遍大纲是 O(整棵树)，而结果根本不会因为移动光标而改变。
+     */
+    const emitActive = (state: EditorState) => {
+      const index = activeIndexAt(lastItems, state.selection.main.head)
+      if (index === lastActive) return
+      lastActive = index
+      outlineRef.current?.setActive(index)
+    }
+
+    /**
+     * 每次视图更新都过一遍，但两条通道各自有判重。
+     *
+     * `treeChanged` 不能省：大文档打开时 Lezer 先解析视口附近，剩下的在
+     * 后台按片推进，每推进一片就 `dispatch` 一个空事务。少了这个条件，
+     * 大纲会永远缺后半篇，直到用户手动敲一个字符。
+     */
+    const syncOutline = (update: ViewUpdate) => {
+      const treeChanged = syntaxTree(update.state) !== syntaxTree(update.startState)
+      if (update.docChanged || treeChanged) emitOutline(update.state)
+      if (update.docChanged || update.selectionSet || treeChanged) emitActive(update.state)
+    }
+
     const view = new EditorView({
       parent: host,
       state: EditorState.create({
@@ -320,17 +418,45 @@ export function NoteEditor({
           markdownDecorations,
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
-            if (!update.docChanged) return
-            pendingRef.current = update.state.doc.toString()
-            schedule()
+            if (update.docChanged) {
+              pendingRef.current = update.state.doc.toString()
+              schedule()
+            }
+            syncOutline(update)
           }),
         ],
       }),
     })
     viewRef.current = view
 
+    // 挂载即发一次：新文档的大纲不能等用户敲第一个字才出现。
+    // 这里不能用 `syncOutline`（它需要一个 ViewUpdate），直接走两条通道。
+    emitOutline(view.state)
+    emitActive(view.state)
+
+    /**
+     * 编辑器滚动 → 把高亮项滚进大纲面板的可视区。
+     *
+     * **只有这一个方向。** 反过来（面板滚动/编辑器滚动改高亮）是
+     * MVP-SCOPE 点名的抖动来源：光标位置和滚动位置都想决定同一个高亮，
+     * 两边轮流覆盖，用户看到的是高亮在列表里来回跳。
+     *
+     * 按帧合并：一次滚动会连发几十个 scroll 事件，而 DOM 操作每帧一次就够。
+     */
+    let scrollFrame = 0
+    const onScroll = () => {
+      if (scrollFrame !== 0) return
+      scrollFrame = window.requestAnimationFrame(() => {
+        scrollFrame = 0
+        outlineRef.current?.revealActive()
+      })
+    }
+    view.scrollDOM.addEventListener('scroll', onScroll, { passive: true })
+
     return () => {
       clearTimer()
+      view.scrollDOM.removeEventListener('scroll', onScroll)
+      if (scrollFrame !== 0) window.cancelAnimationFrame(scrollFrame)
       // 兜底：正常切换路径上上层已经取过内容并 flush 了，这里多半是空的。
       // 组件被意外卸载时（比如 HMR），至少把内容交给 Rust，而不是留在内存里。
       const content = pendingRef.current
