@@ -23,11 +23,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-serde = { workspace = true }
-ki-core = { workspace = true }
-ki-vault = { workspace = true }
+ki-ipc = { workspace = true }
 
-# IPC 契约生成。只有这一层认识 specta —— ki-core 只 derive 类型，不认识导出器。
-tauri-specta = { workspace = true }
-specta = { workspace = true }
+# 只有契约导出器（src/bin/export_bindings.rs）需要它。
+# 命令层与类型定义都在 ki-ipc / ki-core，本 crate 不碰 specta 的细节。
 specta-typescript = { workspace = true }

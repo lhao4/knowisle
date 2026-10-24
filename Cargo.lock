@@ -1666,6 +1666,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ki-ipc"
+version = "0.1.0"
+dependencies = [
+ "ki-core",
+ "ki-vault",
+ "serde",
+ "specta",
+ "tauri",
+ "tauri-specta",
+ "tempfile",
+]
+
+[[package]]
 name = "ki-vault"
 version = "0.1.0"
 dependencies = [
@@ -1680,15 +1693,11 @@ dependencies = [
 name = "knowisle"
 version = "0.1.0"
 dependencies = [
- "ki-core",
- "ki-vault",
- "serde",
- "specta",
+ "ki-ipc",
  "specta-typescript",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
- "tauri-specta",
 ]
 
 [[package]]

@@ -113,6 +113,22 @@ pub struct NoteContent {
     pub mtime: i64,
 }
 
+/// 单篇笔记写入成功后的回执。
+///
+/// 刻意**不回传正文**：调用方刚把它发出去，回显一遍只是浪费一次 1MB 的序列化。
+/// 但 `size` 与 `mtime` 必须是**写完之后的磁盘真值**，而不是"入参长度 + 现在时间"——
+/// 前者能顺带证明落盘的字节数确实等于发出去的字节数（编码、换行转换出问题时会立刻不符）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveResult {
+    /// Vault 相对路径（POSIX），与请求时传入的一致。
+    pub path: String,
+    /// 写入后的文件字节数。
+    pub size: u64,
+    /// 写入后的 mtime（Unix 毫秒）。
+    pub mtime: i64,
+}
+
 /// `app_ping` 的返回值：IPC 通道的握手信息。
 ///
 /// 这个结构体存在的唯一理由是**对称**。M0 时它返回 `serde_json::Value`，

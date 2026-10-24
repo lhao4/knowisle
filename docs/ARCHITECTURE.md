@@ -603,6 +603,7 @@ knowisle/
 ├── Cargo.toml                    # workspace
 ├── crates/
 │   ├── ki-core/                  # 领域模型（纯，无 IO）
+│   ├── ki-ipc/                   # Tauri 命令层：解包 → 调 service → 序列化
 │   ├── ki-store/                 # SQLite 仓储 + refinery 迁移
 │   ├── ki-vault/                 # 文件系统、原子写、watcher
 │   ├── ki-search/                # FTS5 + jieba + RRF
@@ -612,8 +613,9 @@ knowisle/
 │   └── ki-cli/                   # isle 二进制
 ├── apps/
 │   └── desktop/
-│       ├── src-tauri/            # Tauri 适配器（薄！）
+│       ├── src-tauri/            # Tauri 应用壳（只剩起窗口）
 │       └── src/                  # React UI
+├── scripts/                      # 可重复执行的验收脚本（crash-note-save.sh 等）
 ├── packages/
 │   ├── ui/                       # 设计系统（token + Radix 封装）
 │   ├── editor/                   # CodeMirror 6 封装
@@ -623,6 +625,8 @@ knowisle/
 ```
 
 > **生成物落点（M1 实测修正）**：本节早期把 `bindings.ts` 规划在 `packages/bindings/`。M1 接 `tauri-specta` 时改放在 `apps/desktop/src/api/bindings.ts`——目前只有桌面端一个消费者，为一个文件建一个 workspace 包，收益是零，成本是每个 import 都要过一层包名解析。等 `packages/sdk` 真的需要它时再抽出去，那时才有第二个消费者。
+
+> **命令层为什么在 `crates/ki-ipc` 而不是 `src-tauri`（M1 实测修正）**：`src-tauri` 是个二进制壳，它的测试要链接 webview、clippy 要 GUI 系统库，于是"命令层进不了 CI 的 lint，也写不了测试"。而会丢数据的 `note_save` 恰恰最需要被验证。挪出来之后 `tauri` 关掉 default features（不拉 wry），`cargo test -p ki-ipc` 只要 20ms。`src-tauri` 现在只剩"注册插件 + 起窗口"，薄到不需要测试。
 
 `src-tauri` 里的代码应当**薄到无聊**——每个 command 就是"解包参数 → 调 service → 序列化结果"，不超过 15 行。业务逻辑一旦出现在这里，就说明它跑错了层。
 
@@ -665,6 +669,38 @@ CI 里跑 `pnpm bindings:check`，如果生成结果与提交的 `bindings.ts` �
 > **命令命名偏差（M0 实测修正）**：本文早期写的是 `domain::action` 形式（如 `note::save`），但 Tauri 的 `#[tauri::command]` 要求命令名必须是合法的 Rust 函数名，`::` 不可用。实际约定改为 **`domain_action`**：`vault_scan`、`note_read`、`vault_save`。语义不变，只是分隔符从 `::` 变成 `_`。
 >
 > **另一条 M0 实测结论**：所有阻塞型命令必须走 `tauri::async_runtime::spawn_blocking`。`async fn` 命令跑在 tokio 核心线程上，一次 500ms 的目录扫描会阻塞其它命令与事件循环，表现为"点按钮之后整个界面卡住"。这条规则适用于所有文件 IO、SQLite 查询、Git 操作。
+
+#### 写入：原子性只有一种实现
+
+公理 A5（`tmp → fsync → rename`）在代码里只有一处落点：`ki-vault::write_note`。四步各自堵一个洞：
+
+| 步骤 | 堵的洞 |
+|---|---|
+| 写同目录 tmp（`create_new`） | 不碰目标文件，目标在任何时刻都是完整的旧内容 |
+| `sync_all()` | 不 fsync 就 rename，崩溃后可能得到"有目录项、没数据块"的空文件 |
+| `rename` | 同一文件系统内原子替换：要么旧内容、要么新内容 |
+| fsync 父目录（仅 Unix） | 不刷目录，rename 本身可能在崩溃后丢失（退化成旧内容，不是损坏） |
+
+**tmp 必须放在目标同目录**：`rename` 只在同一文件系统内原子，跨设备会返回 `EXDEV`，只能退化成"复制 + 删除"，原子性全没。代价是崩溃后留下孤儿 tmp（`.knowisle.tmp.<pid>.<seq>`，扩展名不是 `.md`，扫描器看不见）。
+
+**Windows 上做不到目录 fsync**（`std::fs` 打不开目录），因此降级为"崩溃后 rename 可能没生效"——结果是旧内容，不破坏核心承诺。
+
+Windows 上 `fs::rename` 的实测结论（`crates/ki-vault/tests/write.rs` 里有对应用例）：
+
+| 情形 | 结果 |
+|---|---|
+| 目标已存在 | **覆盖成功**（`MoveFileExW` + `MOVEFILE_REPLACE_EXISTING`） |
+| 目标是只读文件 | **失败** `ERROR_ACCESS_DENIED`，目标保持旧内容 |
+| 目标被其他句柄占用且对方拒绝 `FILE_SHARE_DELETE` | **失败** `ERROR_ACCESS_DENIED`，目标保持旧内容 |
+| 目标是目录 | **失败** `ERROR_ACCESS_DENIED` |
+
+第二、三条是 M2 必须处理的用户可见场景（笔记正在别的编辑器里开着）：错误要翻译成"文件被占用，请关闭后重试"，而不是笼统的"读写失败"。
+
+**验收方式**：`scripts/crash-note-save.sh` 让子进程连续写 1MB，父进程在随机时刻硬杀（Unix `SIGKILL` / Windows `TerminateProcess`），重启后校验磁盘内容必须是某一代的**完整**内容。
+
+> **一个反直觉的实测结论**：时序型崩溃测试**不足以**证明原子性。硬杀只能落在系统调用之间，而 1MB 的 `write_all` 在本地 SSD 上一次 syscall 就进了页缓存，朴素 `fs::write` 的截断窗口只有几十微秒——把实现换成 `fs::write` 后跑 25 轮硬杀，**一轮都没被抓到**。
+>
+> 真正的判据是一条确定性用例：**写之前打开的句柄，写之后读到的必须仍是旧内容**（`rename` 让旧 inode 与目录项解绑，旧句柄仍指向旧 inode；原地重写则同一 inode 内容已变）。这条用例在朴素实现下立刻红。两条一起留着：一条验结果，一条验机制。
 
 #### 错误模型
 

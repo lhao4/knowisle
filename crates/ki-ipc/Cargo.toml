@@ -1,0 +1,24 @@
+[package]
+name = "ki-ipc"
+description = "知屿 KnowIsle 的 Tauri 命令层：解包 → 调 service → 序列化，以及 IPC 契约生成"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ki-core = { workspace = true }
+ki-vault = { workspace = true }
+serde = { workspace = true }
+
+# 只要 `#[tauri::command]` 宏、`Runtime` trait 与 `spawn_blocking`，
+# 不需要 wry / webview。**关掉 default features 是本 crate 存在的意义之一**：
+# 这样它的 clippy 与测试不必链接一个浏览器引擎，跑起来只要一秒。
+# （Linux 上 tauri 仍然硬依赖 gtk，那是无条件依赖，关不掉，只能靠 CI 装系统包。）
+tauri = { version = "2", default-features = false }
+
+tauri-specta = { workspace = true }
+specta = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

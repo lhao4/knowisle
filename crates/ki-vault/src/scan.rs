@@ -67,7 +67,7 @@ const IGNORED_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 const NOTE_EXTENSIONS: &[&str] = &["md", "markdown"];
 
 /// 单篇笔记读取上限。超过就拒绝，避免用户误点一个 2GB 的假 `.md` 把内存打爆。
-const MAX_NOTE_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_NOTE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// 树深硬上限。**这不是业务参数，是一条栈安全不变量。**
 ///
@@ -329,7 +329,7 @@ fn is_note(path: &Path) -> bool {
 }
 
 /// 取 `(size, mtime_ms)`。元数据读失败时退化为 `(0, 0)`，不影响扫描继续。
-fn stat(meta: Option<std::fs::Metadata>) -> (u64, i64) {
+pub(crate) fn stat(meta: Option<std::fs::Metadata>) -> (u64, i64) {
     let Some(meta) = meta else {
         return (0, 0);
     };

@@ -9,6 +9,18 @@ export const commands = {
 	/**  读取单篇笔记。`path` 必须是 `vault_scan` 返回过的 POSIX 相对路径。 */
 	noteRead: (root: string, path: string) => __TAURI_INVOKE<NoteContent>("note_read", { root, path }),
 	/**
+	 *  原子地写入单篇笔记。
+	 * 
+	 *  # 参数语义（前端必须知道的四条）
+	 * 
+	 *  - `path` 是 **Vault 相对路径**（POSIX 分隔符），不是绝对路径。
+	 *  - `content` 是**完整正文**，不是增量。本命令不做 diff、不做合并。
+	 *  - **父目录必须已存在**：不会替用户建目录。要新建笔记，先确保目标目录在库里。
+	 *  - 写入是原子的（`tmp → fsync → rename`），崩溃只会看到旧内容或新内容，
+	 *    不会看到半截。
+	 */
+	noteSave: (root: string, path: string, content: string) => __TAURI_INVOKE<SaveResult>("note_save", { root, path, content }),
+	/**
 	 *  健康检查：前端启动时用它确认 IPC 通道是通的。
 	 * 
 	 *  返回 `AppInfo` 而不是 `serde_json::Value`：后者对 specta 是不可描述的，
@@ -110,6 +122,22 @@ export type NoteContent = {
 	/**  已去除 UTF-8 BOM 的正文。 */
 	content: string,
 	size: number,
+	mtime: number,
+};
+
+/**
+ *  单篇笔记写入成功后的回执。
+ * 
+ *  刻意**不回传正文**：调用方刚把它发出去，回显一遍只是浪费一次 1MB 的序列化。
+ *  但 `size` 与 `mtime` 必须是**写完之后的磁盘真值**，而不是"入参长度 + 现在时间"——
+ *  前者能顺带证明落盘的字节数确实等于发出去的字节数（编码、换行转换出问题时会立刻不符）。
+ */
+export type SaveResult = {
+	/**  Vault 相对路径（POSIX），与请求时传入的一致。 */
+	path: string,
+	/**  写入后的文件字节数。 */
+	size: number,
+	/**  写入后的 mtime（Unix 毫秒）。 */
 	mtime: number,
 };
 

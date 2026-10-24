@@ -123,6 +123,21 @@ jobs:
       # 打包需要签名证书，MVP 阶段不做。
       - run: cargo build --locked -p knowisle
 
+      # 命令层（ki-ipc）的 lint 与测试放在这里，不放在 rust job：
+      # tauri 在 Linux 上对 gtk 是无条件依赖，本 job 已经装了系统库。
+      # 这就是把命令层从 src-tauri 挪出来的理由——那边永远测不了。
+      - name: Clippy (ki-ipc)
+        run: cargo clippy -p ki-ipc --all-targets -- -D warnings
+
+      - name: Test (ki-ipc)
+        run: cargo test -p ki-ipc
+
+      # M1 唯一不可妥协的验收项：写入途中被硬杀，磁盘上只允许出现
+      # 完整的旧内容或完整的新内容。三个平台都跑——Windows 走 TerminateProcess，
+      # Unix 走 SIGKILL，两者都是不给清理机会的硬杀。
+      - name: Crash consistency (kill -9)
+        run: ./scripts/crash-note-save.sh
+
       # IPC 契约 drift 校验：`bindings.ts` 是从 Rust command 签名生成的，
       # 与 `Cargo.lock` 一样属于"生成物但必须入库"。重新生成一遍，
       # 工作区只要有任何差异就说明有人改了命令却忘了提交生成结果。

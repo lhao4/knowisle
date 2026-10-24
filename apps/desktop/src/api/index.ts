@@ -23,6 +23,7 @@ export type {
   KiError,
   NodeKind,
   NoteContent,
+  SaveResult,
   ScanResult,
 } from './bindings'
 
@@ -31,6 +32,16 @@ export const vaultScan = commands.vaultScan
 
 /** 读取单篇笔记。`path` 必须是 `vaultScan` 返回过的 POSIX 相对路径。 */
 export const noteRead = commands.noteRead
+
+/**
+ * 原子地写入单篇笔记。
+ *
+ * `content` 是**完整正文**，不是增量；父目录必须已存在（不会代建）。
+ * 写入是原子的，崩溃只会看到旧内容或新内容。
+ *
+ * M1 只提供能力，还没接编辑器——UI 入口在 M2。
+ */
+export const noteSave = commands.noteSave
 
 /**
  * 健康检查：确认 Rust 侧真的起来了。

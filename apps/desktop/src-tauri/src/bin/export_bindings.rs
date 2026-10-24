@@ -26,7 +26,7 @@
 fn main() {
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/api/bindings.ts");
 
-    knowisle_lib::ipc_builder()
+    ki_ipc::ipc_builder::<tauri::Wry>()
         .export(specta_typescript::Typescript::default(), &out)
         .expect("导出 bindings.ts 失败");
 
