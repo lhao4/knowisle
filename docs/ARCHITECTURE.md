@@ -698,6 +698,16 @@ Windows 上 `fs::rename` 的实测结论（`crates/ki-vault/tests/write.rs` 里�
 
 **验收方式**：`scripts/crash-note-save.sh` 让子进程连续写 1MB，父进程在随机时刻硬杀（Unix `SIGKILL` / Windows `TerminateProcess`），重启后校验磁盘内容必须是某一代的**完整**内容。
 
+三平台实测（CI，各 20 轮，每一轮都在写入中途硬杀）：
+
+| 平台 | 硬杀机制 | 半截内容 | 崩溃后存活代次 | 孤儿 tmp / 轮 |
+|---|---|---|---|---|
+| Linux（ubuntu-latest） | `SIGKILL` | **0 / 20** | gen 1–5 | 0.0 |
+| macOS（Darwin） | `SIGKILL` | **0 / 20** | gen 2–8 | 0.2 |
+| Windows | `TerminateProcess` | **0 / 20** | gen 1–4 | 0.3 |
+
+> **CI 里这一步必须显式 `shell: bash`。** Windows runner 的默认 shell 是 PowerShell，它执行 `./scripts/x.sh` 既不报错也不执行——直接 0.3 秒"成功"退出、零输出。第一次接 CI 时 windows-latest 就是这么**假绿**的：崩溃测试根本没跑过。凡是"跑一个脚本"的 CI 步骤，`shell` 都不是可省项。
+
 > **一个反直觉的实测结论**：时序型崩溃测试**不足以**证明原子性。硬杀只能落在系统调用之间，而 1MB 的 `write_all` 在本地 SSD 上一次 syscall 就进了页缓存，朴素 `fs::write` 的截断窗口只有几十微秒——把实现换成 `fs::write` 后跑 25 轮硬杀，**一轮都没被抓到**。
 >
 > 真正的判据是一条确定性用例：**写之前打开的句柄，写之后读到的必须仍是旧内容**（`rename` 让旧 inode 与目录项解绑，旧句柄仍指向旧 inode；原地重写则同一 inode 内容已变）。这条用例在朴素实现下立刻红。两条一起留着：一条验结果，一条验机制。
