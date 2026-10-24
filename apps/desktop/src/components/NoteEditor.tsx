@@ -162,6 +162,20 @@ export interface NoteEditorHandle {
   getContent: () => string
   /** 把光标送到 `pos` 并把那一行滚到视口顶部。大纲点击走这里。 */
   jumpTo: (pos: number) => void
+  /**
+   * 把焦点交还给编辑器。
+   *
+   * # 为什么必须是 `view.focus()`，而不是 `dispatch` 一个 selection
+   *
+   * 浮层关闭时，编辑器里的光标**本来就没动过**——`EditorState` 里的
+   * selection 一直在那儿，只是 DOM 焦点被 input 拿走了。所以这里要做的
+   * 只是把 DOM 焦点还回去，CM6 会自己按 state 恢复绘制。
+   *
+   * 反过来，`dispatch({ selection })` 会**新建**一个 selection：只要锚点
+   * 算错一个字符（比如把 `anchor` 写成 `head: 0`），用户关掉浮层就会发现
+   * 光标跑到了文档开头。用一个不需要知道位置的动作，就没有算错的机会。
+   */
+  focus: () => void
 }
 
 interface NoteEditorProps {
@@ -238,6 +252,11 @@ export function NoteEditor({
           effects: EditorView.scrollIntoView(target, { y: 'start' }),
         })
         view.focus()
+      },
+      focus: () => {
+        // `focus()` 在视图已销毁时是空操作（`viewRef` 被清成 null），
+        // 所以这里不需要额外的存活判断。
+        viewRef.current?.focus()
       },
     }),
     [],

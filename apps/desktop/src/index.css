@@ -568,6 +568,134 @@ body {
   font-size: 12px;
 }
 
+/* ───────────────────────── 快速打开（Cmd/Ctrl+P） ───────────────────────── */
+
+/*
+ * 浮层用 fixed 定位，**不参与 workspace 布局**。
+ *
+ * 若把它做成 `.content` 里的一层，打开时正文会被挤压重新排版，
+ * CM6 要重测量视口、大纲要重算可见区——一次「打开面板」变成一次全量重排。
+ * fixed 之后它只影响自己那一层。
+ *
+ * 高度上限 60vh，超出由 `.quick-open__list` 自己滚：面板本身不长高，
+ * 输入框与底部提示永远在视线内。
+ */
+
+.quick-open-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgb(24 24 27 / 22%);
+}
+
+.quick-open {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 92vw);
+  max-height: 60vh;
+  overflow: hidden;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 10px;
+  background: var(--ki-bg-canvas);
+  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+}
+
+.quick-open__input {
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 13px 16px;
+  border: 0;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  background: transparent;
+  color: var(--ki-text-primary);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.quick-open__input::placeholder {
+  color: var(--ki-text-faint);
+}
+
+.quick-open__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 6px 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.quick-open__item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.quick-open__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ki-text-primary);
+}
+
+.quick-open__dir {
+  flex: 0 1 auto;
+  max-width: 55%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ki-text-faint);
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+}
+
+/* 当前项。列表项永远不获得焦点，所以只有 `.is-active` 一种选中态。 */
+.quick-open__item.is-active {
+  background: var(--ki-bg-active);
+}
+
+.quick-open__item.is-active .quick-open__name {
+  color: var(--ki-accent);
+  font-weight: 500;
+}
+
+.quick-open__empty {
+  margin: 0;
+  padding: 24px 16px;
+  color: var(--ki-text-muted);
+  font-size: 13px;
+}
+
+.quick-open__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex: 0 0 auto;
+  padding: 7px 16px;
+  border-top: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-surface);
+  font-size: 11px;
+  color: var(--ki-text-faint);
+}
+
+.quick-open__keys {
+  flex: 0 0 auto;
+  font-family: var(--ki-font-mono);
+}
+
 /* ───────────────────────── 欢迎页 ───────────────────────── */
 
 .welcome {
