@@ -12,7 +12,14 @@ import {
 import { tags } from '@lezer/highlight'
 import { useEffect, useImperativeHandle, useRef, type Ref } from 'react'
 
-import { describeError, noteEdit, type NoteContent, type SaveState } from '../api'
+import {
+  describeError,
+  noteEdit,
+  noteFlush,
+  noteStatus,
+  type NoteContent,
+  type SaveState,
+} from '../api'
 
 /**
  * 把一次按键合并成一次 IPC 的间隔。
@@ -54,6 +61,8 @@ interface NoteEditorProps {
   ref?: Ref<NoteEditorHandle>
   onStateChange: (state: SaveState) => void
   onError: (message: string | null) => void
+  /** 手动保存成功（`Mod-s`）。与轮询出来的「已保存」是两条路径，互不依赖。 */
+  onSaved: () => void
 }
 
 /**
@@ -70,7 +79,14 @@ interface NoteEditorProps {
  *    如果上层先 flush 再卸载，那几个字就丢了。所以这里暴露 `getContent()`，
  *    由上层「先取内容 → 发 noteEdit → flush → 再切换」。
  */
-export function NoteEditor({ root, note, ref, onStateChange, onError }: NoteEditorProps) {
+export function NoteEditor({
+  root,
+  note,
+  ref,
+  onStateChange,
+  onError,
+  onSaved,
+}: NoteEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   /** 最近一次尚未发出的正文。`null` 表示没有待发内容。 */
@@ -99,6 +115,12 @@ export function NoteEditor({ root, note, ref, onStateChange, onError }: NoteEdit
     const baseMtimeAtMount = note.mtime
     const initialDoc = note.content
 
+    const clearTimer = () => {
+      if (timerRef.current === null) return
+      window.clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+
     const flushPending = () => {
       const content = pendingRef.current
       if (content === null) return
@@ -106,6 +128,52 @@ export function NoteEditor({ root, note, ref, onStateChange, onError }: NoteEdit
       noteEdit(rootAtMount, pathAtMount, content, baseMtimeAtMount)
         .then(onStateChange)
         .catch((err: unknown) => onError(describeError(err)))
+    }
+
+    /**
+     * 立刻落盘（`Mod-s`）。
+     *
+     * # 为什么不能直接 `noteFlush`
+     *
+     * `noteFlush` 只冲刷 **Rust 槽位**里的内容。按键后 300ms 内，
+     * 最新的字符还躺在 `pendingRef` 里没发出去——此时 flush 会拿到
+     * 「没有待写内容」并立刻返回，用户看到的「已保存」是上一版。
+     * 所以顺序必须是「先取缓冲 → 发 noteEdit → 再 flush」，
+     * 与切换笔记时是同一条规矩。
+     *
+     * # 连按 10 次
+     *
+     * 第一次把内容写下去之后，`pendingRef` 与槽位都是空的，
+     * 后续每次 `noteFlush` 直接返回上一次的回执（`Ok(None)` / `Ok(Some)`），
+     * **不会重复写盘**——mtime 保持不变，这正是验收里那条判据。
+     */
+    const saveNow = () => {
+      const content = pendingRef.current
+      pendingRef.current = null
+      clearTimer()
+
+      const pushed: Promise<void> =
+        content === null
+          ? Promise.resolve()
+          : noteEdit(rootAtMount, pathAtMount, content, baseMtimeAtMount).then(() => undefined)
+
+      pushed
+        .then(() => noteFlush(rootAtMount, pathAtMount, false))
+        .then(() => {
+          onSaved()
+          return noteStatus(rootAtMount, pathAtMount)
+        })
+        .then(onStateChange)
+        .catch((err: unknown) => {
+          onError(describeError(err))
+          // 冲突横幅由 `saveState.lastError` 驱动，只报错不刷新状态的话
+          // 它要等下一轮轮询（500ms）才出现。
+          noteStatus(rootAtMount, pathAtMount)
+            .then(onStateChange)
+            .catch(() => {
+              // 状态也读不到时，上面的错误信息已经是全部信息了。
+            })
+        })
     }
 
     const schedule = () => {
@@ -127,7 +195,21 @@ export function NoteEditor({ root, note, ref, onStateChange, onError }: NoteEdit
           highlightActiveLine(),
           drawSelection(),
           history(),
-          keymap.of([...defaultKeymap, ...historyKeymap]),
+          keymap.of([
+            // 必须排在 `defaultKeymap` 前面：同一个 keymap 里先命中先生效。
+            // `preventDefault` 让 WebView 不去弹"保存网页"对话框；
+            // 返回 true 同样会阻止默认行为，两个都写是为了不被后人删掉其中一个。
+            {
+              key: 'Mod-s',
+              preventDefault: true,
+              run: () => {
+                saveNow()
+                return true
+              },
+            },
+            ...defaultKeymap,
+            ...historyKeymap,
+          ]),
           markdown(),
           syntaxHighlighting(kiHighlightStyle),
           EditorView.lineWrapping,
@@ -142,10 +224,7 @@ export function NoteEditor({ root, note, ref, onStateChange, onError }: NoteEdit
     viewRef.current = view
 
     return () => {
-      if (timerRef.current !== null) {
-        window.clearTimeout(timerRef.current)
-        timerRef.current = null
-      }
+      clearTimer()
       // 兜底：正常切换路径上上层已经取过内容并 flush 了，这里多半是空的。
       // 组件被意外卸载时（比如 HMR），至少把内容交给 Rust，而不是留在内存里。
       const content = pendingRef.current

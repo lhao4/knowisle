@@ -25,6 +25,14 @@ import {
  */
 const STATUS_POLL_MS = 500
 
+/**
+ * 手动保存（`Mod-s`）后「已保存」在标题栏停留多久。
+ *
+ * 它是一条**一次性回执**，不是状态：轮询出来的 `saveState` 要等 500ms 才更新，
+ * 而按键的反馈必须是即时的。两者分开，谁也不等谁。
+ */
+const SAVED_FLASH_MS = 1200
+
 /** 上次打开的 Vault 绝对路径。 */
 const LAST_VAULT_KEY = 'knowisle.lastVault'
 
@@ -35,7 +43,27 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [runtime, setRuntime] = useState<string>('')
+  /** 手动保存的回执，`null` 表示没有正在显示的提示。 */
+  const [flash, setFlash] = useState<string | null>(null)
+  const flashTimer = useRef<number | null>(null)
   const editorRef = useRef<NoteEditorHandle>(null)
+
+  const showFlash = useCallback((text: string) => {
+    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
+    setFlash(text)
+    flashTimer.current = window.setTimeout(() => {
+      flashTimer.current = null
+      setFlash(null)
+    }, SAVED_FLASH_MS)
+  }, [])
+
+  // 组件卸载时把定时器收掉，否则它会对着已卸载的组件 setState。
+  useEffect(
+    () => () => {
+      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
+    },
+    [],
+  )
 
   // 启动时 ping 一次：确认 Rust 侧真的起来了。
   // 如果这一句失败，后面所有按钮都会失败，报错信息会误导排查方向。
@@ -150,7 +178,7 @@ export default function App() {
   }, [vault, activeNote])
 
   const conflict = saveState?.lastError?.code === 'CONFLICT'
-  const saveLabel = describeSaveState(saveState)
+  const saveLabel = flash ?? describeSaveState(saveState)
 
   return (
     <div className="app">
@@ -251,6 +279,7 @@ export default function App() {
                 note={activeNote}
                 onStateChange={setSaveState}
                 onError={setError}
+                onSaved={() => showFlash('已保存')}
               />
             </section>
           ) : (
