@@ -23,6 +23,7 @@ import {
   noteStatus,
   type NoteContent,
   type SaveState,
+  type SearchHit,
 } from '../api'
 import { activeIndexAt, collectOutline, sameHeadingSequence, type OutlineItem } from '../lib/outline'
 import type { OutlineHandle } from './Outline'
@@ -176,6 +177,44 @@ export interface NoteEditorHandle {
    * 光标跑到了文档开头。用一个不需要知道位置的动作，就没有算错的机会。
    */
   focus: () => void
+  /**
+   * 跳到一条搜索命中：选中命中文本（原生选中就是高亮），并把那一行滚到视口中间。
+   *
+   * # 为什么这里要处理"还没挂载"的情况
+   *
+   * 跨文件跳转的顺序是「`openNote(path)` → resolve → 调本方法」。但
+   * `openNote` 的 `setActiveNote` 只是**排了一次渲染**，resolve 的时候
+   * 新文档往往还没挂载。此刻 `viewRef` 指向的是即将被销毁的旧视图——
+   * 在它上面 dispatch，用户看到的会是「跳过去了，但光标在开头」。
+   *
+   * 所以路径对不上时先存起来，由挂载 effect 在创建新视图之后立刻消费。
+   * 同文件跳转（路径相同）则直接应用，不绕这一圈。
+   */
+  revealHit: (hit: SearchHit) => void
+}
+
+/**
+ * 把一条命中应用到一个**已经存在**的 `EditorView` 上。
+ *
+ * 偏移量全部来自 Rust，单位是 UTF-16 码元——与 CM6 的文档位置、以及
+ * JavaScript 的字符串下标完全一致，不需要任何换算。
+ *
+ * 仍然要夹紧：索引是几秒前建的，磁盘上的文件可能已被别的程序改短，
+ * 而 `dispatch` 遇到越界位置会直接抛。
+ */
+function applyHit(view: EditorView, hit: SearchHit): void {
+  const doc = view.state.doc
+  const number = Math.min(Math.max(hit.line, 1), doc.lines)
+  const line = doc.line(number)
+  const from = line.from + Math.min(hit.column, line.length)
+  const to = line.from + Math.min(Math.max(hit.columnEnd, hit.column), line.length)
+  view.dispatch({
+    selection: { anchor: from, head: to },
+    // `center` 而不是 `start`：命中行的上下文比"顶格"重要，
+    // 上下各留一点，用户能看清这句话属于哪一段。
+    effects: EditorView.scrollIntoView(from, { y: 'center' }),
+  })
+  view.focus()
 }
 
 interface NoteEditorProps {
@@ -230,6 +269,10 @@ export function NoteEditor({
 }: NoteEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
+  /** 当前视图对应的笔记路径。跨文件跳转用它判断"视图换没换"。 */
+  const pathRef = useRef<string | null>(null)
+  /** 还没落地的搜索命中（视图尚未切换到位）。 */
+  const pendingHitRef = useRef<SearchHit | null>(null)
   /** 最近一次尚未发出的正文。`null` 表示没有待发内容。 */
   const pendingRef = useRef<string | null>(null)
   /** 在途的 IPC 定时器。`null` 表示当前没有等待中的合并窗口。 */
@@ -258,6 +301,15 @@ export function NoteEditor({
         // 所以这里不需要额外的存活判断。
         viewRef.current?.focus()
       },
+      revealHit: (hit) => {
+        const view = viewRef.current
+        if (view === null || pathRef.current !== hit.path) {
+          // 跨文件跳转还在 IPC 往返里：新视图没挂载之前，旧视图不能碰。
+          pendingHitRef.current = hit
+          return
+        }
+        applyHit(view, hit)
+      },
     }),
     [],
   )
@@ -271,6 +323,7 @@ export function NoteEditor({
     // 路径变化会重建整个编辑器（见下方依赖数组），所以挂载时的值就是这一篇的值。
     const rootAtMount = root
     const pathAtMount = note.path
+    pathRef.current = pathAtMount
     // 基线只在换文档时被 Rust 采信一次，所以始终传打开时的 mtime。
     const baseMtimeAtMount = note.mtime
     const initialDoc = note.content
@@ -453,6 +506,17 @@ export function NoteEditor({
     emitOutline(view.state)
     emitActive(view.state)
 
+    // 跨文件搜索跳转的落点。`revealHit` 可能在新文档挂载之前就被调用过，
+    // 那时它只能把命中存下来（旧视图即将销毁，不能碰）。这里消费掉。
+    //
+    // 路径对不上就丢弃：用户可能在跳转途中又点了别的笔记，
+    // 把上一次的命中套到新文档上，光标会落在一个毫不相干的位置。
+    const pendingHit = pendingHitRef.current
+    pendingHitRef.current = null
+    if (pendingHit !== null && pendingHit.path === pathAtMount) {
+      applyHit(view, pendingHit)
+    }
+
     /**
      * 编辑器滚动 → 把高亮项滚进大纲面板的可视区。
      *
@@ -487,6 +551,7 @@ export function NoteEditor({
       }
       view.destroy()
       viewRef.current = null
+      pathRef.current = null
     }
     // 只在切换笔记时重建：见组件文档第 2 条。
     // eslint-disable-next-line react-hooks/exhaustive-deps

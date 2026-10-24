@@ -26,10 +26,23 @@ export type {
   SaveResult,
   SaveState,
   ScanResult,
+  SearchHit,
+  SearchResult,
 } from './bindings'
 
 /** 递归扫描 Vault，返回 POSIX 相对路径的树。 */
 export const vaultScan = commands.vaultScan
+
+/**
+ * 全文搜索：ASCII 大小写折叠后的**子串**匹配，不模糊、不分词、不支持正则。
+ *
+ * `refreshPath` 传当前正在编辑的笔记路径：Rust 会把它从磁盘重读一次，
+ * 让刚打的字立刻可见。其余文件不重读。
+ *
+ * 调用方必须**先** flush 当前笔记（`noteEdit` → `noteFlush`），
+ * 否则磁盘上还没有刚打的字，搜索自然找不到——那不是搜索的 bug。
+ */
+export const vaultSearch = commands.vaultSearch
 
 /** 读取单篇笔记。`path` 必须是 `vaultScan` 返回过的 POSIX 相对路径。 */
 export const noteRead = commands.noteRead

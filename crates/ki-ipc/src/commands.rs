@@ -12,16 +12,46 @@
 
 use std::path::{Path, PathBuf};
 
-use ki_core::{AppInfo, KiError, NoteContent, SaveResult, SaveState, ScanResult};
+use ki_core::{AppInfo, KiError, NoteContent, SaveResult, SaveState, ScanResult, SearchResult};
 use ki_vault::{read_note, scan_vault, write_note, ScanOptions};
 
-use crate::autosave;
+use crate::{autosave, search};
 
 /// 扫描 Vault，返回 POSIX 相对路径的树。
+///
+/// 扫描同时**丢掉全文索引缓存**：用户点「选择文件夹」就是在要求"重新看一眼磁盘"，
+/// 留着旧索引会让"外部改动重新扫描后才可见"这句话变成谎言。
 #[tauri::command]
 #[specta::specta]
 pub async fn vault_scan(root: String) -> Result<ScanResult, KiError> {
-    run_blocking(move || scan_vault(&PathBuf::from(root), &ScanOptions::default())).await
+    run_blocking(move || {
+        search::invalidate(Path::new(&root));
+        scan_vault(&PathBuf::from(root), &ScanOptions::default())
+    })
+    .await
+}
+
+/// 全文搜索：ASCII 大小写折叠后的子串匹配。
+///
+/// # 参数
+///
+/// - `query` 是**子串**，不是正则、不分词。首尾空白忽略。
+/// - `refresh_path` 是"当前正在编辑的笔记"：搜索前把它从磁盘重读一次，
+///   让刚打的字立刻可见。其余文件不重读（那叫重建索引）。
+///
+/// # 为什么这里不 flush
+///
+/// "先落盘再搜"是**调用方**的顺序（前端先 `note_flush` 再调本命令）。
+/// 查询若在这里偷偷写盘，一次只读操作就变成了写操作，而写盘失败会连带
+/// 让搜索报错——用户会以为"搜不了"。
+#[tauri::command]
+#[specta::specta]
+pub async fn vault_search(
+    root: String,
+    query: String,
+    refresh_path: Option<String>,
+) -> Result<SearchResult, KiError> {
+    run_blocking(move || search::query(Path::new(&root), &query, refresh_path.as_deref())).await
 }
 
 /// 读取单篇笔记。`path` 必须是 `vault_scan` 返回过的 POSIX 相对路径。

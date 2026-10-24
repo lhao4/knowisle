@@ -1669,6 +1669,7 @@ dependencies = [
 name = "ki-ipc"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "ki-core",
  "ki-vault",
  "serde",

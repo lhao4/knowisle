@@ -10,6 +10,9 @@ license.workspace = true
 ki-core = { workspace = true }
 ki-vault = { workspace = true }
 serde = { workspace = true }
+# 只为了把 Vault 根规范化成与 `scan_vault` 相同的形态：搜索缓存按 root 做键，
+# 键不一致会让每次搜索都重建索引（表现为"怎么每次都慢"）。
+dunce = { workspace = true }
 
 # 只要 `#[tauri::command]` 宏、`Runtime` trait 与 `spawn_blocking`，
 # 不需要 wry / webview。**关掉 default features 是本 crate 存在的意义之一**：

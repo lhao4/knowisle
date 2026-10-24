@@ -19,6 +19,7 @@
   --ki-slate-900: #18181b;
   --ki-blue-500: #2563eb;
   --ki-blue-50: #eff6ff;
+  --ki-amber-100: #fef3c7;
   --ki-amber-600: #d97706;
   --ki-red-600: #dc2626;
 
@@ -34,6 +35,8 @@
   --ki-border-quote: var(--ki-slate-400);
   --ki-bg-code: var(--ki-slate-200);
   --ki-accent: var(--ki-blue-500);
+  /* 搜索命中的底色。刻意用暖色：它必须在一屏冷色的正文里一眼跳出来。 */
+  --ki-bg-mark: var(--ki-amber-100);
 
   --ki-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --ki-font-mono: ui-monospace, 'Cascadia Code', Consolas, 'Microsoft YaHei Mono', monospace;
@@ -692,6 +695,172 @@ body {
 }
 
 .quick-open__keys {
+  flex: 0 0 auto;
+  font-family: var(--ki-font-mono);
+}
+
+/* ───────────────────────── 全文搜索（Cmd/Ctrl+Shift+F） ───────────────────────── */
+
+/*
+ * 外壳与快速打开同构（fixed 浮层 + 顶部输入框 + 自滚列表 + 底部提示），
+ * 但**不复用它的类名**。
+ *
+ * 两个浮层长得像只是现在像：搜索结果每项两行（路径 + 命中片段），
+ * 宽度、行高、hover 语义都不一样。共用一套类名之后，改搜索的列表样式
+ * 会顺手改坏快速打开——而那种回归只有用户会先发现。
+ * 抽公共组件同理，等第三次使用（命令面板）再说。
+ */
+
+.search-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 10vh;
+  background: rgb(24 24 27 / 22%);
+}
+
+.search-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(720px, 94vw);
+  max-height: 64vh;
+  overflow: hidden;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 10px;
+  background: var(--ki-bg-canvas);
+  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+}
+
+.search__input {
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 13px 16px;
+  border: 0;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  background: transparent;
+  color: var(--ki-text-primary);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.search__input::placeholder {
+  color: var(--ki-text-faint);
+}
+
+.search__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 4px 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.search__item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 16px;
+  cursor: pointer;
+}
+
+.search__item.is-active {
+  background: var(--ki-bg-active);
+}
+
+.search__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  color: var(--ki-text-faint);
+}
+
+.search__path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+}
+
+.search__item.is-active .search__path {
+  color: var(--ki-accent);
+}
+
+.search__line {
+  flex: 0 0 auto;
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+}
+
+.search__badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--ki-blue-50);
+  color: var(--ki-accent);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+/*
+ * 命中片段最多两行。`-webkit-line-clamp` 在 WebView2（Chromium）与
+ * WKWebView 上都可用；`overflow-wrap: anywhere` 让没有空格的超长路径式文本
+ * 也能折行，否则一行会把面板撑出横向滚动条。
+ */
+.search__snippet {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--ki-text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* 原生 `<mark>` 的底色是浏览器定的黄，换成 token 才能跟着主题走。 */
+.search__mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  background: var(--ki-bg-mark);
+  color: inherit;
+}
+
+.search__empty {
+  margin: 0;
+  padding: 24px 16px;
+  color: var(--ki-text-muted);
+  font-size: 13px;
+}
+
+.search__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex: 0 0 auto;
+  padding: 7px 16px;
+  border-top: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-surface);
+  font-size: 11px;
+  color: var(--ki-text-faint);
+}
+
+.search__summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search__keys {
   flex: 0 0 auto;
   font-family: var(--ki-font-mono);
 }

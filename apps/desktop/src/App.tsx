@@ -4,6 +4,7 @@ import { TreeNode } from './components/FileTree'
 import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
 import { Outline, type OutlineHandle } from './components/Outline'
 import { QuickOpen } from './components/QuickOpen'
+import { SearchOverlay } from './components/SearchOverlay'
 import type { OutlineItem } from './lib/outline'
 import { flattenVault, type QuickItem } from './lib/quick-open'
 import {
@@ -19,6 +20,7 @@ import {
   type NoteContent,
   type SaveState,
   type ScanResult,
+  type SearchHit,
 } from './api'
 
 /**
@@ -61,6 +63,8 @@ export default function App() {
   const outlineRef = useRef<OutlineHandle>(null)
   /** 快速打开浮层是否可见。 */
   const [paletteOpen, setPaletteOpen] = useState(false)
+  /** 全文搜索浮层是否可见。 */
+  const [searchOpen, setSearchOpen] = useState(false)
   /**
    * 快速打开的全量候选，**只在扫描完成时重建一次**。
    *
@@ -145,10 +149,65 @@ export default function App() {
   }, [applyVault])
 
   /**
+   * 在途的冲刷。
+   *
+   * # 为什么必须串行化
+   *
+   * 两次 `noteEdit` 撞在一起时，第二次带的是**上一次落盘之前**的基线
+   * （基线要等第一次写完才推进），于是第二次写盘必然 `CONFLICT`——
+   * 而这两次写的其实是同一份内容，用户看到的是「我刚打了个字，保存就冲突了」。
+   *
+   * 这个窗口在开发模式下尤其容易撞：`StrictMode` 会把 effect 挂载两次，
+   * 搜索浮层的 `onPrepare` 于是被调用两次，两次冲刷几乎同时出发。
+   * 挡在调用方（而不是改 autosave 的写入链路）是刻意的：写入的 1.5s 节拍、
+   * 原子写与乐观锁都不该为了一个 UI 时序问题而改动。
+   */
+  const flushInFlight = useRef<Promise<boolean> | null>(null)
+
+  /**
+   * 把编辑器里的内容推给 Rust 并立刻落盘。
+   *
+   * 只做「先取内容 → noteEdit → noteFlush」这一条顺序——它就是唯一的落盘路径，
+   * `openNote` 与「搜索前冲刷」都走它。反过来（先 flush 再取内容）会漏掉
+   * 300ms 合并窗口里还没发出去的字符：`noteFlush` 只冲刷 Rust 槽位，
+   * 槽位里没有的那几个字它当然写不出来。
+   *
+   * 返回 `false` 表示失败（典型是冲突）。此时磁盘上没有最新内容，
+   * 由调用方决定"留在原地"还是"照常继续"：切换笔记必须留，搜索要继续。
+   */
+  const flushActiveNote = useCallback(async (): Promise<boolean> => {
+    const inFlight = flushInFlight.current
+    if (inFlight !== null) return inFlight
+    if (!vault || !activeNote) return true
+
+    const task = (async () => {
+      const content = editorRef.current?.getContent()
+      try {
+        if (content !== undefined) {
+          await noteEdit(vault.root, activeNote.path, content, activeNote.mtime)
+        }
+        await noteFlush(vault.root, activeNote.path, false)
+        return true
+      } catch (err) {
+        setError(describeError(err))
+        setSaveState(await noteStatus(vault.root, activeNote.path).catch(() => null))
+        return false
+      }
+    })()
+
+    flushInFlight.current = task
+    try {
+      return await task
+    } finally {
+      flushInFlight.current = null
+    }
+  }, [vault, activeNote])
+
+  /**
    * 打开一篇笔记（按 Vault 相对路径）。
    *
-   * 树点击与快速打开共用这一条路径——**绝不新写一套**。两条入口各自实现
-   * 一遍「先 flush 再切换」，早晚会有一条忘了 flush，而那种丢失是静默的。
+   * 树点击、快速打开、全文搜索共用这一条路径——**绝不新写一套**。三个入口
+   * 各自实现一遍「先 flush 再切换」，早晚会有一个忘了 flush，而那种丢失是静默的。
    *
    * # 顺序不能换
    *
@@ -160,25 +219,18 @@ export default function App() {
    *
    * 典型失败是冲突（文件被别的程序改过）。此时切走等于把这篇的修改丢了，
    * 所以留在原地，让用户处理冲突横幅。
+   *
+   * # 返回值
+   *
+   * 调用方要的其实是「切换到底发生了没有」：搜索跳转必须在 `true` 之后
+   * 才 dispatch selection，否则会打到一篇根本没打开的笔记上。
    */
   const openNote = useCallback(
-    async (path: string) => {
-      if (!vault) return
-      if (activeNote?.path === path) return
+    async (path: string): Promise<boolean> => {
+      if (!vault) return false
+      if (activeNote?.path === path) return true
 
-      if (activeNote) {
-        const content = editorRef.current?.getContent()
-        try {
-          if (content !== undefined) {
-            await noteEdit(vault.root, activeNote.path, content, activeNote.mtime)
-          }
-          await noteFlush(vault.root, activeNote.path, false)
-        } catch (err) {
-          setError(describeError(err))
-          setSaveState(await noteStatus(vault.root, activeNote.path).catch(() => null))
-          return
-        }
-      }
+      if (activeNote && !(await flushActiveNote())) return false
 
       try {
         const note = await noteRead(vault.root, path)
@@ -188,11 +240,13 @@ export default function App() {
         setActiveNote(note)
         setSaveState(null)
         setError(null)
+        return true
       } catch (err) {
         setError(describeError(err))
+        return false
       }
     },
-    [vault, activeNote],
+    [vault, activeNote, flushActiveNote],
   )
 
   /** 树节点点击。`FileNode` 到路径的转换只在这里发生。 */
@@ -229,6 +283,42 @@ export default function App() {
   }, [])
 
   /**
+   * 搜索浮层里选中一条命中：先收浮层，再走同一条打开路径。
+   *
+   * # 为什么必须 `await`
+   *
+   * 跨文件时编辑器按 `note.path` 重建。`openNote` resolve 之前，`viewRef`
+   * 指向的是即将销毁的旧视图——在它上面 dispatch selection，用户看到的
+   * 是「跳过去了，但光标在开头」。`revealHit` 内部还会再兜一层（路径对不上
+   * 就等挂载），两道保险各自独立：这一道挡"根本没打开"，那一道挡"打开了但没挂载"。
+   */
+  const openFromSearch = useCallback(
+    async (hit: SearchHit) => {
+      setSearchOpen(false)
+      const opened = await openNote(hit.path)
+      if (opened) editorRef.current?.revealHit(hit)
+    },
+    [openNote],
+  )
+
+  /** 关闭搜索浮层并把焦点还给编辑器。光标位置不变——`focus()` 不碰 selection。 */
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false)
+    editorRef.current?.focus()
+  }, [])
+
+  /**
+   * 搜索前的落盘。失败不阻断搜索。
+   *
+   * 不阻断的理由：搜索读的是磁盘（唯一真相源）。冲突时磁盘上是对方那一版，
+   * 搜出来的也就是对方那一版——同时冲突横幅已经明示"你的改动还没保存"。
+   * 若在这里中断搜索，用户会以为搜索坏了，而真正的问题在保存冲突上。
+   */
+  const prepareSearch = useCallback(async () => {
+    await flushActiveNote()
+  }, [flushActiveNote])
+
+  /**
    * `Cmd/Ctrl+P`。
    *
    * # 只注册一份
@@ -257,13 +347,40 @@ export default function App() {
       if (e.key !== 'p' && e.key !== 'P') return
       // WebView 里 `Ctrl+P` 是「打印」，不拦会弹出一个打印对话框。
       e.preventDefault()
-      if (!hasVault) return
+      // 搜索浮层开着时不响应：两层浮层叠在一起，Esc 该关谁就没有答案了。
+      if (!hasVault || searchOpen) return
       setPaletteOpen(true)
     }
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [hasVault])
+  }, [hasVault, searchOpen])
+
+  /**
+   * `Cmd/Ctrl+Shift+F` 全文搜索。
+   *
+   * 与 `Mod+P` 是两条独立监听，各自只认自己那个组合键。塞进同一个 handler
+   * 会让「按了 F 但没按 Shift」「按了 P 但按了 Shift」这些判断互相纠缠，
+   * 而它们本来就是互斥的两种意图。
+   *
+   * 只开不关：浮层已开时再按是空操作。关闭只有 Esc 一个入口——只有那条路径
+   * 带「把焦点还给编辑器」的语义（`closeSearch`）。
+   */
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.repeat || e.altKey) return
+      if (!e.metaKey && !e.ctrlKey) return
+      if (!e.shiftKey) return
+      if (e.key !== 'f' && e.key !== 'F') return
+      e.preventDefault()
+      // 快速打开开着时不响应，理由同上一条（反方向）。
+      if (!hasVault || paletteOpen) return
+      setSearchOpen(true)
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [hasVault, paletteOpen])
 
   /** 大纲点击：把光标送到该标题行，并把这一行滚到视口顶部。 */
   const jumpTo = useCallback((pos: number) => {
@@ -443,6 +560,21 @@ export default function App() {
       {paletteOpen && (
         // oxlint-disable-next-line react/refs -- 见上方「为什么这里可以在渲染期读 ref」
         <QuickOpen items={quickItems.current} onOpen={openFromPalette} onClose={closePalette} />
+      )}
+
+      {/*
+        搜索浮层与快速打开互斥（两个快捷键各自挡住对方），所以这里不需要
+        考虑"谁盖在谁上面"。`vault` 判空只为让 `root` 的类型收窄——没有库时
+        快捷键根本不会开它。
+      */}
+      {searchOpen && vault && (
+        <SearchOverlay
+          root={vault.root}
+          activePath={activeNote?.path ?? null}
+          onPrepare={prepareSearch}
+          onOpen={openFromSearch}
+          onClose={closeSearch}
+        />
       )}
     </div>
   )

@@ -4,8 +4,29 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
-	/**  扫描 Vault，返回 POSIX 相对路径的树。 */
+	/**
+	 *  扫描 Vault，返回 POSIX 相对路径的树。
+	 * 
+	 *  扫描同时**丢掉全文索引缓存**：用户点「选择文件夹」就是在要求"重新看一眼磁盘"，
+	 *  留着旧索引会让"外部改动重新扫描后才可见"这句话变成谎言。
+	 */
 	vaultScan: (root: string) => __TAURI_INVOKE<ScanResult>("vault_scan", { root }),
+	/**
+	 *  全文搜索：ASCII 大小写折叠后的子串匹配。
+	 * 
+	 *  # 参数
+	 * 
+	 *  - `query` 是**子串**，不是正则、不分词。首尾空白忽略。
+	 *  - `refresh_path` 是"当前正在编辑的笔记"：搜索前把它从磁盘重读一次，
+	 *    让刚打的字立刻可见。其余文件不重读（那叫重建索引）。
+	 * 
+	 *  # 为什么这里不 flush
+	 * 
+	 *  "先落盘再搜"是**调用方**的顺序（前端先 `note_flush` 再调本命令）。
+	 *  查询若在这里偷偷写盘，一次只读操作就变成了写操作，而写盘失败会连带
+	 *  让搜索报错——用户会以为"搜不了"。
+	 */
+	vaultSearch: (root: string, query: string, refreshPath: string | null) => __TAURI_INVOKE<SearchResult>("vault_search", { root, query, refreshPath }),
 	/**  读取单篇笔记。`path` 必须是 `vault_scan` 返回过的 POSIX 相对路径。 */
 	noteRead: (root: string, path: string) => __TAURI_INVOKE<NoteContent>("note_read", { root, path }),
 	/**
@@ -235,5 +256,65 @@ export type ScanResult = {
 	skipped: number,
 	/**  扫描耗时（毫秒），用于直接验证 M0 的 500ms 预算。 */
 	elapsedMs: number,
+};
+
+/**
+ *  一条命中：某篇笔记的某一行。
+ * 
+ *  # 两套偏移量，不是冗余
+ * 
+ *  `from` / `to` 是相对 [`SearchHit::text`] 的下标，前端直接 `text.slice(from, to)`
+ *  就能把命中片段包进 `<mark>`；`column` / `column_end` 是相对**整行**的位置，
+ *  编辑器跳转用它。
+ * 
+ *  分开的原因是 `text` 可能是一个**窗口**：超长行只截命中附近的一段返回
+ *  （否则一条 5000 字的长段落会把结果列表撑成一面墙，payload 也会失控）。
+ *  若只给一套偏移，前端就得自己知道窗口从哪儿开始——那种"约定"迟早会算错。
+ * 
+ *  所有偏移的单位都是 **UTF-16 码元**，与 JavaScript 的字符串下标、以及
+ *  CodeMirror 6 的文档位置完全一致。Rust 侧的字节偏移在出口处就换算掉。
+ */
+export type SearchHit = {
+	/**  Vault 相对路径（POSIX），与 `note_read` 接受的形式一致。 */
+	path: string,
+	/**  1-based 行号。 */
+	line: number,
+	/**  该行的展示文本。通常是整行；超长行会被裁成命中附近的一个窗口。 */
+	text: string,
+	/**  命中在 `text` 里的起点（UTF-16 码元）。 */
+	from: number,
+	/**  命中在 `text` 里的终点（UTF-16 码元，不含）。 */
+	to: number,
+	/**  命中在整行里的起点（UTF-16 码元）。 */
+	column: number,
+	/**  命中在整行里的终点（UTF-16 码元，不含）。 */
+	columnEnd: number,
+	/**  这篇笔记的**文件名**也包含关键词。排序时这类命中排在前面。 */
+	nameHit: boolean,
+};
+
+/**  一次全文搜索的结果。 */
+export type SearchResult = {
+	/**  命中行，已排序并截断到 200 条。 */
+	hits: SearchHit[],
+	/**  截断前的命中条数（是**行数**，不是文件数）。UI 用它显示「共 N 条」。 */
+	total: number,
+	/**  是否因为超过 200 条而截断。 */
+	truncated: boolean,
+	/**  进入索引的文件数（建索引时成功读取的篇数）。 */
+	indexedFiles: number,
+	/**  建索引时跳过的文件数：非 UTF-8、超过 2MB、IO 失败。 */
+	skippedFiles: number,
+	/**  本次请求建索引的耗时（毫秒）。命中缓存时为 0。 */
+	indexMs: number,
+	/**
+	 *  当前 Vault 的索引被建起来的次数。
+	 * 
+	 *  切库归零，重新扫描（缓存作废）后继续累加。
+	 * 
+	 *  诊断字段，不是业务字段：连打 3 个字符会发 3 次搜索，这个数必须恒为 1。
+	 *  它也是唯一能从外部证明"锁真的生效了"的证据。
+	 */
+	builds: number,
 };
 
