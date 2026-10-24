@@ -310,10 +310,16 @@ pub fn flush(root: &Path, path: &str, force: bool) -> Result<Option<SaveResult>,
 fn worker() {
     loop {
         let deadline = {
-            let slot = lock();
+            let mut slot = lock();
             if slot.pending.is_none() {
+                // **必须与 `pending.is_none()` 在同一次持锁里放下 `worker_running`。**
+                // 分两次（先判 pending、再调 `retire()`）会开一个窗口：
+                // 提交恰好落在中间，它看到 `worker_running == true` 就不起线程，
+                // 紧接着这里把标志放下——于是既没有线程在跑、内容也没人写，
+                // 要等用户下一次按键才被救回来。
+                slot.worker_running = false;
                 drop(slot);
-                retire();
+                SHARED.wake.notify_all();
                 return;
             }
             slot.throttle.deadline(Instant::now())
@@ -359,13 +365,6 @@ fn worker() {
     }
 }
 
-/// 把 `worker_running` 放下来并唤醒可能在等的 `note_flush`。
-fn retire() {
-    let mut slot = lock();
-    slot.worker_running = false;
-    drop(slot);
-    SHARED.wake.notify_all();
-}
 
 /// 查询当前保存状态，不触发任何写入。
 ///
