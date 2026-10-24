@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "typecheck": "tsc -b",
     "lint": "oxlint",
+    "bindings:generate": "cargo run --quiet --locked --manifest-path src-tauri/Cargo.toml --bin export_bindings",
+    "bindings:check": "pnpm bindings:generate && git diff --exit-code -- src/api/bindings.ts",
     "tauri": "tauri"
   },
   "dependencies": {

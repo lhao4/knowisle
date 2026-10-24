@@ -12,6 +12,8 @@
     "build": "pnpm --filter @knowisle/desktop tauri build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
+    "bindings": "pnpm --filter @knowisle/desktop bindings:generate",
+    "bindings:check": "pnpm --filter @knowisle/desktop bindings:check",
     "check": "cargo check --workspace",
     "test": "cargo test --workspace"
   }

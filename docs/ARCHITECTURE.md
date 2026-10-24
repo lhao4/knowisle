@@ -617,11 +617,12 @@ knowisle/
 ├── packages/
 │   ├── ui/                       # 设计系统（token + Radix 封装）
 │   ├── editor/                   # CodeMirror 6 封装
-│   ├── sdk/                      # 插件 SDK（TS 类型 + 运行时）
-│   └── bindings/                 # tauri-specta 自动生成，禁止手改
+│   └── sdk/                      # 插件 SDK（TS 类型 + 运行时）
 └── docs/
     └── ARCHITECTURE.md
 ```
+
+> **生成物落点（M1 实测修正）**：本节早期把 `bindings.ts` 规划在 `packages/bindings/`。M1 接 `tauri-specta` 时改放在 `apps/desktop/src/api/bindings.ts`——目前只有桌面端一个消费者，为一个文件建一个 workspace 包，收益是零，成本是每个 import 都要过一层包名解析。等 `packages/sdk` 真的需要它时再抽出去，那时才有第二个消费者。
 
 `src-tauri` 里的代码应当**薄到无聊**——每个 command 就是"解包参数 → 调 service → 序列化结果"，不超过 15 行。业务逻辑一旦出现在这里，就说明它跑错了层。
 
@@ -640,13 +641,26 @@ pub async fn note_save(
 ) -> Result<SaveResult, KiError> { ... }
 ```
 
-生成：
+生成的是一个 `commands` 对象，函数名转小驼峰（IPC 字符串仍是 `note_save`）：
 
 ```ts
-export function note_save(noteId: string, content: string, baseHash: string | null): Promise<SaveResult>
+export const commands = {
+  noteSave: (noteId: string, content: string, baseHash: string | null) =>
+    __TAURI_INVOKE<SaveResult>("note_save", { noteId, content, baseHash }),
+}
 ```
 
 CI 里跑 `pnpm bindings:check`，如果生成结果与提交的 `bindings.ts` 不一致则**构建失败**。这保证了"前端调用的 API 一定存在且类型正确"。
+
+> **生成器的三个默认值不能照单全收（M1 实测）**：
+>
+> 1. `ErrorHandlingMode` 默认是 `Result`，生成 `{ status, data | error }` 包装，逼着前端每处调用改写。本项目用 `Throw`——与 `invoke()` 原语义逐字相同，`try/catch` 一行不动。**换契约不该顺带改调用风格。**
+> 2. `u64` / `i64` 默认导成 TS `bigint`，而 bigint 默认**禁止导出**（直接报错）。但 Tauri v2 走 JSON，`u64` 到 webview 里本来就是 double，导成 bigint 是错的。用 `dangerously_cast_bigints_to_number()` 承认既成事实，安全边界写死在领域层注释里（2^53）。
+> 3. serde 分相默认开启，一个 `skip_serializing_if` 就能炸出 `FileNode_Serialize | FileNode_Deserialize` 联合类型。本项目类型形状对称，用 `disable_serde_phases()` 统一。
+>
+> **生成器必须是 bin，不能是 example**：`tauri-build` 只给 **bin** 目标嵌 ComCtl32 v6 清单，example 没有清单，Windows 上必然 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)`。
+>
+> **版本必须三件套精确钉死**：`tauri-specta` 对 `specta` 的依赖是 `=2.0.0-rc.N`。写成 `"2"` 或 `^` 会解析出两个 specta，症状是 `the trait bound Foo: specta::Type is not satisfied`——而你已经 derive 过了。
 
 > **命令命名偏差（M0 实测修正）**：本文早期写的是 `domain::action` 形式（如 `note::save`），但 Tauri 的 `#[tauri::command]` 要求命令名必须是合法的 Rust 函数名，`::` 不可用。实际约定改为 **`domain_action`**：`vault_scan`、`note_read`、`vault_save`。语义不变，只是分隔符从 `::` 变成 `_`。
 >

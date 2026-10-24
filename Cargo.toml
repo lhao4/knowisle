@@ -20,3 +20,14 @@ serde_json = "1"
 thiserror = "2"
 walkdir = "2.5"
 dunce = "1"
+
+# ---- IPC 类型生成（tauri-specta）----
+# 三行必须同时升级，且必须用 `=` 精确钉死，理由不是洁癖：
+#   tauri-specta 对 specta 的依赖是 `=2.0.0-rc.26`（精确相等，不是 ^）。
+# 一旦这里的 specta 解析成另一个 rc，cargo 会同时装两个 specta，
+# `#[derive(specta::Type)]` 实现的是 A 版本，tauri-specta 要的是 B 版本，
+# 报错是 "the trait bound `Foo: specta::Type` is not satisfied" —— 而你明明已经 derive 了。
+# specta 与 tauri-specta 都是 rc 预发布版，语义化版本规则下 `"2"` 根本匹配不到它们。
+specta = { version = "=2.0.0-rc.26", features = ["derive", "function"] }
+specta-typescript = "=0.0.13"
+tauri-specta = { version = "=2.0.0-rc.26", features = ["derive", "typescript"] }

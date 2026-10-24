@@ -10,10 +10,17 @@
 //! 那是把国际化、日志格式与用户文案三者耦合在一起的经典错误。
 
 use serde::Serialize;
+use specta::Type;
 
 /// 领域错误。变体数量刻意保持很少：错误分类的粒度应该由**处理方式**决定，
 /// 而不是由"出错的地方"决定。
-#[derive(Debug, thiserror::Error, Serialize)]
+///
+/// # 为什么 derive `Type`
+///
+/// 前端要写 `switch (err.code)`，就必须知道 `code` 的全部取值以及每个取值下
+/// `detail` 的形状。手写这份联合类型等于把错误模型抄了两遍；`Type` 让它只有一份。
+/// 新加一个变体而前端没跟上时，`tsc` 会直接报错，而不是在运行时落到 default 分支。
+#[derive(Debug, thiserror::Error, Serialize, Type)]
 #[serde(tag = "code", content = "detail", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum KiError {
     /// 传入的路径存在，但不是目录。

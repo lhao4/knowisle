@@ -3,10 +3,13 @@
  *
  * 这是 IPC 边界的一部分：`KiError` 的判别联合是契约，翻译规则必须和契约放在一起，
  * 否则 Rust 加了新错误码，改的地方会散落在各个组件里。
+ *
+ * `KiError` 本身来自 `bindings.ts`（Rust 生成），所以新加变体时这里的 `switch`
+ * 会立刻编译失败——这正是我们要的：错误文案不能静默落后于契约。
  */
 
 import { formatBytes } from '../lib/format'
-import type { KiError } from './types'
+import type { KiError } from './bindings'
 
 export function isKiError(value: unknown): value is KiError {
   return typeof value === 'object' && value !== null && 'code' in value

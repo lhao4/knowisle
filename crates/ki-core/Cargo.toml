@@ -9,3 +9,8 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# `specta::Type` 是 `serde::Serialize` 的类型级孪生：前者描述「Rust 里是什么形状」，
+# 后者描述「跨 IPC 之后前端看到什么形状」。把它放在领域层而不是适配层，
+# 是因为一旦搬到 src-tauri，就得为每个结构体写一份镜像 DTO——那正是要消灭的东西。
+# 注意 specta 不是 tauri：公理 A2 禁止的是 `tauri::`，不是类型反射。
+specta = { workspace = true }

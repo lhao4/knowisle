@@ -1,9 +1,10 @@
 //! 领域数据结构：Vault 树、笔记内容、扫描结果。
 
 use serde::{Deserialize, Serialize};
+use specta::Type;
 
 /// 树节点类型。序列化为小写字符串：`"dir"` / `"file"`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeKind {
     Dir,
@@ -25,7 +26,15 @@ impl NodeKind {
 ///   违反此条会在 Windows 上产生 `notes\a.md` 与 `notes/a.md` 两套互不相等的 key。
 /// - `name` 是路径最后一段的原始文本，完整保留中文与 emoji。
 /// - `children` 仅目录有值；文件恒为 `None`（而不是 `Some(vec![])`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # 数值宽度
+///
+/// `size` 是 `u64`、`mtime` 是 `i64`，但前端拿到的是 JS `number`——
+/// 这不是疏忽，是 Tauri v2 的 IPC 只走 JSON，`u64` 到了 webview 里本来就是 double。
+/// 生成绑定时用 `dangerously_cast_bigints_to_number()` 承认这个既成事实；
+/// 若改成 TS `bigint` 反而与运行时值不符。安全边界是 2^53：
+/// 文件字节数与毫秒时间戳都不可能越界（2^53 毫秒 ≈ 28.5 万年）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct FileNode {
     pub name: String,
@@ -76,7 +85,7 @@ impl FileNode {
 ///
 /// 除了树本身，还带上足够多的诊断信息——这样"为什么少了几百个文件"
 /// 这类问题可以在 UI 上直接回答，而不必让用户去翻日志。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResult {
     /// 规范化后的绝对路径（Windows 上已剥离 `\\?\` 前缀）。
@@ -93,7 +102,7 @@ pub struct ScanResult {
 }
 
 /// 单篇笔记的读取结果。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteContent {
     /// Vault 相对路径（POSIX），与请求时传入的一致。
@@ -102,4 +111,20 @@ pub struct NoteContent {
     pub content: String,
     pub size: u64,
     pub mtime: i64,
+}
+
+/// `app_ping` 的返回值：IPC 通道的握手信息。
+///
+/// 这个结构体存在的唯一理由是**对称**。M0 时它返回 `serde_json::Value`，
+/// 于是契约只有前端一侧——Rust 改了字段名，编译器不会拦，只有用户会看见
+/// `undefined`。M1 要再加三个命令，再放任下去就是四个单边契约。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    /// 产品标识，恒为 `knowisle`（不是窗口标题，别拿它做展示）。
+    pub name: String,
+    /// 取自 `CARGO_PKG_VERSION`，与 `tauri.conf.json` 的 version 同源。
+    pub version: String,
+    /// 进程号。用来在"起了两个实例"时确认前端连的是哪一个。
+    pub pid: u32,
 }

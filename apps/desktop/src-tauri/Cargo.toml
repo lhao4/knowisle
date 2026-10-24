@@ -7,6 +7,11 @@ edition = "2024"
 rust-version = "1.90"
 license = "AGPL-3.0-or-later"
 
+# 本 crate 有两个 bin：应用本体 `knowisle` 与契约导出器 `export_bindings`。
+# 有第二个 bin 之后 `cargo run` 会变成歧义错误，`tauri dev` 随之失效——
+# 这一行是让 `cargo run` 默认落到应用本体的唯一开关，别删。
+default-run = "knowisle"
+
 # Tauri 2 要求 lib 目标；移动端入口也从这里导出。
 [lib]
 name = "knowisle_lib"
@@ -19,6 +24,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { workspace = true }
-serde_json = { workspace = true }
 ki-core = { workspace = true }
 ki-vault = { workspace = true }
+
+# IPC 契约生成。只有这一层认识 specta —— ki-core 只 derive 类型，不认识导出器。
+tauri-specta = { workspace = true }
+specta = { workspace = true }
+specta-typescript = { workspace = true }

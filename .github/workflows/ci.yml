@@ -122,3 +122,13 @@ jobs:
       # 编译整个壳（含 tauri / 插件 / capabilities），不打包安装器：
       # 打包需要签名证书，MVP 阶段不做。
       - run: cargo build --locked -p knowisle
+
+      # IPC 契约 drift 校验：`bindings.ts` 是从 Rust command 签名生成的，
+      # 与 `Cargo.lock` 一样属于"生成物但必须入库"。重新生成一遍，
+      # 工作区只要有任何差异就说明有人改了命令却忘了提交生成结果。
+      #
+      # 放在 shell job 而不是 frontend job：生成器要链接 tauri，需要系统依赖。
+      # 三个平台都跑，因为"生成结果与平台无关"本身也是要守的性质——
+      # 一旦哪天导出器开始写绝对路径或 CRLF，这里会立刻红。
+      - name: IPC bindings drift
+        run: pnpm --filter @knowisle/desktop bindings:check
