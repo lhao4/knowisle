@@ -186,6 +186,26 @@ body {
   font-size: 12px;
 }
 
+/* 确认类动作（新建 / 重命名）。整屏只有一个，用 accent 把它和「取消」分开。 */
+.btn--primary {
+  border-color: var(--ki-accent);
+  background: var(--ki-accent);
+  color: #fff;
+}
+
+.btn--primary:hover:not(:disabled) {
+  border-color: var(--ki-blue-500);
+  background: var(--ki-blue-500);
+  filter: brightness(1.08);
+}
+
+.btn--primary:disabled {
+  /* 与 `.btn:disabled` 的灰字区分：这里底色还在，只是变淡。 */
+  background: var(--ki-slate-400);
+  border-color: var(--ki-slate-400);
+  color: #fff;
+}
+
 .workspace {
   display: flex;
   flex: 1 1 auto;
@@ -214,6 +234,22 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/*
+ * 侧栏顶部：「新建」按钮。
+ *
+ * 与 `.sidebar__root` 分成两行：路径是诊断信息（等宽、10px、灰色），
+ * 按钮是动作。挤在一行里，长路径会把按钮挤出可视区——而这是**唯一**
+ * 能在空库里创建第一篇笔记的入口（树里没有节点可右键）。
+ */
+.sidebar__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ki-border-subtle);
 }
 
 .tree {
@@ -863,6 +899,125 @@ body {
 .search__keys {
   flex: 0 0 auto;
   font-family: var(--ki-font-mono);
+}
+
+/* ───────────────────────── 树节点右键菜单 ───────────────────────── */
+
+/*
+ * fixed 定位 + 内联 left/top（坐标来自 `contextmenu` 事件）。
+ * z-index 高于两个浮层（100）：菜单是"对某一行的一次操作"，必须盖住正文。
+ */
+.context-menu {
+  position: fixed;
+  z-index: 200;
+  padding: 4px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 8px;
+  background: var(--ki-bg-canvas);
+  box-shadow: 0 8px 24px rgb(24 24 27 / 18%);
+}
+
+.context-menu__item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ki-text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu__item:hover,
+.context-menu__item:focus-visible {
+  background: var(--ki-bg-active);
+  color: var(--ki-accent);
+  outline: none;
+}
+
+/* ───────────────────────── 新建 / 重命名浮层 ───────────────────────── */
+
+/*
+ * 结构与快速打开同构（fixed 遮罩 + 居中小面板），但**没有列表**：
+ * 它只问一个字符串，多一行提示、一行错误就够。
+ *
+ * 遮罩比其它浮层更暗一点（32%）：这个浮层出现时用户正在做一个会改磁盘的决定，
+ * 背景越安静，越不容易点错。
+ */
+.prompt-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 18vh;
+  background: rgb(24 24 27 / 32%);
+}
+
+.prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(420px, 92vw);
+  padding: 16px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 10px;
+  background: var(--ki-bg-canvas);
+  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+}
+
+.prompt__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ki-text-primary);
+}
+
+.prompt__input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 6px;
+  background: var(--ki-bg-canvas);
+  color: var(--ki-text-primary);
+  font-family: var(--ki-font-mono);
+  font-size: 13px;
+  outline: none;
+}
+
+.prompt__input:focus {
+  border-color: var(--ki-accent);
+}
+
+.prompt__input[aria-invalid='true'] {
+  border-color: var(--ki-red-600);
+}
+
+.prompt__hint {
+  margin: 0;
+  color: var(--ki-text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* 即时提示与服务端错误共用一种样式：对用户来说都是"这个名字现在不能提交"。 */
+.prompt__error {
+  margin: 0;
+  color: var(--ki-red-600);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.prompt__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 /* ───────────────────────── 欢迎页 ───────────────────────── */

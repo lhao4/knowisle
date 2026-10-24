@@ -42,6 +42,41 @@ export const commands = {
 	 */
 	noteSave: (root: string, path: string, content: string) => __TAURI_INVOKE<SaveResult>("note_save", { root, path, content }),
 	/**
+	 *  新建一篇**空**笔记，返回它的 Vault 相对路径。
+	 * 
+	 *  # 参数
+	 * 
+	 *  - `dir` 是 Vault 相对目录（POSIX 分隔符，空串表示根目录），**必须已存在**。
+	 *    不代建目录：目录是另一个功能（M2 明确不做），悄悄造一个只会让树里
+	 *    多出一串用户没要求的层级。
+	 *  - `name` 是单个文件名。没有 `.md` / `.markdown` 后缀会自动补 `.md`；
+	 *    合法性判定在 `ki_vault::naming`——那是唯一闸门，前端只做即时反馈。
+	 * 
+	 *  # 为什么是 0 字节
+	 * 
+	 *  不写标题、不写模板。用户没写的字，编辑器不该替他写。
+	 * 
+	 *  # 为什么不用原子写
+	 * 
+	 *  新建没有"旧内容"可保护，而 `create_new` 能在内核层面原子地拒绝撞名——
+	 *  这恰恰是原子写给不了的。撞名返回 [`KiError::NameTaken`]，原文件不动。
+	 */
+	noteCreate: (root: string, dir: string, name: string) => __TAURI_INVOKE<string>("note_create", { root, dir, name }),
+	/**
+	 *  重命名一篇笔记（**同目录内改名**，不移动、不删除）。
+	 * 
+	 *  # 为什么先 drain 再改名
+	 * 
+	 *  自动保存的 worker 可能正在写这篇笔记。若先改名，worker 会把内容写到
+	 *  已经不存在的旧路径上——旧文件"复活"，而新文件停在旧内容。所以顺序是
+	 *  **先落盘并等 worker 退出 → 再 rename → 最后把槽位键搬到新路径**，
+	 *  三步都在 Rust 侧完成（见 `autosave::drain_for_rename` / `rename_slot`）。
+	 * 
+	 *  前端先 flush 一遍只是为了让编辑器 300ms 合并窗口里的字也参与进来，
+	 *  **不能替代**这里的 drain：前端 flush 返回时，worker 可能还没退。
+	 */
+	noteRename: (root: string, path: string, name: string) => __TAURI_INVOKE<string>("note_rename", { root, path, name }),
+	/**
 	 *  提交一次编辑，由 Rust 侧的节流器决定何时落盘。
 	 * 
 	 *  # 为什么不是前端定时调 `note_save`
@@ -165,6 +200,26 @@ export type KiError =
 } } | 
 /**  文件名或文件内容不是合法 UTF-8。 */
 { code: "INVALID_ENCODING"; detail: {
+	path: string,
+} } | 
+/**
+ *  文件名不合法（保留名、非法字符、全角标点、超长、空名等）。
+ * 
+ *  `reason` 是给用户看的一句话，必须能指导下一步动作（"请用半角"），
+ *  而不是复述"不合法"。前端直接展示它，不做二次翻译——
+ *  判定规则只有 Rust 一份，文案也就不该有第二份。
+ */
+{ code: "INVALID_NAME"; detail: {
+	name: string,
+	reason: string,
+} } | 
+/**
+ *  目标名字已被占用：新建时撞名，或重命名到一个已存在的文件。
+ * 
+ *  **抛出本错误时磁盘上什么都没变**：新建是 `create_new` 失败，
+ *  重命名在动目标之前就返回了。调用方可以放心地让用户改个名字重试。
+ */
+{ code: "NAME_TAKEN"; detail: {
 	path: string,
 } } | 
 /**  文件超出单文件大小上限。 */

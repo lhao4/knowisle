@@ -29,6 +29,12 @@ export function describeError(error: unknown): string {
       return `读写失败：${error.detail.path}\n${error.detail.message}`
     case 'INVALID_ENCODING':
       return `文件不是合法的 UTF-8：${error.detail.path}`
+    case 'INVALID_NAME':
+      // 理由由 Rust 给出（"请用半角"这类可执行的话）。前端不再拼一遍，
+      // 否则规则一旦增删，两处文案就会各说各的。
+      return `文件名不合法：${error.detail.reason}`
+    case 'NAME_TAKEN':
+      return `已经有一个同名文件：${error.detail.path}`
     case 'TOO_LARGE':
       return `文件过大（${formatBytes(error.detail.size)}）：${error.detail.path}`
     case 'INTERNAL':

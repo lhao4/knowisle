@@ -58,6 +58,32 @@ export const noteRead = commands.noteRead
 export const noteSave = commands.noteSave
 
 /**
+ * 新建一篇空笔记，返回它的 Vault 相对路径。
+ *
+ * `dir` 是 Vault 相对目录（空串表示根目录），必须已存在——不会代建目录。
+ * `name` 没有 `.md` / `.markdown` 后缀会自动补 `.md`。
+ *
+ * 文件名合法性**只在 Rust 侧判定**（`ki_vault::naming`）。前端可以提前给
+ * 一句提示，但那只是即时反馈，不是闸门——第二个入口（将来的 `isle` CLI）
+ * 走的是同一份 Rust 规则。
+ *
+ * 撞名返回 `NAME_TAKEN`，原文件一个字节都不动。
+ */
+export const noteCreate = commands.noteCreate
+
+/**
+ * 重命名一篇笔记（同目录内改名，不移动、不删除），返回新的相对路径。
+ *
+ * 调用前必须先 `noteEdit` + `noteFlush` 把编辑器 300ms 合并窗口里的字交出去，
+ * 但那**不能替代** Rust 侧的 drain：前端 flush 返回时自动保存的 worker
+ * 可能还没退出，而它会把内容写到已经不存在的旧路径上（旧文件复活）。
+ * 顺序由 `note_rename` 自己在 Rust 侧保证。
+ *
+ * 目标已存在返回 `NAME_TAKEN`（只改大小写除外——那是同一个文件）。
+ */
+export const noteRename = commands.noteRename
+
+/**
  * 提交一次编辑，由 Rust 侧的节流器决定何时落盘（1.5 秒）。
  *
  * `baseMtime` 传打开这篇笔记时 `noteRead` 返回的 mtime，

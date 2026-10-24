@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { ContextMenu, type ContextMenuItem } from './components/ContextMenu'
 import { TreeNode } from './components/FileTree'
+import { NamePrompt } from './components/NamePrompt'
 import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
 import { Outline, type OutlineHandle } from './components/Outline'
 import { QuickOpen } from './components/QuickOpen'
@@ -10,9 +12,11 @@ import { flattenVault, type QuickItem } from './lib/quick-open'
 import {
   appPing,
   describeError,
+  noteCreate,
   noteEdit,
   noteFlush,
   noteRead,
+  noteRename,
   noteStatus,
   pickFolder,
   vaultScan,
@@ -42,9 +46,40 @@ const SAVED_FLASH_MS = 1200
 /** 上次打开的 Vault 绝对路径。 */
 const LAST_VAULT_KEY = 'knowisle.lastVault'
 
+/**
+ * 正在输入名字的浮层。
+ *
+ * 两种意图共用一个组件，但**位置来源不同**：
+ * - `create` 只需要目录（当前笔记所在目录，没有选中就是根目录）；
+ * - `rename` 需要旧路径（新名字只在同一个目录内生效）。
+ */
+type PromptState =
+  | { kind: 'create'; dir: string }
+  | { kind: 'rename'; path: string; name: string }
+
+/** 右键菜单：位置 + 它属于哪个节点（节点只用来生成菜单项，用完即弃）。 */
+interface MenuState {
+  node: FileNode
+  x: number
+  y: number
+}
+
+/** 取 Vault 相对路径的父目录（POSIX 分隔符）。根目录返回空串。 */
+function parentDir(path: string): string {
+  const index = path.lastIndexOf('/')
+  return index < 0 ? '' : path.slice(0, index)
+}
+
 export default function App() {
   const [vault, setVault] = useState<ScanResult | null>(null)
   const [activeNote, setActiveNote] = useState<NoteContent | null>(null)
+  /**
+   * 当前文档的**身份**。打开新笔记时自增，重命名时不变。
+   *
+   * 编辑器重建只认它（见 `NoteEditor` 的 `docId`）。改名不重建，所以撤销栈、
+   * 光标、滚动位置都留在原地——这三个东西属于"这篇文档"，不属于"这个路径"。
+   */
+  const [docId, setDocId] = useState(0)
   const [saveState, setSaveState] = useState<SaveState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -53,6 +88,17 @@ export default function App() {
   const [flash, setFlash] = useState<string | null>(null)
   const flashTimer = useRef<number | null>(null)
   const editorRef = useRef<NoteEditorHandle>(null)
+  /** 正在输入名字的浮层。`null` 表示没有。 */
+  const [prompt, setPrompt] = useState<PromptState | null>(null)
+  /** 右键菜单。 */
+  const [menu, setMenu] = useState<MenuState | null>(null)
+  /**
+   * 需要在树里露出来的路径（新建 / 改名之后）。
+   *
+   * 只在**写入那一刻**设一次：`TreeNode` 按"值变化"展开目录，所以用户随后
+   * 手动折叠不会被下一次无关重渲染弹开。
+   */
+  const [revealPath, setRevealPath] = useState<string | null>(null)
   /**
    * 大纲的标题集合。**低频**：只有标题增删改时才变。
    *
@@ -137,6 +183,10 @@ export default function App() {
       setActiveNote(null)
       setSaveState(null)
       setOutline([])
+      // 换库：上一轮的"露出来"和浮层都不再指向任何东西。
+      setRevealPath(null)
+      setPrompt(null)
+      setMenu(null)
       localStorage.setItem(LAST_VAULT_KEY, result.root)
     } catch (err) {
       applyVault(null)
@@ -185,6 +235,11 @@ export default function App() {
       try {
         if (content !== undefined) {
           await noteEdit(vault.root, activeNote.path, content, activeNote.mtime)
+          // 内容已经完整交给 Rust（紧接着 noteFlush 会把它写下去），
+          // 把编辑器里那个 300ms 合并窗口清掉。不清的话它会到点重发同一份
+          // 内容——平时只是浪费一次 IPC，**改名之后那一次会写到旧路径上**，
+          // 于是磁盘上多出一个"改名前的旧文件"。
+          editorRef.current?.commitFlushed(content)
         }
         await noteFlush(vault.root, activeNote.path, false)
         return true
@@ -237,6 +292,8 @@ export default function App() {
         // 先清空再换文档：编辑器重建后会在挂载时把新大纲发上来，中间这一帧
         // 如果留着上一篇的标题，用户会看到「标题还是上一篇的」闪一下。
         setOutline([])
+        // 新文档 = 新身份。编辑器据此重建，撤销栈归零（那本来就是另一篇）。
+        setDocId((id) => id + 1)
         setActiveNote(note)
         setSaveState(null)
         setError(null)
@@ -256,6 +313,170 @@ export default function App() {
     },
     [openNote],
   )
+
+  /**
+   * 把焦点还给编辑器。
+   *
+   * # 为什么不是「等一帧」
+   *
+   * 新建之后编辑器是**刚挂载**的，而 CM6 的 `EditorView` 是在挂载 effect 里
+   * 创建的——它可能晚于下一帧的 rAF 回调。那一刻 `focus()` 是空操作（视图还
+   * 不存在），用户看到的是「输入框没了，但光标也不在正文里」。这是时序问题，
+   * 不是每次都发生（本机实测约三次里一次），所以只能按帧重试。
+   *
+   * # 判据为什么是 activeElement
+   *
+   * 视图不存在时 `focus()` 与「已经聚焦」无法区分（都是无声返回），而
+   * `document.activeElement` 是浏览器给出的既成事实。要求**连续两帧**确认，
+   * 是为了排掉「聚焦在即将被销毁的旧视图上」的那一帧：换文档时旧视图的 DOM
+   * 会连同焦点一起消失，只看一帧会把那一帧当成成功。
+   *
+   * # 别人抢走焦点就立刻收手
+   *
+   * 重试期间用户可能已经点开了另一个浮层。若继续抢，浮层输入框会在打开后的
+   * 一两帧里被夺走焦点——表现是「打字没反应」，比不给焦点更糟。这里用
+   * `focusin` 判断而不是每帧比对：轮询永远慢一帧，而抢焦点慢一帧就够难看了。
+   *
+   * 上限 12 帧（约 200ms）。超时同样放弃——那时用户已经在干别的了。
+   */
+  const focusEditor = useCallback(() => {
+    let left = 12
+    let confirmed = 0
+
+    /** 焦点落到别处（新开的浮层、被点的按钮）就作废这一轮。 */
+    const onElsewhere = (e: FocusEvent) => {
+      const el = e.target
+      if (el instanceof Element && el.classList.contains('cm-content')) return
+      stop()
+    }
+
+    const stop = () => {
+      left = 0
+      document.removeEventListener('focusin', onElsewhere, true)
+    }
+
+    document.addEventListener('focusin', onElsewhere, true)
+
+    const tick = () => {
+      if (left <= 0) return
+      editorRef.current?.focus()
+      const landed = document.activeElement?.classList.contains('cm-content') === true
+      confirmed = landed ? confirmed + 1 : 0
+      if (confirmed >= 2) return stop()
+      left -= 1
+      if (left <= 0) return stop()
+      window.requestAnimationFrame(tick)
+    }
+    window.requestAnimationFrame(tick)
+  }, [])
+
+  /** 关闭名字浮层并把焦点还给编辑器。取消与成功共用这一条路径。 */
+  const closePrompt = useCallback(() => {
+    setPrompt(null)
+    focusEditor()
+  }, [focusEditor])
+
+  /**
+   * 新建笔记。`dir` 是目标目录（Vault 相对路径，空串表示根目录）。
+   *
+   * # 顺序
+   *
+   * 先把当前笔记写完 → 建文件 → **整库重扫** → 打开新笔记。
+   *
+   * 重扫在打开之前：树必须先有这一项，`openNote` 之后的高亮才有落点。
+   * 反过来也能用（`openNote` 不依赖树），但用户会看到"正文换了、侧栏还是旧的"
+   * 那一帧。
+   *
+   * # 为什么整库重扫
+   *
+   * 磁盘是唯一真相源。增量插一个节点看着更快，但它等于在内存里维护第二份
+   * 树，一旦某次判断错了（比如名字大小写在 Windows 上折叠了），错误会一直
+   * 留在界面上，直到下次手动扫描。1000 篇的整库扫描是 15ms 量级，
+   * 不值得为它发明一套 diff。
+   */
+  const submitCreate = useCallback(
+    async (dir: string, name: string): Promise<string | null> => {
+      if (!vault) return '还没有打开知识库'
+      // 新建会切到一篇新文档，而切换的前提是上一篇已经落盘。
+      if (!(await flushActiveNote())) return '当前笔记没有落盘，请先处理保存冲突'
+      try {
+        const path = await noteCreate(vault.root, dir, name)
+        applyVault(await vaultScan(vault.root))
+        setRevealPath(path)
+        if (!(await openNote(path))) return '笔记已创建，但打开失败'
+        return null
+      } catch (err) {
+        return describeError(err)
+      }
+    },
+    [vault, flushActiveNote, applyVault, openNote],
+  )
+
+  /**
+   * 重命名笔记（同目录内）。
+   *
+   * # 为什么不用重建编辑器
+   *
+   * 改名之后编辑器仍然编辑**同一篇文档**：撤销栈、光标、滚动位置都该留着。
+   * 所以这里只换 `activeNote.path`，不动 `docId`——`NoteEditor` 的挂载依赖
+   * 是 docId，path 只是它的 IPC 参数。
+   *
+   * # 先 flush 是必须的，但不够
+   *
+   * 前端 flush 把 300ms 合并窗口里的字交出去；Rust 侧还要 drain 一遍自动保存
+   * 的 worker（它可能正握着更早的一份 pending）。两件事都在 `note_rename`
+   * 里串好了，前端不能只做一半。
+   */
+  const submitRename = useCallback(
+    async (path: string, name: string): Promise<string | null> => {
+      if (!vault) return '还没有打开知识库'
+      const isActive = activeNote?.path === path
+      if (isActive && !(await flushActiveNote())) {
+        return '当前笔记没有落盘，请先处理保存冲突'
+      }
+      try {
+        const next = await noteRename(vault.root, path, name)
+        // 同名：Rust 侧是空操作，这里也不必重扫。
+        if (next === path) return null
+        applyVault(await vaultScan(vault.root))
+        setRevealPath(next)
+        if (isActive) {
+          setActiveNote((prev) => (prev === null ? prev : { ...prev, path: next }))
+        }
+        return null
+      } catch (err) {
+        return describeError(err)
+      }
+    },
+    [vault, activeNote, flushActiveNote, applyVault],
+  )
+
+  /** 右键菜单：坐标来自事件，节点只用来决定菜单项。 */
+  const openMenu = useCallback((node: FileNode, x: number, y: number) => {
+    setMenu({ node, x, y })
+  }, [])
+
+  const closeMenu = useCallback(() => setMenu(null), [])
+
+  /**
+   * 菜单项。目录只有「新建」，文件多一个「重命名」。
+   *
+   * 目录不改名：那会把一整片笔记从树里搬走（扫描器按路径建树），属于
+   * "移动"而不是"改名"，本轮明确不做。菜单里不出现，用户就不会去试。
+   */
+  const menuItemsFor = (node: FileNode): ContextMenuItem[] => {
+    const dir = node.kind === 'dir' ? node.path : parentDir(node.path)
+    const items: ContextMenuItem[] = [
+      { label: '新建笔记', onSelect: () => setPrompt({ kind: 'create', dir }) },
+    ]
+    if (node.kind === 'file') {
+      items.push({
+        label: '重命名',
+        onSelect: () => setPrompt({ kind: 'rename', path: node.path, name: node.name }),
+      })
+    }
+    return items
+  }
 
   /**
    * 快速打开里选中一项：先收浮层，再走同一条打开路径。
@@ -466,6 +687,29 @@ export default function App() {
         <aside className="sidebar">
           {vault ? (
             <>
+              {/*
+                侧栏顶部的「新建」。位置规则：当前笔记所在目录，没有选中就是根目录。
+                不做目录选择器——一个每次都要回答"建在哪"的弹窗，比多点一次右键更烦。
+              */}
+              <div className="sidebar__head">
+                <button
+                  type="button"
+                  className="btn btn--small"
+                  onClick={() =>
+                    setPrompt({
+                      kind: 'create',
+                      dir: activeNote === null ? '' : parentDir(activeNote.path),
+                    })
+                  }
+                  title={
+                    activeNote === null
+                      ? '在 Vault 根目录新建'
+                      : `在 ${parentDir(activeNote.path) || '根目录'} 新建`
+                  }
+                >
+                  ＋ 新建
+                </button>
+              </div>
               <div className="sidebar__root" title={vault.root}>
                 {vault.root}
               </div>
@@ -477,12 +721,14 @@ export default function App() {
                       node={child}
                       depth={0}
                       activePath={activeNote?.path ?? null}
+                      revealPath={revealPath}
                       onSelect={selectNote}
+                      onContextMenu={openMenu}
                     />
                   ))
                 ) : (
                   <p className="sidebar__empty">
-                    这个文件夹里没有 .md 文件。
+                    这个文件夹里没有 .md 文件。点上面的「新建」写第一篇。
                   </p>
                 )}
               </div>
@@ -515,6 +761,7 @@ export default function App() {
                   ref={editorRef}
                   root={vault.root}
                   note={activeNote}
+                  docId={docId}
                   onStateChange={setSaveState}
                   onError={setError}
                   onSaved={() => showFlash('已保存')}
@@ -574,6 +821,34 @@ export default function App() {
           onPrepare={prepareSearch}
           onOpen={openFromSearch}
           onClose={closeSearch}
+        />
+      )}
+
+      {/*
+        右键菜单与名字浮层都渲染在最外层：它们是 fixed 定位，不参与 workspace
+        布局，打开时不会让正文重新排版（那会连带触发 CM6 重测量）。
+      */}
+      {menu !== null && (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItemsFor(menu.node)} onClose={closeMenu} />
+      )}
+
+      {prompt?.kind === 'create' && (
+        <NamePrompt
+          title="新建笔记"
+          initial=""
+          confirmLabel="创建"
+          onSubmit={(name) => submitCreate(prompt.dir, name)}
+          onClose={closePrompt}
+        />
+      )}
+
+      {prompt?.kind === 'rename' && (
+        <NamePrompt
+          title="重命名"
+          initial={prompt.name}
+          confirmLabel="重命名"
+          onSubmit={(name) => submitRename(prompt.path, name)}
+          onClose={closePrompt}
         />
       )}
     </div>

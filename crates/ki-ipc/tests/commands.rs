@@ -7,7 +7,7 @@
 //! 这类错误在 `src-tauri` 时代是测不到的：那边要链接 webview，`cargo test` 跑不起来。
 //! 而"`note_save` 的第二个参数接错了字段"恰恰是最容易犯、最难发现的一类错误。
 
-use ki_ipc::{app_ping, note_read, note_save, vault_scan};
+use ki_ipc::{app_ping, note_create, note_read, note_save, vault_scan};
 use tempfile::TempDir;
 
 /// `#[tauri::command]` 的 async 版本返回 Future，测试里自己驱动它。
@@ -89,4 +89,47 @@ fn app_ping_reports_the_crate_version() {
     assert_eq!(info.name, "knowisle");
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     assert!(info.pid > 0);
+}
+
+/// 新建命令返回的路径必须能直接喂给 `note_read`，而且文件是 0 字节。
+///
+/// 这条锁的是"新建之后前端拿什么去打开"：命令返回相对路径，前端再走
+/// 唯一的 `openNote` 路径去读。返回绝对路径会让 `note_read` 的路径校验
+/// 直接报 PathEscape——那种错在浏览器里看起来像"新建坏了"。
+#[test]
+fn note_create_returns_a_path_that_note_read_accepts() {
+    let vault = TempDir::new().unwrap();
+    let root = vault.path().to_string_lossy().into_owned();
+    std::fs::create_dir(vault.path().join("notes")).unwrap();
+
+    let rel = block_on(note_create(
+        root.clone(),
+        "notes".to_owned(),
+        "周会".to_owned(),
+    ))
+    .expect("note_create 应当成功");
+
+    assert_eq!(rel, "notes/周会.md");
+    assert_eq!(std::fs::metadata(vault.path().join(&rel)).unwrap().len(), 0);
+
+    let read = block_on(note_read(root, rel)).expect("新建的文件必须读得回来");
+    assert_eq!(read.content, "");
+}
+
+/// 文件名错误必须原样穿过 `spawn_blocking`，且变体是 `InvalidName`。
+///
+/// 前端靠 `err.code` 分支（`INVALID_NAME` / `NAME_TAKEN`）。被包成 `Internal`
+/// 的话，用户看到的是"内部错误"，而真正的原因（名字里有全角字符）就丢了。
+#[test]
+fn invalid_names_survive_the_thread_hop() {
+    let vault = TempDir::new().unwrap();
+    let root = vault.path().to_string_lossy().into_owned();
+
+    for name in ["CON", "a:b", "周会.ｍｄ"] {
+        let err = block_on(note_create(root.clone(), String::new(), name.to_owned()))
+            .expect_err("非法名必须被拒绝");
+        let debug = format!("{err:?}");
+        assert!(debug.contains("InvalidName"), "{name} → {debug}");
+        assert!(!debug.contains("Internal"), "{name} → {debug}");
+    }
 }

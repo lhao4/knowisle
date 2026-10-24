@@ -191,6 +191,23 @@ export interface NoteEditorHandle {
    * 同文件跳转（路径相同）则直接应用，不绕这一圈。
    */
   revealHit: (hit: SearchHit) => void
+  /**
+   * 上层已经把这份内容完整冲刷过（`noteEdit` → `noteFlush`）：丢掉本地缓冲。
+   *
+   * # 为什么需要它
+   *
+   * `getContent()` 只是"读"，不改变 300ms 合并窗口的状态。上层冲刷完之后，
+   * 那个定时器仍然会到点触发，把**同一份内容**再发一次。平时这只是一次
+   * 无谓的 IPC；改名之后它是错的——闭包里的路径是旧的，这一次重发会在
+   * 新文件旁边重新造出一个旧文件。
+   *
+   * # 为什么带内容做参数
+   *
+   * 只有"缓冲里就是刚冲刷的那一份"才允许丢。IPC 往返期间用户又打了字时，
+   * `pendingRef` 已经是新字符串，那部分字必须留着——按内容比对是唯一
+   * 不需要知道"现在过了多久"的判据。
+   */
+  commitFlushed: (content: string) => void
 }
 
 /**
@@ -220,6 +237,14 @@ function applyHit(view: EditorView, hit: SearchHit): void {
 interface NoteEditorProps {
   root: string
   note: NoteContent
+  /**
+   * **文档身份**。打开一篇新笔记时自增，重命名时不变。
+   *
+   * 编辑器重建只认它，不认 `note.path`：改名会让 path 变，而撤销栈、光标、
+   * 滚动位置都属于"同一篇文档"，不该为了一次改名全部丢掉。
+   * `note.path` 退化成纯元数据——IPC 参数、树高亮、breadcrumb 用它。
+   */
+  docId: number
   ref?: Ref<NoteEditorHandle>
   onStateChange: (state: SaveState) => void
   onError: (message: string | null) => void
@@ -249,8 +274,10 @@ interface NoteEditorProps {
  * 1. **文档内容不进 React state。** 每次按键都 `setState` 会让 React 重渲染整棵树，
  *    而 CM6 自己维护 `EditorState`。这里只在 ref 里持有 `EditorView`，
  *    React 完全不参与输入路径。
- * 2. **`note.path` 变化才重建编辑器。** 用 `note.content` 做依赖会导致
- *    "外部改了文件 → 内容变了 → 编辑器重建 → 光标丢失"。
+ * 2. **只有 `docId` 变化才重建编辑器。** 用 `note.content` 做依赖会导致
+ *    "外部改了文件 → 内容变了 → 编辑器重建 → 光标丢失"；用 `note.path` 做依赖
+ *    会导致"改个文件名 → 撤销栈与光标全丢"。文档身份与它在磁盘上的名字是两件事，
+ *    前者由上层自增，后者只是元数据。
  * 3. **切换笔记时的顺序由上层控制。** 合并窗口（300ms）里可能还有没发出去的字符，
  *    如果上层先 flush 再卸载，那几个字就丢了。所以这里暴露 `getContent()`，
  *    由上层「先取内容 → 发 noteEdit → flush → 再切换」。
@@ -260,6 +287,7 @@ interface NoteEditorProps {
 export function NoteEditor({
   root,
   note,
+  docId,
   ref,
   onStateChange,
   onError,
@@ -269,7 +297,7 @@ export function NoteEditor({
 }: NoteEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
-  /** 当前视图对应的笔记路径。跨文件跳转用它判断"视图换没换"。 */
+  /** 当前视图对应的笔记路径。跨文件跳转、IPC 目标路径都用它。 */
   const pathRef = useRef<string | null>(null)
   /** 还没落地的搜索命中（视图尚未切换到位）。 */
   const pendingHitRef = useRef<SearchHit | null>(null)
@@ -310,9 +338,35 @@ export function NoteEditor({
         }
         applyHit(view, hit)
       },
+      commitFlushed: (content) => {
+        // 见 `NoteEditorHandle.commitFlushed`：按内容比对，不按时间猜。
+        if (pendingRef.current !== content) return
+        pendingRef.current = null
+        if (timerRef.current !== null) {
+          window.clearTimeout(timerRef.current)
+          timerRef.current = null
+        }
+      },
     }),
     [],
   )
+
+  /**
+   * 让 IPC 目标路径跟随 props。
+   *
+   * 改名**不重建**编辑器（挂载依赖是 `docId`），所以闭包里那个
+   * `pathAtMount` 会一直指着旧名字。所有 `noteEdit` 调用都读这个 ref，
+   * 改名之后它们自然落到新路径上。
+   *
+   * 写在 effect 里而不是渲染期直接赋值：渲染期写 ref 在并发渲染下会把
+   * 一棵被丢弃的树的路径写进去，而这里没有任何东西能发现它写错了。
+   *
+   * 顺序上它是安全的：换文档时 React 先跑完所有 cleanup 再跑 effect，
+   * 所以挂载 effect 的 cleanup 读到的仍然是**旧**路径（那才是它该写的）。
+   */
+  useEffect(() => {
+    pathRef.current = note.path
+  }, [note.path])
 
   useEffect(() => {
     const host = hostRef.current
@@ -334,11 +388,18 @@ export function NoteEditor({
       timerRef.current = null
     }
 
+    /**
+     * IPC 目标路径。**每次调用时现取**，不能在挂载时算一次：
+     * 改名会换路径而不换视图，闭包里的 `pathAtMount` 从此就是旧名字。
+     * `pathRef` 为空只可能发生在 cleanup 之后，那时也没人再调它了。
+     */
+    const ipcPath = () => pathRef.current ?? pathAtMount
+
     const flushPending = () => {
       const content = pendingRef.current
       if (content === null) return
       pendingRef.current = null
-      noteEdit(rootAtMount, pathAtMount, content, baseMtimeAtMount)
+      noteEdit(rootAtMount, ipcPath(), content, baseMtimeAtMount)
         .then(onStateChange)
         .catch((err: unknown) => onError(describeError(err)))
     }
@@ -364,24 +425,27 @@ export function NoteEditor({
       const content = pendingRef.current
       pendingRef.current = null
       clearTimer()
+      // 整条链只认一个路径：中途改名的话，noteEdit 与 noteFlush 必须落在
+      // 同一篇上，否则 flush 冲刷的是另一篇的槽位，会静默地什么都不做。
+      const target = ipcPath()
 
       const pushed: Promise<void> =
         content === null
           ? Promise.resolve()
-          : noteEdit(rootAtMount, pathAtMount, content, baseMtimeAtMount).then(() => undefined)
+          : noteEdit(rootAtMount, target, content, baseMtimeAtMount).then(() => undefined)
 
       pushed
-        .then(() => noteFlush(rootAtMount, pathAtMount, false))
+        .then(() => noteFlush(rootAtMount, target, false))
         .then(() => {
           onSaved()
-          return noteStatus(rootAtMount, pathAtMount)
+          return noteStatus(rootAtMount, target)
         })
         .then(onStateChange)
         .catch((err: unknown) => {
           onError(describeError(err))
           // 冲突横幅由 `saveState.lastError` 驱动，只报错不刷新状态的话
           // 它要等下一轮轮询（500ms）才出现。
-          noteStatus(rootAtMount, pathAtMount)
+          noteStatus(rootAtMount, target)
             .then(onStateChange)
             .catch(() => {
               // 状态也读不到时，上面的错误信息已经是全部信息了。
@@ -542,10 +606,15 @@ export function NoteEditor({
       if (scrollFrame !== 0) window.cancelAnimationFrame(scrollFrame)
       // 兜底：正常切换路径上上层已经取过内容并 flush 了，这里多半是空的。
       // 组件被意外卸载时（比如 HMR），至少把内容交给 Rust，而不是留在内存里。
+      //
+      // 路径要**在清空 ref 之前**读：换文档时 React 先跑 cleanup 再跑 effect，
+      // 此刻 `pathRef` 还是这一篇的；若在 cleanup 里把它清掉再读，就只能退回
+      // 挂载时的路径——改名之后那是错的。
       const content = pendingRef.current
       pendingRef.current = null
+      const pathNow = ipcPath()
       if (content !== null) {
-        void noteEdit(rootAtMount, pathAtMount, content, baseMtimeAtMount).catch(() => {
+        void noteEdit(rootAtMount, pathNow, content, baseMtimeAtMount).catch(() => {
           // 组件已经卸载，没有地方展示错误了。
         })
       }
@@ -553,9 +622,11 @@ export function NoteEditor({
       viewRef.current = null
       pathRef.current = null
     }
-    // 只在切换笔记时重建：见组件文档第 2 条。
+    // 只在**换文档**时重建：依赖是 `docId` 而不是 `note.path`。
+    // 改名会让 path 变，但撤销栈、光标、滚动位置都属于同一篇文档——
+    // 用 path 做依赖等于"改个名字，撤销栈就没了"。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [note.path])
+  }, [docId])
 
   return <div className="editor" ref={hostRef} />
 }

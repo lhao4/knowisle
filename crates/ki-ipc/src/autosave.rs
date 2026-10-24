@@ -303,6 +303,73 @@ pub fn flush(root: &Path, path: &str, force: bool) -> Result<Option<SaveResult>,
     }
 }
 
+/// 改名前的准备：如果槽位里正是这篇笔记，先把它彻底写完，再让调用方动磁盘。
+///
+/// # 为什么不能只在前端 flush
+///
+/// 前端 `note_flush` 返回时，Rust 侧的内容确实已经在磁盘上了——但它返回的
+/// 是**那一刻**的槽位状态。worker 线程可能刚好被调度起来，手里握着一份
+/// 更早取走的 pending；`flush` 会等它收工（见函数体的等待分支），
+/// 但**调用方必须知道这件事已经做完了**才能去 rename，否则顺序就反了：
+/// 文件先改名，worker 后落盘 → 内容写到已经不存在的旧路径上，旧文件复活。
+///
+/// 所以这条规则只能落在 Rust 侧：rename 命令先调本函数，成功后才碰目录项。
+///
+/// # 返回 `Err` 就**不要改名**
+///
+/// 典型是冲突：磁盘上那份是别人改的，我们的内容还在槽位里。此时改名等于
+/// 把"写不出去的内容"搬到新路径上，用户看到的是"改名之后内容回退了"。
+/// 让改名失败、把冲突横幅留在原地，是唯一不会骗人的选择。
+///
+/// # 改的不是当前文档
+///
+/// 直接放行。用户完全可能在树里右键改一篇**没打开**的笔记的名字，
+/// 那与槽位无关；此时若去 flush，反而会把另一篇的内容写一遍。
+pub fn drain_for_rename(root: &Path, path: &str) -> Result<(), KiError> {
+    let is_current = {
+        let slot = lock();
+        slot.key.as_ref() == Some(&(root.to_path_buf(), path.to_owned()))
+    };
+    if !is_current {
+        return Ok(());
+    }
+
+    // `flush` 的契约：返回 `Ok` 时 pending 必为空、worker 必已退出
+    // （worker 还在写时会等，5 秒超时则返回 `Err`，那条路径由 `?` 挡掉）。
+    flush(root, path, false).map(|_| ())
+}
+
+/// 改名成功之后，把槽位从旧路径搬到新路径。
+///
+/// # 为什么必须搬
+///
+/// 槽位以 `(root, path)` 为键。改名后若键还指着旧路径，下一次 `note_edit`
+/// 会被判成"换了一篇笔记"：`drain_previous` 把新路径的内容写一遍，
+/// 然后把槽位切到旧路径——worker 于是把内容写到**已经不存在的旧文件**上，
+/// 树里看不到、搜索搜不到，而用户以为自己在编辑改名后的那一篇。
+///
+/// 只搬键、不重置基线：rename 不改 mtime（三平台一致），所以乐观锁的基线
+/// 仍然有效；重置成 `None` 会让下一次自动保存退化成"无条件覆盖"。
+pub fn rename_slot(root: &Path, old_path: &str, new_path: &str) {
+    let mut slot = lock();
+    if slot.key.as_ref() != Some(&(root.to_path_buf(), old_path.to_owned())) {
+        // 改的不是当前文档：槽位里是另一篇，一个字都不该动。
+        return;
+    }
+    slot.key = Some((root.to_path_buf(), new_path.to_owned()));
+
+    // 理论上 `drain_for_rename` 已经把 pending 清空了，这里只是保险：
+    // 万一将来有人在 rename 之前插了一条别的写入路径，也不至于写回旧路径。
+    if let Some(job) = slot.pending.as_mut() {
+        job.path = new_path.to_owned();
+    }
+    // 回执里的路径也要跟着改：`note_flush` 在没有待写内容时返回它，
+    // 前端拿到的"磁盘现状"不该指着一个已经不存在的路径。
+    if let Some(saved) = slot.last_saved.as_mut() {
+        saved.path = new_path.to_owned();
+    }
+}
+
 /// 冲刷**当前槽位**，供关窗路径调用。
 ///
 /// # 为什么无参

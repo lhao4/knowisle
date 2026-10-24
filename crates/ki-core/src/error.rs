@@ -50,6 +50,21 @@ pub enum KiError {
     #[error("编码错误：{path}")]
     InvalidEncoding { path: String },
 
+    /// 文件名不合法（保留名、非法字符、全角标点、超长、空名等）。
+    ///
+    /// `reason` 是给用户看的一句话，必须能指导下一步动作（"请用半角"），
+    /// 而不是复述"不合法"。前端直接展示它，不做二次翻译——
+    /// 判定规则只有 Rust 一份，文案也就不该有第二份。
+    #[error("文件名不合法（{name}）：{reason}")]
+    InvalidName { name: String, reason: String },
+
+    /// 目标名字已被占用：新建时撞名，或重命名到一个已存在的文件。
+    ///
+    /// **抛出本错误时磁盘上什么都没变**：新建是 `create_new` 失败，
+    /// 重命名在动目标之前就返回了。调用方可以放心地让用户改个名字重试。
+    #[error("目标已存在：{path}")]
+    NameTaken { path: String },
+
     /// 文件超出单文件大小上限。
     #[error("文件过大（{size} 字节）：{path}")]
     TooLarge { path: String, size: u64 },

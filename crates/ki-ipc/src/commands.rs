@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use ki_core::{AppInfo, KiError, NoteContent, SaveResult, SaveState, ScanResult, SearchResult};
-use ki_vault::{read_note, scan_vault, write_note, ScanOptions};
+use ki_vault::{create_note, read_note, rename_note, scan_vault, write_note, ScanOptions};
 
 use crate::{autosave, search};
 
@@ -74,6 +74,54 @@ pub async fn note_read(root: String, path: String) -> Result<NoteContent, KiErro
 #[specta::specta]
 pub async fn note_save(root: String, path: String, content: String) -> Result<SaveResult, KiError> {
     run_blocking(move || write_note(&PathBuf::from(root), &path, &content)).await
+}
+
+/// 新建一篇**空**笔记，返回它的 Vault 相对路径。
+///
+/// # 参数
+///
+/// - `dir` 是 Vault 相对目录（POSIX 分隔符，空串表示根目录），**必须已存在**。
+///   不代建目录：目录是另一个功能（M2 明确不做），悄悄造一个只会让树里
+///   多出一串用户没要求的层级。
+/// - `name` 是单个文件名。没有 `.md` / `.markdown` 后缀会自动补 `.md`；
+///   合法性判定在 `ki_vault::naming`——那是唯一闸门，前端只做即时反馈。
+///
+/// # 为什么是 0 字节
+///
+/// 不写标题、不写模板。用户没写的字，编辑器不该替他写。
+///
+/// # 为什么不用原子写
+///
+/// 新建没有"旧内容"可保护，而 `create_new` 能在内核层面原子地拒绝撞名——
+/// 这恰恰是原子写给不了的。撞名返回 [`KiError::NameTaken`]，原文件不动。
+#[tauri::command]
+#[specta::specta]
+pub async fn note_create(root: String, dir: String, name: String) -> Result<String, KiError> {
+    run_blocking(move || create_note(&PathBuf::from(root), &dir, &name)).await
+}
+
+/// 重命名一篇笔记（**同目录内改名**，不移动、不删除）。
+///
+/// # 为什么先 drain 再改名
+///
+/// 自动保存的 worker 可能正在写这篇笔记。若先改名，worker 会把内容写到
+/// 已经不存在的旧路径上——旧文件"复活"，而新文件停在旧内容。所以顺序是
+/// **先落盘并等 worker 退出 → 再 rename → 最后把槽位键搬到新路径**，
+/// 三步都在 Rust 侧完成（见 `autosave::drain_for_rename` / `rename_slot`）。
+///
+/// 前端先 flush 一遍只是为了让编辑器 300ms 合并窗口里的字也参与进来，
+/// **不能替代**这里的 drain：前端 flush 返回时，worker 可能还没退。
+#[tauri::command]
+#[specta::specta]
+pub async fn note_rename(root: String, path: String, name: String) -> Result<String, KiError> {
+    run_blocking(move || {
+        let root = PathBuf::from(root);
+        autosave::drain_for_rename(&root, &path)?;
+        let next = rename_note(&root, &path, &name)?;
+        autosave::rename_slot(&root, &path, &next);
+        Ok(next)
+    })
+    .await
 }
 
 /// 提交一次编辑，由 Rust 侧的节流器决定何时落盘。
