@@ -298,6 +298,21 @@ body {
 }
 
 /*
+ * 键盘焦点环。
+ *
+ * 不靠浏览器默认：WebView2 给的是一圈亮蓝，在暗色底上刺眼，在亮色底上
+ * 又几乎看不见（对比度随主题反向变化）。这里统一用 accent，两套主题下
+ * 都是同一个"能看见"的强度。
+ *
+ * 只管 `:focus-visible`，鼠标点击不出环——按钮按下去已经有 hover / active
+ * 的背景变化，再加一圈框只会让"刚点过"看起来像"还停在上面"。
+ */
+.btn:focus-visible {
+  outline: 2px solid var(--ki-accent);
+  outline-offset: 2px;
+}
+
+/*
  * 主题切换按钮。刻意**不继承 `.btn`**：
  *
  * 1. `.btn` 带 120ms 的背景过渡（服务于 hover）。挂在它下面的话，切主题时
@@ -1376,6 +1391,19 @@ body {
   max-width: 420px;
   margin: 0;
   font-size: 13px;
+}
+
+/*
+ * 欢迎页的按钮行。
+ *
+ * 独立一层而不是给按钮加 `margin-top`：将来若多一个"导入"之类的次要动作，
+ * 它该和主按钮并排，而不是各自往下堆。`gap` 只有 8px——这两个按钮之间
+ * 不需要"分组"的距离，它们是同一件事的两个说法。
+ */
+.welcome__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 .hint {

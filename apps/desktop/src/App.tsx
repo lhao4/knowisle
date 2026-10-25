@@ -9,6 +9,7 @@ import { Outline, type OutlineHandle } from './components/Outline'
 import { QuickOpen } from './components/QuickOpen'
 import { SearchOverlay } from './components/SearchOverlay'
 import { ThemeToggle } from './components/ThemeToggle'
+import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { flattenVault, type QuickItem } from './lib/quick-open'
 import { useTheme } from './lib/theme'
@@ -119,6 +120,18 @@ export default function App() {
   const [flash, setFlash] = useState<string | null>(null)
   const flashTimer = useRef<number | null>(null)
   const editorRef = useRef<NoteEditorHandle>(null)
+  /**
+   * 自动弹窗的闸门。
+   *
+   * `main.tsx` 开着 `StrictMode`：dev 下 effect 会「挂载 → 清理 → 再挂载」，
+   * 恢复库的那个 effect 因此跑两次。不加闸就是两个原生对话框叠在一起，
+   * 而且**第二个的返回值会覆盖第一个**——用户在下面那个里选了目录，
+   * 上面那个一关，结果被 `null` 盖掉。
+   *
+   * 闸门是 ref 而不是 state：它必须在同一次 effect 执行里立刻生效，
+   * `setState` 要等下一次渲染才看得见，挡不住紧随其后的第二次挂载。
+   */
+  const autoPickRef = useRef(false)
   /** 正在输入名字的浮层。`null` 表示没有。 */
   const [prompt, setPrompt] = useState<PromptState | null>(null)
   /** 右键菜单。 */
@@ -243,20 +256,19 @@ export default function App() {
       .catch((err) => setRuntime(`IPC 未就绪：${describeError(err)}`))
   }, [])
 
-  // 恢复上次打开的 Vault。失败就静默清掉记录——目录可能被删了、改名了、
-  // 或者挪到了没权限的地方，这些都不该在启动时糊用户一脸错误。
-  useEffect(() => {
-    const last = localStorage.getItem(LAST_VAULT_KEY)
-    if (last === null) return
-    vaultScan(last)
-      .then(applyVault)
-      .catch(() => localStorage.removeItem(LAST_VAULT_KEY))
-  }, [applyVault])
-
   const pickVault = useCallback(async () => {
     setError(null)
     try {
       const selected = await pickFolder('选择知识库文件夹')
+      /*
+       * 对话框**出现过**就算问过一次——取消、选错、随后扫描失败都写。
+       * 判据是「用户见过这个对话框」，不是「他选了目录」：不写的话，
+       * 取消一次的人每次启动都会被再弹一次，比不弹更烦。
+       *
+       * 位置必须在 `await pickFolder` **之后**：它抛错时对话框根本没出现，
+       * 那一次不该消耗掉「被问过」的资格，下次启动该重试。
+       */
+      localStorage.setItem(ONBOARDED_KEY, '1')
       // 用户点了取消：返回 null，不是错误
       if (selected === null) return
 
@@ -280,6 +292,43 @@ export default function App() {
       setBusy(false)
     }
   }, [applyVault])
+
+  /**
+   * 恢复上次打开的 Vault；没有记录就**自己把选择器弹出来**。
+   *
+   * 失败就静默清掉记录——目录可能被删了、改名了、或者挪到了没权限的地方，
+   * 这些都不该在启动时糊用户一脸错误。
+   *
+   * # 为什么这个 effect 写在 `pickVault` 下面
+   *
+   * 它要调 `pickVault`，而依赖数组是在**渲染期**求值的：写在 `pickVault`
+   * 定义之前，读到的就是 `const` 的 TDZ，直接抛 `ReferenceError`。
+   * 换成一个 ref 转手也能跑，但那等于为了排版顺序引入一个只在启动时
+   * 用一次的间接层。
+   *
+   * # 只有「没有记录」这一支会弹窗
+   *
+   * `last !== null` 那支保持原样（扫描、失败删记录）。用 `lastVault === null`
+   * 当「首次启动」是错的：扫描失败也会删记录，那批用户会每次启动都被弹。
+   * 判据见 `shouldAutoPick`——它还要看独立的 `onboarded`。
+   */
+  useEffect(() => {
+    const last = localStorage.getItem(LAST_VAULT_KEY)
+    if (last !== null) {
+      vaultScan(last)
+        .then(applyVault)
+        .catch(() => localStorage.removeItem(LAST_VAULT_KEY))
+      return
+    }
+    if (!shouldAutoPick({ lastVault: last, onboarded: localStorage.getItem(ONBOARDED_KEY) })) {
+      return
+    }
+    // StrictMode 下这个 effect 会挂载两次；闸门必须在 `pickVault()` **之前**
+    // 同步置位，否则第二次挂载会再弹一个对话框。
+    if (autoPickRef.current) return
+    autoPickRef.current = true
+    void pickVault()
+  }, [applyVault, pickVault])
 
   /**
    * 在途的冲刷。
@@ -1022,7 +1071,14 @@ export default function App() {
             /*
              * 三种"没有正文"的状态必须分开说。合并成一句话的话，删掉当前笔记
              * 之后用户会看到「写第一篇」——而库里明明还有 999 篇，他会以为
-             * 笔记全没了。这是本刀唯一允许改文案的地方。
+             * 笔记全没了。
+             *
+             * # 只有前两种给按钮
+             *
+             * 它们各自对应「没有任何能点的东西」：无库时整屏只有一句话，
+             * 空库时唯一的入口在侧栏（离这里隔着一次目光转移）。第三种
+             * 已经有 `Cmd/Ctrl+P` 的提示，再放一个按钮等于把快速打开抄一遍，
+             * 而库里 999 篇笔记需要的恰恰是"找"，不是"建"。
              */
             <div className="welcome">
               <div className="welcome__mark">◈</div>
@@ -1030,14 +1086,31 @@ export default function App() {
               {vault === null ? (
                 <>
                   <p>还没有打开知识库。</p>
-                  <p className="hint">
-                    点右上角「选择文件夹」，选一个装着 .md 的目录。{runtime}
-                  </p>
+                  <p className="hint">选一个装着 .md 的目录。{runtime}</p>
+                  <div className="welcome__actions">
+                    <button
+                      type="button"
+                      className="btn btn--primary"
+                      onClick={() => void pickVault()}
+                      disabled={busy}
+                    >
+                      {busy ? '扫描中…' : '选择文件夹'}
+                    </button>
+                  </div>
                 </>
               ) : vault.totalFiles === 0 ? (
                 <>
                   <p>这个库里还没有笔记。</p>
-                  <p className="hint">点左上角「＋ 新建」写第一篇。{runtime}</p>
+                  <p className="hint">也可以按 Cmd/Ctrl+N。{runtime}</p>
+                  <div className="welcome__actions">
+                    <button
+                      type="button"
+                      className="btn btn--primary"
+                      onClick={() => setPrompt({ kind: 'create', dir: createDir })}
+                    >
+                      写第一篇
+                    </button>
+                  </div>
                 </>
               ) : (
                 <>
