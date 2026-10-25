@@ -155,16 +155,16 @@ jobs:
       - name: IPC bindings drift
         run: pnpm --filter @knowisle/desktop bindings:check
 
-  # 冷启动与空载内存。只在 Windows 上跑：K1 靠 Win32 EnumWindows 判「窗口可见」，
-  # K2 靠 CDP 判「树渲染完」，两者都是 Windows 口径。
+  # release 版的启动冒烟。只在 Windows 上跑：K1 靠 Win32 EnumWindows 判「窗口可见」，
+  # 是 Windows 口径。
   #
   # 为什么不在 shell job 里顺带跑：那个 job 用 `cargo build`（debug）——
-  # debug 版连的是 devUrl，量出来的是「页面加载失败有多快」。release 版必须
-  # 走 `tauri build`，它才会关掉 dev cfg 并把前端嵌进二进制。
+  # debug 版连的是 devUrl，起来的是「连不上 vite 的空白页」。release 版必须
+  # 走 `tauri build`，它才会关掉 dev cfg 并把前端嵌进二进制。所以这个 job 的
+  # 独有价值是「`tauri build` 产出的那个二进制真的能起来」，K1 只是顺手带的数。
   #
-  # 阈值刻意留得很松（K1 1500ms / K2 5000ms），因为这是共享 runner：
-  # 同样的代码在不同负载下能差一倍。这两条卡的是**灾难性回归**
-  # （有人在 setup 里塞了同步阻塞、有人把整个库一次性读进内存），
+  # 阈值刻意留得很松（1500ms），因为这是共享 runner：同样的代码在不同负载下
+  # 能差一倍。它卡的是**灾难性回归**（有人在 setup 里塞了同步阻塞），
   # 不是「比上次慢了 80ms」。真正的启动基线在本机量，见 docs/ARCHITECTURE.md。
   perf:
     name: perf (windows)
@@ -246,12 +246,20 @@ jobs:
             -File scripts/perf-window-visible.ps1 \
             -Exe target/release/knowisle.exe -Rounds 5 -LimitMs 1500
 
-      - name: K2 树渲染完 + 空载内存
-        env:
-          PERF_ROUNDS: 5
-          PERF_K2_MS: 5000
-          PERF_SELF_MB: 40
-          # 共享 runner 没有可用显卡。Chromium 拿不到 D3D 时的降级路径与桌面机
-          # 不同，显式关掉 GPU 比让它自己摸黑降级更可预测。
-          PERF_WEBVIEW2_ARGS: --disable-gpu
-        run: node scripts/perf-coldstart.mjs
+      # K2（侧栏树渲染完）与空载内存**故意不在这里**。三次实测的结论：
+      #
+      #   WebView2 runtime 已存在: 155.0.4283.62
+      #   子孙进程: msedgewebview2.exe
+      #   /json/version → 连不上 | /json/list → 连不上
+      #
+      # 运行时在、浏览器进程也起来了，但 `--remote-debugging-port` 就是不监听。
+      # 换过 `--disable-gpu`、换过端口（9222 → 内核分配的 51397，避开 Hyper-V
+      # 预留区间），三次重试全败。Chromium 绑不上调试端口时是**静默放弃**
+      # DevTools 的，所以这条路在托管 runner 上没法走。
+      #
+      # 旁证：K1 在 runner 上只要 12–15ms，本机是 200–400ms——runner 上的
+      # WebView2 并没有真正接上（服务会话、无交互桌面、无显卡）。
+      #
+      # 所以 K2 与内存预算退回**本机卡口**：node scripts/perf-coldstart.mjs。
+      # 数字与口径见 docs/ARCHITECTURE.md 2.7。哪天 runner 换了环境想再试，
+      # 脚本已经能自己把病因打出来，直接加回一个 step 即可。

@@ -1045,21 +1045,26 @@ unsafe { cmd.pre_exec(|| { setrlimit(RLIMIT_AS, 512MB); setsid(); Ok(()) }); }
 - 结果可缓存（同一代码块不重复跑）
 - 用户可选择"折叠/展开/固定显示"
 
-### 2.7 性能预算（CI 卡口）
+### 2.7 性能预算（卡口）
 
-没有数字的性能目标是许愿。以下指标在 CI 中作为**构建阻断条件**：
+没有数字的性能目标是许愿。下表的「卡口」列说明这条预算在哪里被强制执行：**CI** 是构建阻断，**本机**是发布前必须手动跑的验收。
 
-| 指标 | 目标 | 测量方式 |
-|------|------|----------|
-| K1 冷启动：窗口首次可见 | ≤ 600ms (P95) | `scripts/perf-window-visible.ps1`（Win32 `IsWindowVisible` 忙等，不带 CDP 参数）。实测 P95 395ms |
-| K2 冷启动：侧栏树渲染完 | ≤ 2000ms (P95) | `scripts/perf-coldstart.mjs`（CDP 判 `.tree-row`）。实测 P95 1774ms——**其中约 1.7s 是 Tauri + WebView2 的进程与环境初始化**：把前端换成一张 165 字节的空白页，这个数仍是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度 |
-| 打开 10k 笔记 Vault | ≤ 1.2s | E2E 脚本 |
-| 全局搜索响应 | ≤ 60ms (P95) | 基准测试（`criterion`） |
-| 击键到像素 | ≤ 16ms (P99) | Playwright + PerformanceObserver |
-| 10 万字文档滚动 | 60fps 稳定 | 帧率采样 |
-| 安装包体积 | Win/macOS ≤ 20MB；AppImage ≤ 100MB | `release.yml` 的 bundle job（逐包断言，超限即红）。实测 msi 3.29 / nsis 2.27 / dmg 2.68 / AppImage 77.6 MiB——AppImage 的大头是随包的 WebKitGTK，不是我们的代码 |
-| 空载 RSS | `knowisle.exe` 私有 ≤ 40MB | 按 pid 父子递归采样。WebView2 子树只记基线不设卡口——它的进程数与显存策略由系统决定，同一份代码换台机器就能差 100MB。实测主进程私有 5.7MB；整树私有 204MB（6 个 `msedgewebview2.exe`，其中 GPU 进程单个就占 103.9MB） |
-| 主 chunk（gzip） | ≤ 350KB | `vite-bundle-visualizer` |
+| 指标 | 目标 | 卡口 | 测量方式 |
+|------|------|------|----------|
+| K1 冷启动：窗口首次可见 | ≤ 600ms (P95) | CI + 本机 | `scripts/perf-window-visible.ps1`（Win32 `IsWindowVisible` 忙等，不带 CDP 参数）。实测 P95 395ms（runner 上 12–195ms） |
+| K2 冷启动：侧栏树渲染完 | ≤ 2000ms (P95) | 本机 | `scripts/perf-coldstart.mjs`（CDP 判 `.tree-row`）。实测 P95 1774ms——**其中约 1.7s 是 Tauri + WebView2 的进程与环境初始化**：把前端换成一张 165 字节的空白页，这个数仍是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度 |
+| 打开 10k 笔记 Vault | ≤ 1.2s | 本机 | E2E 脚本 |
+| 全局搜索响应 | ≤ 60ms (P95) | 本机 | 基准测试（`criterion`） |
+| 击键到像素 | ≤ 16ms (P99) | 本机 | Playwright + PerformanceObserver |
+| 10 万字文档滚动 | 60fps 稳定 | 本机 | 帧率采样 |
+| 安装包体积 | Win/macOS ≤ 20MB；AppImage ≤ 100MB | CI | `release.yml` 的 bundle job（逐包断言，超限即红）。实测 msi 3.29 / nsis 2.27 / dmg 2.68 / AppImage 77.6 MiB——AppImage 的大头是随包的 WebKitGTK，不是我们的代码 |
+| 空载 RSS | `knowisle.exe` 私有 ≤ 40MB | 本机 | 按 pid 父子递归采样。WebView2 子树只记基线不设卡口——它的进程数与显存策略由系统决定，同一份代码换台机器就能差 100MB。实测主进程私有 5.7MB；整树私有 204MB（6 个 `msedgewebview2.exe`，其中 GPU 进程单个就占 103.9MB） |
+| 主 chunk（gzip） | ≤ 350KB | 本机 | `vite-bundle-visualizer` |
+
+**为什么 K2 与内存不进 CI。** 实测三次（2026-10-25）：托管 Windows runner 上 WebView2 运行时是装着的（`155.0.4283.62`），`msedgewebview2.exe` 也起来了，但 `--remote-debugging-port` 指定的端口**根本不监听**（`/json/version` 与 `/json/list` 全是 `fetch failed`）。换过 `--disable-gpu`、换过端口（9222 → 内核分配的 51397，避开 Hyper-V 预留区间），三次重试全败。Chromium 绑不上调试端口时是**静默放弃** DevTools 的，所以这条路在服务会话 + 无交互桌面 + 无显卡的 runner 上走不通。旁证：K1 在 runner 上只要 12–15ms，本机是 200–400ms——那边 WebView2 并没有真正接上。
+
+CI 只留 K1，它的独有价值是「`tauri build` 产出的那个二进制真的能起来」（别的 job 只做 debug 编译检查）。K2 与内存是**发布前必须在本机跑一遍**的验收。
+
 
 ---
 

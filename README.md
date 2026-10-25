@@ -126,7 +126,7 @@ cd apps/desktop && pnpm exec tauri build --bundles nsis --ci
 
 ## 性能预算
 
-数字写在 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的 2.7 节，由 CI 与 `scripts/` 下的脚本守着。两条冷启动指标分开量，因为量到的根本不是一回事：
+数字写在 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的 2.7 节。两条冷启动指标分开量，因为量到的根本不是一回事：
 
 | 指标 | 预算 | 实测（本机 Windows） |
 |---|---|---|
@@ -136,6 +136,8 @@ cd apps/desktop && pnpm exec tauri build --bundles nsis --ci
 | 安装包（AppImage） | ≤ 100MiB | 77.6 MiB（内含 WebKitGTK） |
 
 K2 那 1.7 秒几乎全是 Tauri + WebView2 的进程与环境初始化：把前端换成一张 165 字节的空白页，这个数仍然是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度。
+
+CI 只守 K1 与安装包体积。K2 与空载内存是**发布前在本机跑一遍**的验收（`node scripts/perf-coldstart.mjs`）：托管 runner 上的 WebView2 不开调试端口，这条路在 CI 里走不通，原因记在架构文档 2.7 节。
 
 ## 许可证
 
