@@ -337,6 +337,41 @@ body {
   text-align: left;
 }
 
+/*
+ * 顶栏图标按钮（侧栏开合）。
+ *
+ * 与 `.theme-toggle` 同因不继承 `.btn`：那里带 120ms 背景过渡，而这一刀
+ * 的红线是**不新增任何过渡**。图标本身用文字符号（`◧`）而不是 SVG：
+ * 一个字符不值得换一份内联路径。
+ */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 6px;
+  background: var(--ki-bg-canvas);
+  color: var(--ki-text-muted);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  background: var(--ki-bg-hover);
+  border-color: var(--ki-border-strong);
+  color: var(--ki-text-primary);
+}
+
+/* 展开时图标是"有侧栏"的半实心块，收起时淡化，靠 aria-expanded 驱动。 */
+.icon-btn[aria-expanded='false'] {
+  color: var(--ki-text-faint);
+}
+
 .banner {
   flex: 0 0 auto;
   padding: 8px 16px;
@@ -425,6 +460,20 @@ body {
   min-height: 0;
   border-right: 1px solid var(--ki-border-subtle);
   background: var(--ki-bg-surface);
+}
+
+/*
+ * 折叠态：`display:none`，**绝不条件渲染**。
+ *
+ * `TreeNode` 的展开状态是组件内 `useState`。写成 `{open && <aside>}` 会在
+ * 折叠一次之后把整棵子树卸载，用户手动展开过的目录全部回到初值——再展开时
+ * 看起来像"我的树被重置了"。CSS 隐藏不动 React 树，那些 state 原样留着。
+ *
+ * 也**不加** `width` 过渡：那会让 CM6 在动画的每一帧都重测量视口。
+ * 它自己的 ResizeObserver 本来就能在一帧内处理完（验收量的就是这一点）。
+ */
+.app--sidebar-collapsed .sidebar {
+  display: none;
 }
 
 .sidebar__root {
@@ -592,20 +641,6 @@ body {
   font-family: var(--ki-font-mono);
   font-size: 10px;
   color: var(--ki-text-faint);
-}
-
-.viewer__body {
-  flex: 1 1 auto;
-  min-height: 0;
-  margin: 0;
-  padding: 24px;
-  overflow: auto;
-  font-family: var(--ki-font-mono);
-  font-size: 13px;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-  tab-size: 2;
 }
 
 /* ───────────────────────── 编辑器（CodeMirror 6） ───────────────────────── */

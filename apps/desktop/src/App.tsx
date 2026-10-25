@@ -51,6 +51,27 @@ const SAVED_FLASH_MS = 1200
 const LAST_VAULT_KEY = 'knowisle.lastVault'
 
 /**
+ * 侧栏开合。`'1'` 展开 / `'0'` 折叠，缺省是展开。
+ *
+ * # 为什么不需要 `index.html` 的内联脚本
+ *
+ * 主题必须在样式生效前落到 `<html>` 上，所以它有一份"pre-React 的"内联副本。
+ * 侧栏不一样：它是 React 画出来的，`.app` 与 `.sidebar` 在**同一次提交**里
+ * 出现。在 `useState` 的初始化器里同步读，读到的就是首帧的值——不存在
+ * 「先按 300px 画一帧、再变 0」的中间态。
+ */
+const SIDEBAR_KEY = 'knowisle.sidebar'
+
+/** 读侧栏开合。隐私模式下 `localStorage` 的 getter 会抛，回落到展开。 */
+function readSidebarOpen(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
+/**
  * 正在输入名字的浮层。
  *
  * 两种意图共用一个组件，但**位置来源不同**：
@@ -123,6 +144,45 @@ export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false)
   /** 全文搜索浮层是否可见。 */
   const [searchOpen, setSearchOpen] = useState(false)
+  /**
+   * 侧栏是否展开。初值由初始化器同步读盘，理由见 `SIDEBAR_KEY`。
+   *
+   * **折叠是 CSS 隐藏，不是条件渲染**（`.app--sidebar-collapsed`）。
+   * `{sidebarOpen && <aside>}` 会在折叠一次之后把整棵子树卸载，而
+   * `TreeNode` 的展开状态是组件内 `useState`——用户手动展开过的目录会
+   * 全部回到初值，再展开时看起来像"我的树被重置了"。
+   */
+  const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen)
+
+  // 写回。`useEffect` 就够了：首帧敏感的是"读"，那件事在初始化器里做完了。
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? '1' : '0')
+    } catch {
+      // 隐私模式 / 配额满：本次会话内照样生效，只是下次启动回到展开。
+    }
+  }, [sidebarOpen])
+
+  /**
+   * 折叠 / 展开侧栏。快捷键与顶栏按钮共用这一条路径。
+   *
+   * # 折叠前先把焦点救出来
+   *
+   * 焦点可能正在树里（用户点了一行再按 `Mod+\`）。`display:none` 会把聚焦
+   * 元素从文档里摘掉，焦点掉到 `<body>` 上——之后所有按键都没有落点，
+   * 用户会以为应用卡死了。只在焦点确实位于侧栏内时才动它：焦点本来就在
+   * 正文里的话，任何抢焦点的动作都是多余的。
+   */
+  const toggleSidebar = useCallback(() => {
+    if (sidebarOpen) {
+      const active = document.activeElement
+      if (active instanceof Element && active.closest('.sidebar') !== null) {
+        editorRef.current?.focus()
+      }
+    }
+    setSidebarOpen(!sidebarOpen)
+  }, [sidebarOpen])
+
   /**
    * 快速打开的全量候选，**只在扫描完成时重建一次**。
    *
@@ -635,6 +695,17 @@ export default function App() {
   }, [flushActiveNote])
 
   /**
+   * 「新建」的目标目录：当前笔记所在目录，没有选中就是根目录。
+   *
+   * 侧栏的「＋ 新建」与 `Mod+N` 共用它。两处各算一遍的话，某天改了一处
+   * 就会出现"按钮建在日记里、快捷键建在根目录"这种谁也说不清的行为。
+   */
+  const createDir = activeNote === null ? '' : parentDir(activeNote.path)
+  /** 屏幕上是否有任意一层浮层 / 菜单。`Mod+N` 据此判断要不要装死。 */
+  const overlayOpen =
+    prompt !== null || paletteOpen || searchOpen || menu !== null || deleteTarget !== null
+
+  /**
    * `Cmd/Ctrl+P`。
    *
    * # 只注册一份
@@ -698,6 +769,73 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [hasVault, paletteOpen])
 
+  /**
+   * `Cmd/Ctrl+N` 新建笔记。
+   *
+   * # 为什么是 window 级
+   *
+   * 「新建」与焦点无关：用户点着树、看着大纲、刚关掉一个浮层，都该能按。
+   * 加粗 / 斜体正相反——它们必须有文档选区，所以挂在 CM6 的 keymap 上
+   * （见 `NoteEditor`）。两种注册方式不能混：把 `Mod+B` 挂到 window 上，
+   * 名字输入框里按一下就会改到背后的文档。
+   *
+   * # 任一闪层打开时空操作
+   *
+   * 不是为了"优雅"：`Mod+N` 再开一层，屏幕上就有两个 `.prompt`，而 Esc
+   * 只关最上面那层——用户会以为卡住了。快捷键不叠层是硬约束。
+   *
+   * # 无库时也要 `preventDefault`
+   *
+   * WebView2 里 `Ctrl+N` 是"新建窗口"。不拦的话，用户在欢迎页按一下就会
+   * 多出一个空窗口，而这个应用没有任何多窗口设计。
+   */
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.repeat || e.altKey || e.shiftKey) return
+      if (!e.metaKey && !e.ctrlKey) return
+      if (e.key !== 'n' && e.key !== 'N') return
+      e.preventDefault()
+      if (!hasVault || overlayOpen) return
+      setPrompt({ kind: 'create', dir: createDir })
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [hasVault, overlayOpen, createDir])
+
+  /**
+   * `Cmd/Ctrl+\` 折叠 / 展开侧栏（Notion 的键位）。
+   *
+   * # 为什么不判 `hasVault`
+   *
+   * 侧栏在没打开库时是一个 placeholder，收起来同样能让欢迎页占满整宽。
+   * 更重要的是：顶栏那个按钮**任何时候都在**，快捷键却只在有库时生效的话，
+   * 同一次开合会因为"有没有库"而有两种答案。同一条路径，同一个判据。
+   *
+   * # 为什么不判浮层
+   *
+   * 浮层是 fixed 定位、盖在最上面，侧栏在后面收起来既看不见也不打断输入。
+   * 唯一有代价的是 `Mod+N`——那会叠层，所以它单独判（见上一条）。
+   *
+   * # `e.key` 之外还要看 `e.code`
+   *
+   * 部分布局（以及某些输入法开启时的 WebView）给的 `key` 不是反斜杠。
+   * 物理键位是同一个，所以 `Backslash` 也认。带 Shift 的组合已经被上面的
+   * 早退挡住了，不会误伤 `|`。
+   */
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.repeat || e.altKey || e.shiftKey) return
+      if (!e.metaKey && !e.ctrlKey) return
+      if (e.key !== '\\' && e.code !== 'Backslash') return
+      e.preventDefault()
+      toggleSidebar()
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [toggleSidebar])
+
   /** 大纲点击：把光标送到该标题行，并把这一行滚到视口顶部。 */
   const jumpTo = useCallback((pos: number) => {
     editorRef.current?.jumpTo(pos)
@@ -734,7 +872,7 @@ export default function App() {
   const saveLabel = flash ?? describeSaveState(saveState)
 
   return (
-    <div className="app">
+    <div className={`app${sidebarOpen ? '' : ' app--sidebar-collapsed'}`}>
       <header className="topbar">
         <div className="brand">
           <span className="brand__mark">◈</span>
@@ -754,6 +892,23 @@ export default function App() {
               {vault.skipped > 0 && ` · 跳过 ${vault.skipped}`}
             </span>
           )}
+          {/*
+            侧栏的**可见入口**。快捷键只是加速器，不能是唯一入口：
+            忘了键位就永久丢功能，而这个应用没有菜单栏可以翻。
+            它挂在顶栏而不是侧栏里——否则收起来之后按钮跟着一起消失，
+            就再也打不开了。
+          */}
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={toggleSidebar}
+            aria-expanded={sidebarOpen}
+            aria-controls="ki-sidebar"
+            aria-label="切换侧栏"
+            title="折叠/展开侧栏（Mod+\）"
+          >
+            <span aria-hidden="true">◧</span>
+          </button>
           <ThemeToggle pref={themePref} onCycle={cycleTheme} />
           <button type="button" className="btn" onClick={pickVault} disabled={busy}>
             {busy ? '扫描中…' : '选择文件夹'}
@@ -785,7 +940,7 @@ export default function App() {
       )}
 
       <main className="workspace">
-        <aside className="sidebar">
+        <aside className="sidebar" id="ki-sidebar">
           {vault ? (
             <>
               {/*
@@ -796,17 +951,8 @@ export default function App() {
                 <button
                   type="button"
                   className="btn btn--small"
-                  onClick={() =>
-                    setPrompt({
-                      kind: 'create',
-                      dir: activeNote === null ? '' : parentDir(activeNote.path),
-                    })
-                  }
-                  title={
-                    activeNote === null
-                      ? '在 Vault 根目录新建'
-                      : `在 ${parentDir(activeNote.path) || '根目录'} 新建`
-                  }
+                  onClick={() => setPrompt({ kind: 'create', dir: createDir })}
+                  title={createDir === '' ? '在 Vault 根目录新建' : `在 ${createDir} 新建`}
                 >
                   ＋ 新建
                 </button>

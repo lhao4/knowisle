@@ -25,6 +25,7 @@ import {
   type SaveState,
   type SearchHit,
 } from '../api'
+import { toggleMark, type MarkKind } from '../lib/marks'
 import { activeIndexAt, collectOutline, sameHeadingSequence, type OutlineItem } from '../lib/outline'
 import type { OutlineHandle } from './Outline'
 
@@ -253,6 +254,29 @@ function applyHit(view: EditorView, hit: SearchHit): void {
     effects: EditorView.scrollIntoView(from, { y: 'center' }),
   })
   view.focus()
+}
+
+/**
+ * 加粗 / 斜体：把纯函数的结果落到视图上。
+ *
+ * # 为什么挂在 CM6 的 keymap 上，而不是像 `Mod+P` 那样挂 window
+ *
+ * 这两个键**必须有文档选区**才有意义。挂 window 的话，快速打开浮层、名字
+ * 输入框、搜索框里按 `Mod+B` 也会改文档——用户看不见背后的编辑器，却已经
+ * 把内容改了。CM6 的 keymap 只在编辑器持有焦点时才跑，这条边界是白送的。
+ *
+ * # 一次 dispatch
+ *
+ * `changes` 与 `selection` 必须同属一个 spec，理由见 `MarkEdit` 的注释。
+ * 返回 `true` 表示这个键被消费掉了；`false`（选区里全是空行）时让 CM6
+ * 继续往下找——绑定的 `preventDefault` 会挡住 WebView 的默认行为。
+ */
+function applyMark(view: EditorView, mark: MarkKind): boolean {
+  const { from, to } = view.state.selection.main
+  const edit = toggleMark(view.state.doc.toString(), from, to, mark)
+  if (edit === null) return false
+  view.dispatch({ changes: edit.changes, selection: edit.selection })
+  return true
 }
 
 interface NoteEditorProps {
@@ -575,6 +599,12 @@ export function NoteEditor({
                 return true
               },
             },
+            // 加粗 / 斜体：同样排在前面。`preventDefault` 在这里不是"顺手"：
+            // 编辑器是一个 `contenteditable`，不拦的话浏览器会执行自己的
+            // `execCommand('bold')`，往 CM6 管理的 DOM 里插 `<b>`——那是一次
+            // CM6 没有发出的变更，DOMObserver 只能猜，猜错就是正文错乱。
+            { key: 'Mod-b', preventDefault: true, run: (view) => applyMark(view, 'bold') },
+            { key: 'Mod-i', preventDefault: true, run: (view) => applyMark(view, 'italic') },
             ...defaultKeymap,
             ...historyKeymap,
           ]),
