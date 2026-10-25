@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContextMenu, type ContextMenuItem } from './components/ContextMenu'
 import { TreeNode } from './components/FileTree'
 import { NamePrompt } from './components/NamePrompt'
@@ -13,6 +14,7 @@ import {
   appPing,
   describeError,
   noteCreate,
+  noteDelete,
   noteEdit,
   noteFlush,
   noteRead,
@@ -64,6 +66,12 @@ interface MenuState {
   y: number
 }
 
+/** 等待二次确认的删除目标。 */
+interface DeleteTarget {
+  path: string
+  name: string
+}
+
 /** 取 Vault 相对路径的父目录（POSIX 分隔符）。根目录返回空串。 */
 function parentDir(path: string): string {
   const index = path.lastIndexOf('/')
@@ -92,6 +100,8 @@ export default function App() {
   const [prompt, setPrompt] = useState<PromptState | null>(null)
   /** 右键菜单。 */
   const [menu, setMenu] = useState<MenuState | null>(null)
+  /** 等待二次确认的删除目标。`null` 表示没有确认框。 */
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
   /**
    * 需要在树里露出来的路径（新建 / 改名之后）。
    *
@@ -459,10 +469,78 @@ export default function App() {
   const closeMenu = useCallback(() => setMenu(null), [])
 
   /**
-   * 菜单项。目录只有「新建」，文件多一个「重命名」。
+   * 删除笔记：移进 `.knowisle/trash/`，然后整库重扫。
    *
-   * 目录不改名：那会把一整片笔记从树里搬走（扫描器按路径建树），属于
-   * "移动"而不是"改名"，本轮明确不做。菜单里不出现，用户就不会去试。
+   * # 顺序（每一步都不能换）
+   *
+   * 1. **先 flush 当前笔记**（如果删的就是它）。槽位里可能压着最后 1.5 秒的
+   *    输入，不落盘就搬目录项，trash 里那份是**旧版本**——删除变成了
+   *    "悄悄回退一个版本再删"。失败（冲突）就直接放弃：此刻用户还有
+   *    「覆盖 / 放弃」两个选择，删掉就只剩一个。
+   * 2. `noteDelete`（Rust 侧还会再 drain 一遍，并清空槽位）。
+   * 3. **先 `discardPending` 再 `setActiveNote(null)`**。反了的话编辑器先卸载，
+   *    卸载的 cleanup 会把缓冲里的内容再 flush 一次——落在已删除的路径上。
+   *    清空缓冲之后，cleanup 里的判断自然为假。
+   * 4. 重扫。磁盘是唯一真相源，删完必须重新看一遍。
+   *
+   * # `discardPending` 只在删的是当前文档时调
+   *
+   * `pendingRef` 属于**当前**编辑器。删别的笔记时清它，等于把当前笔记
+   * 最后 300ms 的字悄悄扔掉——那是另一种数据丢失。
+   */
+  const submitDelete = useCallback(
+    async (path: string): Promise<string | null> => {
+      if (!vault) return '还没有打开知识库'
+      const isActive = activeNote?.path === path
+      if (isActive && !(await flushActiveNote())) {
+        return '当前笔记没有落盘，请先处理保存冲突'
+      }
+
+      try {
+        await noteDelete(vault.root, path)
+      } catch (err) {
+        return describeError(err)
+      }
+
+      // 到这里文件已经在 trash 里了。下面每一步都只清内存，不再碰磁盘。
+      if (isActive) {
+        editorRef.current?.discardPending()
+        setActiveNote(null)
+        setOutline([])
+        setSaveState(null)
+      }
+      // `revealPath` 可能正指着刚删掉的那条路径，留着会让树多展开一次
+      // 已经不存在的目录。
+      setRevealPath(null)
+
+      try {
+        applyVault(await vaultScan(vault.root))
+      } catch (err) {
+        // 删除已经成功，重扫失败不该把确认框留在屏幕上让用户再点一次
+        // （再点会报"文件不存在"）。错误照常展示。
+        setError(describeError(err))
+      }
+      return null
+    },
+    [vault, activeNote, flushActiveNote, applyVault],
+  )
+
+  /**
+   * 关闭确认框并把焦点还给编辑器。
+   *
+   * 删除成功后编辑器已经卸载，`focus()` 是空操作（句柄里的 `viewRef` 为 null），
+   * 所以这条路径不需要分支——取消与成功共用它。
+   */
+  const closeDelete = useCallback(() => {
+    setDeleteTarget(null)
+    focusEditor()
+  }, [focusEditor])
+
+  /**
+   * 菜单项。目录只有「新建」，文件多「重命名」与「删除」。
+   *
+   * 目录不改名也不删除：那会把一整片笔记从树里搬走（扫描器按路径建树），
+   * 属于"移动"而不是"改名"，本轮明确不做。菜单里不出现，用户就不会去试。
    */
   const menuItemsFor = (node: FileNode): ContextMenuItem[] => {
     const dir = node.kind === 'dir' ? node.path : parentDir(node.path)
@@ -473,6 +551,10 @@ export default function App() {
       items.push({
         label: '重命名',
         onSelect: () => setPrompt({ kind: 'rename', path: node.path, name: node.name }),
+      })
+      items.push({
+        label: '删除',
+        onSelect: () => setDeleteTarget({ path: node.path, name: node.name }),
       })
     }
     return items
@@ -772,14 +854,34 @@ export default function App() {
               <Outline ref={outlineRef} items={outline} onJump={jumpTo} />
             </>
           ) : (
+            /*
+             * 三种"没有正文"的状态必须分开说。合并成一句话的话，删掉当前笔记
+             * 之后用户会看到「写第一篇」——而库里明明还有 999 篇，他会以为
+             * 笔记全没了。这是本刀唯一允许改文案的地方。
+             */
             <div className="welcome">
               <div className="welcome__mark">◈</div>
               <h1>把知识，安放在自己的岛上。</h1>
-              <p>M1 只做一件事：证明「改了不会丢」。</p>
-              <p className="hint">
-                左侧选择一篇笔记，直接开始写。每 1.5 秒自动保存，断电最多丢 1.5 秒。
-                {runtime}
-              </p>
+              {vault === null ? (
+                <>
+                  <p>还没有打开知识库。</p>
+                  <p className="hint">
+                    点右上角「选择文件夹」，选一个装着 .md 的目录。{runtime}
+                  </p>
+                </>
+              ) : vault.totalFiles === 0 ? (
+                <>
+                  <p>这个库里还没有笔记。</p>
+                  <p className="hint">点左上角「＋ 新建」写第一篇。{runtime}</p>
+                </>
+              ) : (
+                <>
+                  <p>还没选中笔记。</p>
+                  <p className="hint">
+                    从左侧选一篇开始写，或按 Cmd/Ctrl+P 快速打开。{runtime}
+                  </p>
+                </>
+              )}
             </div>
           )}
         </section>
@@ -850,6 +952,27 @@ export default function App() {
           onSubmit={(name) => submitRename(prompt.path, name)}
           onClose={closePrompt}
         />
+      )}
+
+      {/*
+        删除的二次确认。文案必须把三件事说全：移到哪里、**不是**永久删除、
+        但应用里没有恢复入口。少说最后一句，"移到回收站"会被理解成
+        "随时能撤销"——那是我们给不了的承诺。
+      */}
+      {deleteTarget !== null && (
+        <ConfirmDialog
+          title="删除这篇笔记？"
+          confirmLabel="删除"
+          onSubmit={() => submitDelete(deleteTarget.path)}
+          onClose={closeDelete}
+        >
+          <p>
+            <span className="confirm__name">{deleteTarget.name}</span> 会被移到{' '}
+            <code className="confirm__path">.knowisle/trash/</code>。
+          </p>
+          <p className="confirm__note">
+            不是永久删除，文件还在磁盘上；但应用里<strong>没有恢复入口</strong>，要找回得自己去文件夹翻。
+          </p>        </ConfirmDialog>
       )}
     </div>
   )

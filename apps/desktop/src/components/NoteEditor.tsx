@@ -208,6 +208,27 @@ export interface NoteEditorHandle {
    * 不需要知道"现在过了多久"的判据。
    */
   commitFlushed: (content: string) => void
+  /**
+   * **无条件**丢掉本地缓冲，不发任何 IPC。删除笔记之后调。
+   *
+   * # 为什么不能复用 `commitFlushed`
+   *
+   * 那个函数按内容比对、只在"缓冲正是刚冲刷的那一份"时才丢——因为改名之后
+   * 多出来的一次重发是错的。删除的处境不同：这篇文档马上就要从磁盘上消失，
+   * 缓冲里剩下的任何内容都不该再发出去（发了就是"删除之后文件又回来了"）。
+   *
+   * # 为什么只清前端不够
+   *
+   * 这只挡得住 300ms 合并窗口里的那一次 `noteEdit`。挡不住的是**已经在飞的
+   * IPC**：`flushActiveNote` 的 `noteFlush` 可能正走在路上。所以 Rust 侧
+   * 还有一道 `autosave::clear_for_delete`（把槽位键置 None），两层各管一段。
+   *
+   * # 为什么必须在 `setActiveNote(null)` 之前调
+   *
+   * 编辑器一卸载，cleanup 会再发一次 flush——那次会落在已删除的路径上。
+   * 清空缓冲之后，cleanup 里的 `content !== null` 判断为假，它自然什么都不做。
+   */
+  discardPending: () => void
 }
 
 /**
@@ -341,6 +362,14 @@ export function NoteEditor({
       commitFlushed: (content) => {
         // 见 `NoteEditorHandle.commitFlushed`：按内容比对，不按时间猜。
         if (pendingRef.current !== content) return
+        pendingRef.current = null
+        if (timerRef.current !== null) {
+          window.clearTimeout(timerRef.current)
+          timerRef.current = null
+        }
+      },
+      discardPending: () => {
+        // 见 `NoteEditorHandle.discardPending`：不比对、不发 IPC、不问理由。
         pendingRef.current = null
         if (timerRef.current !== null) {
           window.clearTimeout(timerRef.current)

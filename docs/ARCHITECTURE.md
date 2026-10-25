@@ -1101,6 +1101,7 @@ my-vault/
 | `.knowisle/cache/**` | ❌ | 纯缓存 |
 | `.knowisle/session/**` | ❌ | 崩溃恢复，纯本地 |
 | `.knowisle/history/**` | ❌ | 分钟级快照，会让仓库爆炸（Git 已经有自己的历史） |
+| `.knowisle/trash/**` | ❌ | 删除的笔记，纯本地 |
 | `.knowisle/plugins/*/dist/**` | ❌ | 二进制产物，走 Release 分发 |
 
 ```gitignore
@@ -1111,6 +1112,7 @@ device.json
 session/
 cache/
 history/
+trash/
 tmp/
 plugins/*/dist/
 ```

@@ -1,9 +1,9 @@
-//! 新建与重命名。
+//! 新建、重命名与删除。
 //!
-//! 两个操作都**只碰目录项**，不写内容：新建落一个 0 字节文件，重命名搬一个
-//! 目录项。内容写入是 [`crate::write`] 的事，两者刻意不共用代码——
-//! 原子写的四步（`tmp → fsync → rename`）保护的是"旧内容不被截断"，
-//! 而新建没有旧内容可保护，重命名搬的是整个文件（`fs::rename` 本身就是原子的）。
+//! 三个操作都**只碰目录项**，不写内容：新建落一个 0 字节文件，重命名搬一个
+//! 目录项，删除把它搬进回收目录。内容写入是 [`crate::write`] 的事，两者刻意
+//! 不共用代码——原子写的四步（`tmp → fsync → rename`）保护的是"旧内容不被截断"，
+//! 而新建没有旧内容可保护，重命名与删除搬的是整个文件（`fs::rename` 本身就是原子的）。
 //!
 //! # 新建为什么不用 `tmp → rename`
 //!
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ki_core::KiError;
 
 use crate::naming::normalize_note_name;
-use crate::path::{resolve_for_write, resolve_in_vault};
+use crate::path::{reject_metadata_path, resolve_for_write, resolve_in_vault};
 
 /// 两步改名用的临时名前缀。
 ///
@@ -36,6 +36,20 @@ const RENAME_TMP_PREFIX: &str = ".knowisle.rename.";
 
 /// 进程内单调序号：同一目录下并发改名（CLI + GUI）不会撞同一个临时名。
 static RENAME_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 回收目录（Vault 相对路径，POSIX 分隔符）。
+///
+/// 它落在 `.knowisle/` 下面，而 `.knowisle` 在 `scan::IGNORED_DIRS` 里——
+/// 于是删掉的东西**天然**从树、快速打开、全文索引里消失，不需要任何额外过滤。
+/// 这条"放在哪里"的决定比"删完之后还要记得过滤"可靠得多：过滤会漏，位置不会。
+pub const TRASH_DIR: &str = ".knowisle/trash";
+
+/// 同一毫秒内的撞名重试上限。
+///
+/// 不是业务参数，是**收敛保证**：`while 存在就换名字` 的循环必须有上界，
+/// 否则一个被塞满同名文件的回收目录会让删除永久卡住（而它看起来像"卡死"，
+/// 不像"出错"）。1000 个同毫秒同名文件在任何真实场景下都不可能出现。
+const TRASH_SEQ_LIMIT: u32 = 1000;
 
 /// 在 `dir`（Vault 相对路径，空串表示根目录）下新建一个**空**笔记。
 ///
@@ -96,6 +110,10 @@ pub fn create_note(root: &Path, dir: &str, raw_name: &str) -> Result<String, KiE
 /// 返回 [`KiError::NameTaken`]，两个文件都不动。唯一的例外是"目标与源是同一个
 /// 文件，只是大小写不同"——那走两步改名，见 [`move_no_clobber`]。
 pub fn rename_note(root: &Path, path: &str, raw_name: &str) -> Result<String, KiError> {
+    // `.knowisle/` 下的东西不是用户内容，改名会让索引 / 回收目录里的路径失联。
+    // 这条闸与 `delete_note` 共用，见 `path::reject_metadata_path`。
+    reject_metadata_path(path)?;
+
     let new_name = normalize_note_name(raw_name)?;
 
     // 源必须存在，且路径上不许有重解析点。`resolve_in_vault` 顺带把源
@@ -133,6 +151,136 @@ pub fn rename_note(root: &Path, path: &str, raw_name: &str) -> Result<String, Ki
     move_no_clobber(&source, &target, &new_rel)?;
 
     Ok(new_rel)
+}
+
+/// 把 `path` 移进 `.knowisle/trash/`，返回它在回收目录里的 Vault 相对路径。
+///
+/// # 为什么不是 `fs::remove_file`
+///
+/// 删除是对公理 A1（磁盘上的 Markdown 是唯一真相源）**最直接的违背**：
+/// 库里那份文件一消失，磁盘上就再没有它的任何痕迹。local-first 产品第一次
+/// 误删就失去信任，而"移进一个目录"与"抹掉 inode"之间只差一次 `rename`——
+/// 同盘原子、零新依赖（`trash` crate 会带平台特定依赖，违反红线）。
+///
+/// 目标名是 `<unix_ms>-<原名>`：时间戳保证两次删除不会互相覆盖，原名保证
+/// 用户打开 `.knowisle/trash/` 还认得出哪个是哪个。
+///
+/// # 代价（必须让用户知道）
+///
+/// **这不是回收站。** 应用里没有恢复入口，也没有"清空回收站"——文件只是
+/// 躺在磁盘上，要找回得自己去文件夹翻。写这条是因为"移到 trash"很容易被
+/// 理解成"随时能撤销"，而实际不成立。
+///
+/// # 只删文件
+///
+/// `meta.is_file()` 是必须的：`fs::rename` 对目录完全合法，一次能搬走一整片
+/// 笔记，而"删除目录"不在本轮范围内（与 [`rename_note`] 同一条闸）。
+///
+/// # 失败时的状态
+///
+/// - 建不出回收目录 → 报错，**绝不降级成永久删除**。静默降级是这条路径上
+///   唯一能造成真实数据丢失的写法。
+/// - `fs::rename` 失败（跨设备、目标被占用）→ 文件仍在原位，一个字节没动，
+///   直接重试即可。
+///
+/// # 崩溃窗口
+///
+/// 只有一次 `rename`，它是原子的：崩溃后要么文件还在原位（删除没发生），
+/// 要么已经在 trash 里。不刷父目录——Windows 上根本做不到目录 fsync
+/// （见 `write` 模块），而"删除没生效"是安全方向的失败。
+pub fn delete_note(root: &Path, path: &str) -> Result<String, KiError> {
+    // 闸 1：`.knowisle/` 下的东西一律拒绝。必须在 `resolve_in_vault` 之前——
+    // 那条路对"文件不存在"给的是 OS 的 ENOENT 文案，用户看不懂它为什么被拒。
+    reject_metadata_path(path)?;
+
+    // 闸 2：语法 + 重解析点 + 必须存在（`resolve_in_vault` 的职责）。
+    // 返回的是规范化后的真实落点，Windows 上大小写也被纠正成磁盘上的那一份。
+    let source = resolve_in_vault(root, path)?;
+
+    // 闸 3：只删文件。理由见上面的「只删文件」。
+    let meta = std::fs::metadata(&source).map_err(|err| KiError::io(path, &err))?;
+    if !meta.is_file() {
+        return Err(KiError::Io {
+            path: path.to_owned(),
+            message: "只能删除文件，不能删除目录".to_owned(),
+        });
+    }
+
+    // 只取 `file_name()`：目标名里绝不允许出现路径分隔符。取规范化路径而不是
+    // 原始 `path` 的末段，是因为前者已经是磁盘上的真名（大小写也一致）。
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| KiError::InvalidEncoding {
+            path: path.to_owned(),
+        })?;
+
+    let canonical_root = dunce::canonicalize(root)
+        .map_err(|err| KiError::io(root.to_string_lossy().into_owned(), &err))?;
+    let trash = canonical_root.join(TRASH_DIR);
+
+    // 建不出来就报错返回：此时文件还在原位，用户只是删不掉，而不是丢了。
+    std::fs::create_dir_all(&trash).map_err(|err| KiError::Io {
+        path: TRASH_DIR.to_owned(),
+        message: format!("无法创建回收目录（已取消删除，不会降级为永久删除）：{err}"),
+    })?;
+
+    // `.knowisle` 本身可能是软链 / junction。`create_dir_all` 会顺着它建到库外，
+    // 而 `fs::rename` 于是把笔记搬出 Vault——用户以为删了，其实文件到了别处。
+    // 规范化后比一次是最便宜的挡法（与 `resolve_for_write` 的父目录检查同一手法）。
+    let trash_real = dunce::canonicalize(&trash).map_err(|err| KiError::io(TRASH_DIR, &err))?;
+    if !trash_real.starts_with(&canonical_root) {
+        return Err(KiError::PathEscape {
+            path: TRASH_DIR.to_owned(),
+        });
+    }
+
+    let stamp = unix_ms();
+    // `symlink_metadata` 而不是 `exists`：回收目录里残留一个同名软链时，
+    // `exists` 会跟随它去问目标，而这里要问的是"这个名字有没有人占"。
+    let candidate = unique_trash_name(stamp, name, |candidate| {
+        std::fs::symlink_metadata(trash_real.join(candidate)).is_ok()
+    })
+    .ok_or_else(|| KiError::Io {
+        path: path.to_owned(),
+        message: format!("回收目录里已有 {TRASH_SEQ_LIMIT} 个同毫秒同名的文件，已放弃删除"),
+    })?;
+
+    std::fs::rename(&source, trash_real.join(&candidate)).map_err(|err| KiError::io(path, &err))?;
+
+    Ok(format!("{TRASH_DIR}/{candidate}"))
+}
+
+/// 在 `<unix_ms>-<原名>` 被占用时依次尝试 `<unix_ms>-<seq>-<原名>`。
+///
+/// 抽成纯函数（`taken` 由调用方注入）是为了让"同一毫秒撞名"这条分支能被
+/// **确定性**地测到：真实删除两次之间必然跨过一毫秒，端到端测试永远走不到
+/// 撞名分支，而它恰恰是唯一会覆盖别人文件的路径。
+///
+/// 序号插在时间戳与原名之间，而不是追加到末尾：`a.md-1` 会让文件看起来不再
+/// 是 Markdown，而 `1699-1-a.md` 仍然一眼认得出原名。
+///
+/// 返回 `None` 表示重试次数用尽（见 [`TRASH_SEQ_LIMIT`]）。
+fn unique_trash_name(stamp: i64, name: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
+    let mut candidate = format!("{stamp}-{name}");
+    let mut seq = 0u32;
+    while taken(&candidate) {
+        seq += 1;
+        if seq > TRASH_SEQ_LIMIT {
+            return None;
+        }
+        candidate = format!("{stamp}-{seq}-{name}");
+    }
+    Some(candidate)
+}
+
+/// 当前 Unix 毫秒时间戳。取不到（时钟早于 epoch）时退化为 0——
+/// 那样只会让两次删除撞名，而撞名有 `-<seq>` 兜底，不会丢文件。
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 /// 把 `source` 搬到 `target`，**绝不覆盖**已存在的 `target`。
@@ -212,5 +360,53 @@ fn move_no_clobber(source: &Path, target: &Path, rel: &str) -> Result<(), KiErro
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空回收目录：第一个候选名就是 `<stamp>-<原名>`，且原名（含扩展名）完整。
+    #[test]
+    fn the_first_trash_name_is_stamp_plus_the_original_name() {
+        let name = unique_trash_name(1_700_000_000_000, "a.md", |_| false).unwrap();
+        assert_eq!(name, "1700000000000-a.md");
+    }
+
+    /// 撞名一次 → `-1`，且扩展名仍在末尾。
+    ///
+    /// 这条分支在真实删除里几乎撞不到（两次删除必然跨毫秒），所以它只能
+    /// 靠注入 `taken` 来测——见 `unique_trash_name` 的注释。
+    #[test]
+    fn a_collision_appends_a_sequence_between_the_stamp_and_the_name() {
+        let taken = |candidate: &str| candidate == "1700000000000-a.md";
+        let name = unique_trash_name(1_700_000_000_000, "a.md", taken).unwrap();
+        assert_eq!(name, "1700000000000-1-a.md");
+        assert!(name.ends_with("-a.md"), "扩展名必须还在末尾：{name}");
+    }
+
+    /// 连续撞名：序号一路加，直到找到空位。
+    #[test]
+    fn consecutive_collisions_keep_counting_up() {
+        let taken = |candidate: &str| {
+            matches!(
+                candidate,
+                "1700000000000-a.md" | "1700000000000-1-a.md" | "1700000000000-2-a.md"
+            )
+        };
+        assert_eq!(
+            unique_trash_name(1_700_000_000_000, "a.md", taken).unwrap(),
+            "1700000000000-3-a.md"
+        );
+    }
+
+    /// 重试有上界：永远不会收敛的 `taken` 必须返回 `None`，不能死循环。
+    #[test]
+    fn an_always_taken_name_gives_up_instead_of_spinning() {
+        assert!(
+            unique_trash_name(1_700_000_000_000, "a.md", |_| true).is_none(),
+            "无上界的 while 会让删除永久卡住，而它看起来像卡死不像出错"
+        );
     }
 }

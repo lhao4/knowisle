@@ -77,6 +77,38 @@ export const commands = {
 	 */
 	noteRename: (root: string, path: string, name: string) => __TAURI_INVOKE<string>("note_rename", { root, path, name }),
 	/**
+	 *  删除一篇笔记：**移进 `.knowisle/trash/`**，不抹掉文件。
+	 * 
+	 *  返回它在回收目录里的 Vault 相对路径（`.knowisle/trash/<unix_ms>-<原名>`）。
+	 * 
+	 *  # 顺序：drain → trash → clear_slot
+	 * 
+	 *  三步都在 Rust 侧、都在同一个阻塞任务里，任何一步失败都会让后面两步不执行：
+	 * 
+	 *  1. **drain**：槽位里可能压着用户最后 1.5 秒的输入。不先落盘就搬目录项，
+	 *     trash 里那份就是**旧版本**——删除变成了"悄悄回退一个版本再删"。
+	 *     冲突时返回 `Err`，删除直接拒绝：此刻用户还有「覆盖 / 放弃」两个选择。
+	 *  2. **trash**：一次 `fs::rename`，同盘原子。失败时文件仍在原位，状态一致，
+	 *     重试即可——**不要**在失败路径里清理 trash，那只会多一次删文件的机会。
+	 *  3. **clear_slot**：把槽位清空。这一步不能省：前端 `discardPending` 只挡住
+	 *     300ms 合并窗口，挡不住已经在飞的 `noteFlush`——它落在已删除路径上会
+	 *     把文件写回来。`key = None` 之后任何迟到的 flush 都是无操作。
+	 * 
+	 *  # 为什么不能先让前端 `setActiveNote(null)`
+	 * 
+	 *  编辑器一卸载，`getContent()` 就拿不到内容了，第 1 步会往 trash 写一个
+	 *  旧版本。所以"离开这篇文档"的动作必须排在 drain 之后——这是本轮唯一新增的
+	 *  **离开**路径，它和打开路径一样不能绕开既有的三条规矩。
+	 * 
+	 *  # 拒绝的输入
+	 * 
+	 *  - 目录（`fs::rename` 对目录合法，一次能搬走一整片笔记）
+	 *  - `.knowisle/` 下的任何路径（否则 `note_delete(".knowisle/index.sqlite")`
+	 *    能删掉索引，`note_delete(".knowisle/trash/x.md")` 会把回收目录里那份再删一次）
+	 *  - `..` / 绝对路径（`PATH_ESCAPE`）
+	 */
+	noteDelete: (root: string, path: string) => __TAURI_INVOKE<string>("note_delete", { root, path }),
+	/**
 	 *  提交一次编辑，由 Rust 侧的节流器决定何时落盘。
 	 * 
 	 *  # 为什么不是前端定时调 `note_save`

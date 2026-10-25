@@ -32,6 +32,12 @@ use std::path::{Component, Path, PathBuf};
 
 use ki_core::KiError;
 
+/// 本应用的元数据目录（Vault 相对路径的第一级）。
+///
+/// 它同时出现在 `scan::IGNORED_DIRS` 里——两处引用同一个常量，是为了让
+/// "扫描器看不见它" 与 "破坏性操作不许碰它" 不会各自漂移。
+pub(crate) const METADATA_DIR: &str = ".knowisle";
+
 /// 把文件系统路径转成 POSIX 风格的相对路径。
 ///
 /// 返回 `None` 表示路径中含有无法用 UTF-8 表示的片段。
@@ -91,6 +97,38 @@ fn validate_rel(rel: &str) -> Result<&Path, KiError> {
     }
 
     Ok(rel_path)
+}
+
+/// 拒绝 `.knowisle/` 下的路径。
+///
+/// # 为什么破坏性操作必须单独有这道闸
+///
+/// `resolve_in_vault` 只管"在不在库内"，`.knowisle/index.sqlite` 完全在库内、
+/// 也完全存在，所以它能过那道闸。放行的话有两个后果：
+///
+/// - `note_delete(".knowisle/index.sqlite")` 能删掉索引（可重建，但用户会先
+///   看到"搜索坏了"）；更糟的是删 `.knowisle/trash/x.md`，等于把已经删过一次的
+///   东西再删一次，而它本来就是我们承诺"文件还在"的唯一证据。
+/// - `note_rename(".knowisle/trash/x.md", "y")` 同理。
+///
+/// # 为什么大小写不敏感
+///
+/// 扫描器用 `eq_ignore_ascii_case` 匹配忽略名单（Windows 上 `.KnowIsle` 与
+/// `.knowisle` 是同一个目录）。这里若用大小写敏感比较，就会出现
+/// "扫描器看不见它、删除却删得掉"的裂缝——两边必须用同一把尺。
+///
+/// 分隔符同时认 `/` 与 `\`：`rel` 的契约是 POSIX，但 Windows 上 `Path::components`
+/// 会把反斜杠也当分隔符，于是 `.knowisle\x.md` 能一路走到 rename。与其赌
+/// 调用方永远不传反斜杠，不如在这里一次判掉。
+pub(crate) fn reject_metadata_path(rel: &str) -> Result<(), KiError> {
+    let first = rel.split(['/', '\\']).next().unwrap_or("");
+    if first.eq_ignore_ascii_case(METADATA_DIR) {
+        return Err(KiError::Io {
+            path: rel.to_owned(),
+            message: format!("{METADATA_DIR}/ 是应用自己的元数据，不能改名或删除"),
+        });
+    }
+    Ok(())
 }
 
 /// 从库根开始逐级检查 `rel`，任何一级是重解析点（软链 / junction / 挂载点）就拒绝。

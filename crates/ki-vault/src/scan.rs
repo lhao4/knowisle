@@ -48,7 +48,9 @@ const IGNORED_DIRS: &[&str] = &[
     "logseq",
     ".trash",
     ".stversions",
-    ".knowisle",
+    // 自己的元数据目录。与 `path::METADATA_DIR` 是同一个常量：扫描器"看不见它"
+    // 与破坏性操作"不许碰它"必须指的是同一个名字，各写一份就会漂移。
+    crate::path::METADATA_DIR,
     // 构建产物与依赖
     "node_modules",
     "target",

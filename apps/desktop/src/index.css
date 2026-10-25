@@ -22,6 +22,7 @@
   --ki-amber-100: #fef3c7;
   --ki-amber-600: #d97706;
   --ki-red-600: #dc2626;
+  --ki-red-700: #b91c1c;
 
   /* L2 · Semantic */
   --ki-bg-canvas: #ffffff;
@@ -35,6 +36,10 @@
   --ki-border-quote: var(--ki-slate-400);
   --ki-bg-code: var(--ki-slate-200);
   --ki-accent: var(--ki-blue-500);
+  /* 破坏性动作。只有"这一步做错了要丢东西"的按钮用它——
+   * 用得多就等于没有强调，所以它刻意不参与普通按钮的 hover 体系。 */
+  --ki-danger: var(--ki-red-600);
+  --ki-danger-hover: var(--ki-red-700);
   /* 搜索命中的底色。刻意用暖色：它必须在一屏冷色的正文里一眼跳出来。 */
   --ki-bg-mark: var(--ki-amber-100);
 
@@ -203,6 +208,29 @@ body {
   /* 与 `.btn:disabled` 的灰字区分：这里底色还在，只是变淡。 */
   background: var(--ki-slate-400);
   border-color: var(--ki-slate-400);
+  color: #fff;
+}
+
+/*
+ * 破坏性动作（删除）。红色只出现在"按下去要丢东西"的那一个按钮上。
+ *
+ * 不继承 `.btn--primary` 的 `filter: brightness()` 悬停：红底上提亮会变成
+ * 粉红，看起来像"被禁用"。改用更深的一档（L1 的 red-700）。
+ */
+.btn--danger {
+  border-color: var(--ki-danger);
+  background: var(--ki-danger);
+  color: #fff;
+}
+
+.btn--danger:hover:not(:disabled) {
+  border-color: var(--ki-danger-hover);
+  background: var(--ki-danger-hover);
+}
+
+.btn--danger:disabled {
+  border-color: var(--ki-slate-400);
+  background: var(--ki-slate-400);
   color: #fff;
 }
 
@@ -1018,6 +1046,92 @@ body {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 4px;
+}
+
+/* ───────────────────────── 删除的二次确认 ───────────────────────── */
+
+/*
+ * 与名字浮层同构（fixed 遮罩 + 居中面板），但**不复用它的类名**：
+ * 那个面板的核心是一个输入框，这个面板的核心是一段必须读完的代价说明。
+ * 共用类名之后，改输入框的行高会顺手改坏这里。
+ *
+ * 遮罩比名字浮层更暗（44% vs 32%）：这一步之后文件就不在树里了，
+ * 背景越安静，越不容易在"我在删哪一篇"上判断错。
+ */
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 22vh;
+  background: rgb(24 24 27 / 44%);
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(460px, 92vw);
+  padding: 18px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 10px;
+  background: var(--ki-bg-canvas);
+  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+}
+
+.confirm__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ki-text-primary);
+}
+
+.confirm__body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--ki-text-primary);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.confirm__body p {
+  margin: 0;
+}
+
+/* 文件名与回收目录用等宽字：它们是**磁盘上的东西**，不是散文。
+ * `overflow-wrap: anywhere` 让超长中文名不至于把面板撑破。 */
+.confirm__name,
+.confirm__path {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--ki-bg-code);
+  font-family: var(--ki-font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* 代价说明：更小、更淡，但**必须在**。它说的是"应用里没有恢复入口"。 */
+.confirm__note {
+  color: var(--ki-text-muted);
+  font-size: 12px;
+}
+
+.confirm__error {
+  margin: 0;
+  color: var(--ki-danger);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.confirm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
 }
 
 /* ───────────────────────── 欢迎页 ───────────────────────── */

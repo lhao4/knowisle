@@ -84,6 +84,24 @@ export const noteCreate = commands.noteCreate
 export const noteRename = commands.noteRename
 
 /**
+ * 删除一篇笔记：**移进 `.knowisle/trash/`**，返回它在回收目录里的相对路径。
+ *
+ * 调用前必须先 `noteEdit` + `noteFlush`（当前笔记时），否则 trash 里会是旧版本。
+ * 但那**不能替代** Rust 侧的 drain：前端 flush 返回时自动保存的 worker 可能
+ * 还没退出。顺序由 `note_delete` 自己在 Rust 侧保证：
+ * drain → 搬进 trash → 清空槽位。
+ *
+ * 冲突时拒绝删除（`CONFLICT`）：此刻用户还有「覆盖 / 放弃」两个选择，
+ * 删掉就只剩一个。
+ *
+ * # 这不是回收站
+ *
+ * 应用里没有恢复入口，也没有"清空回收站"。文件还在磁盘上，要找回得自己去
+ * 文件夹翻——UI 文案必须说清这一点，不能只说"移到回收站"。
+ */
+export const noteDelete = commands.noteDelete
+
+/**
  * 提交一次编辑，由 Rust 侧的节流器决定何时落盘（1.5 秒）。
  *
  * `baseMtime` 传打开这篇笔记时 `noteRead` 返回的 mtime，

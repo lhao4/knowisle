@@ -326,6 +326,30 @@ pub fn flush(root: &Path, path: &str, force: bool) -> Result<Option<SaveResult>,
 /// 直接放行。用户完全可能在树里右键改一篇**没打开**的笔记的名字，
 /// 那与槽位无关；此时若去 flush，反而会把另一篇的内容写一遍。
 pub fn drain_for_rename(root: &Path, path: &str) -> Result<(), KiError> {
+    drain_if_current(root, path)
+}
+
+/// 删除前的准备：**与改名完全同一条契约**，只是理由不同。
+///
+/// 槽位里可能压着用户最后 1.5 秒的输入。直接 `rename` 进 trash，会让
+/// "移到回收站"变成"丢掉最新版本"——文件在 trash 里，内容却是旧的，
+/// 而且这件事没有任何提示。
+///
+/// 冲突（`Err`）时必须拒绝删除：此刻用户手里还有「覆盖 / 放弃」两个选择，
+/// 删掉就只剩一个，而剩下的那个还不是他选的。
+///
+/// 单独起一个名字而不是让删除去调 `drain_for_rename`：两者的**判据**相同
+/// （是不是当前文档），但**后果**不同（改名失败只是名字没变，删除失败是
+/// 一条会丢数据的路径）。名字是调用方唯一会读的那行文档。
+pub fn drain_for_delete(root: &Path, path: &str) -> Result<(), KiError> {
+    drain_if_current(root, path)
+}
+
+/// 动目录项之前，把当前文档彻底写完。
+///
+/// `flush` 的契约是：返回 `Ok` 时 pending 必为空、worker 必已退出
+/// （worker 还在写时会等，5 秒超时则返回 `Err`，那条路径由调用方挡掉）。
+fn drain_if_current(root: &Path, path: &str) -> Result<(), KiError> {
     let is_current = {
         let slot = lock();
         slot.key.as_ref() == Some(&(root.to_path_buf(), path.to_owned()))
@@ -334,8 +358,6 @@ pub fn drain_for_rename(root: &Path, path: &str) -> Result<(), KiError> {
         return Ok(());
     }
 
-    // `flush` 的契约：返回 `Ok` 时 pending 必为空、worker 必已退出
-    // （worker 还在写时会等，5 秒超时则返回 `Err`，那条路径由 `?` 挡掉）。
     flush(root, path, false).map(|_| ())
 }
 
@@ -368,6 +390,45 @@ pub fn rename_slot(root: &Path, old_path: &str, new_path: &str) {
     if let Some(saved) = slot.last_saved.as_mut() {
         saved.path = new_path.to_owned();
     }
+}
+
+/// 删除成功之后，把槽位**清空**（不是搬到别的键上）。
+///
+/// # 这是整条删除路径上唯一防「文件复活」的硬防线
+///
+/// 前端也会丢本地缓冲（`NoteEditorHandle.discardPending`），但那只挡得住
+/// 300ms 合并窗口里的那一次 `noteEdit`。挡不住的是**已经在飞的 IPC**：
+/// `flushActiveNote` 的 `noteFlush` 可能正走在路上，等它到达时文件已经进了
+/// trash。它落在已删除路径上会写回一个新文件——删除看起来"没生效"。
+///
+/// 清掉 `key` 之后，`flush` 的第一道判断就是 `slot.key != key → Ok(None)`，
+/// 于是任何迟到的 flush 都是无操作。**这条不许省**，它比前端那层更靠后，
+/// 也更难绕过。
+///
+/// # 为什么不是搬键
+///
+/// 改名可以把键从旧路径搬到新路径（文件还在，只是换了名字）。删除没有新路径，
+/// 搬键只能搬到一个假名字上——那等于给"下一次编辑"留了个会写脏的坑。
+///
+/// # 删的不是当前文档
+///
+/// 一个字都不动。用户完全可能在树里删一篇**没打开**的笔记，此时槽位里是
+/// 另一篇的内容，清掉就是把它最后几个字扔了。
+pub fn clear_for_delete(root: &Path, path: &str) {
+    let mut slot = lock();
+    if slot.key.as_ref() != Some(&(root.to_path_buf(), path.to_owned())) {
+        return;
+    }
+
+    // 到这一步 `drain_for_delete` 已经跑过了：pending 为空、worker 已退出，
+    // 所以这里不需要（也不该）碰 `worker_running`——把一个正在写的线程标成
+    // "没在跑"会让后来者同时起第二个 worker。
+    slot.key = None;
+    slot.pending = None;
+    slot.baseline = None;
+    slot.last_saved_mtime = None;
+    slot.last_saved = None;
+    slot.last_error = None;
 }
 
 /// 冲刷**当前槽位**，供关窗路径调用。

@@ -1,10 +1,10 @@
 //! 知屿 KnowIsle · Vault 文件系统层
 //!
 //! 本 crate 是"磁盘上的 Markdown 是唯一真相源"（公理 A1）在代码里的落点。
-//! 它只做五件事：**扫描**、**路径安全**、**读写**、**新建与改名**、**全文索引**。
+//! 它只做五件事：**扫描**、**路径安全**、**读写**、**新建 / 改名 / 删除**、**全文索引**。
 //!
-//! 新建与改名（[`fileops`]）刻意与内容写入（[`write`]）分开：前者只碰目录项，
-//! 后者才是原子写要保护的那条路径。文件名规则（[`naming`]）单独成模块，
+//! 新建、改名与删除（[`fileops`]）刻意与内容写入（[`write`]）分开：前三者只碰
+//! 目录项，后者才是原子写要保护的那条路径。文件名规则（[`naming`]）单独成模块，
 //! 因为它是**唯一**的闸门——GUI 与将来的 `isle` CLI 共用同一份判定。
 //!
 //! 全文索引（[`search`]）刻意是"朴素子串扫描 + 进程内存"，不是搜索引擎：
@@ -24,7 +24,7 @@ pub mod search;
 pub mod write;
 
 pub use autosave::{SaveThrottle, AUTOSAVE_INTERVAL};
-pub use fileops::{create_note, rename_note};
+pub use fileops::{create_note, delete_note, rename_note, TRASH_DIR};
 pub use naming::normalize_note_name;
 pub use path::{resolve_for_write, resolve_in_vault, to_posix};
 pub use scan::{read_note, scan_vault, ScanOptions, MAX_SAFE_DEPTH};

@@ -20,7 +20,7 @@
 //! 架构文档原本写 `domain::action`（如 `note::save`），但 Tauri 命令名必须是
 //! 合法的 Rust 标识符，`::` 不可用。因此统一为 `domain_action`：
 //! `vault_scan`、`vault_search`、`note_read`、`note_save`、`note_create`、
-//! `note_rename`、`note_edit`、`note_flush`、`note_status`、`app_ping`。
+//! `note_rename`、`note_delete`、`note_edit`、`note_flush`、`note_status`、`app_ping`。
 //!
 //! 生成到 TS 后访问器是小驼峰（`commands.noteSave`），但 IPC 字符串仍是下划线。
 
@@ -29,8 +29,8 @@ mod commands;
 pub mod search;
 
 pub use commands::{
-    app_ping, note_create, note_edit, note_flush, note_read, note_rename, note_save, note_status,
-    vault_scan, vault_search,
+    app_ping, note_create, note_delete, note_edit, note_flush, note_read, note_rename, note_save,
+    note_status, vault_scan, vault_search,
 };
 
 use tauri_specta::{Builder, ErrorHandlingMode};
@@ -54,6 +54,7 @@ pub fn ipc_builder<R: tauri::Runtime>() -> Builder<R> {
             note_save,
             note_create,
             note_rename,
+            note_delete,
             note_edit,
             note_flush,
             note_status,
