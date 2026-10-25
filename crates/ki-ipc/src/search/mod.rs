@@ -5,26 +5,58 @@
 //! | 模块 | 职责 | 有没有状态 |
 //! |---|---|---|
 //! | [`legacy`] | M2 的内存索引（旧引擎），整库读进内存逐篇字面匹配 | 无 |
-//! | [`service`] | 扫描之后的增量同步：diff → 读盘 → 分批写库 | 无 |
-//! | [`cache`] | 进程级缓存：当前 Vault、旧索引、索引库连接、诊断计数 | **有** |
+//! | [`service`] | 增量同步（diff → 读盘 → 分批写库）与 FTS 查询编排 | 无 |
+//! | `cache` | 进程级缓存：当前 Vault、旧索引、索引库连接、诊断计数 | **有** |
 //!
-//! 纯逻辑在 `ki-vault`（定位器、扫描）与 `ki-search`（分词、计划、RRF），
-//! 这里只负责"谁在同时用"与"东西活多久"——与 autosave 的分工完全一样。
+//! 纯逻辑在 `ki-vault`（定位器、扫描）、`ki-search`（分词、计划、RRF）、
+//! `ki-store`（SQL），这里只负责"谁在同时用"与"东西活多久"——
+//! 与 autosave 的分工完全一样。
 //!
 //! # 为什么只有一个 Vault 的缓存
 //!
 //! 同一时刻只可能打开一个 Vault。缓存两个 root 的唯一效果是切库时内存翻倍，
 //! 而切回来仍然要重建——没有 watcher（B-09），旧索引不可信。
 //!
-//! # 迁移状态（M4 步骤 2）
+//! # 两个引擎共存
 //!
-//! 写入路径已经接上索引库（[`sync_after_scan`]），**查询仍然走旧引擎**
-//! （[`query`]）。这是刻意的：先让"存进去"独立可测，再把"查出来"换掉，
-//! 最后才翻开关。翻开关时 `query` 换实现，前端一行都不用改。
+//! [`ENGINE`] 决定 [`query`] 走哪条路。`Memory` 是 M2 的旧实现，`Fts` 是
+//! 新的 FTS5 路径。两者**共用同一个定位器**（`ki_vault::NoteLocator`），
+//! 所以它们的检索精度天然一致，差异只可能来自候选集——这正是
+//! `tests/search_parity.rs` 能作为硬门槛的原因。
+//!
+//! 旧引擎计划保留一个 release 再清理：它是回滚路径，也是对拍的参照实现。
 
 mod cache;
-mod legacy;
-mod service;
+pub mod legacy;
+pub mod service;
 
-pub use legacy::{invalidate, query};
+pub use legacy::invalidate;
 pub use service::{sync_after_scan, SyncReport};
+
+use std::path::Path;
+
+use ki_core::{KiError, SearchResult};
+
+/// 检索引擎。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// M2 的内存索引：整库读进内存，逐篇字面匹配。
+    Memory,
+    /// FTS5 索引：SQLite 选候选，定位器出结果。
+    Fts,
+}
+
+/// 当前生效的引擎。
+///
+/// 换引擎改这一行即可，不需要动前端、数据库或命令签名。对拍测试直接调
+/// [`legacy::query`] 与 [`service::search`]，不经过这里——否则它就成了
+/// 「用同一份代码对比自己」。
+pub const ENGINE: Engine = Engine::Memory;
+
+/// 查询全文索引。这是 `vault_search` 命令唯一会调的函数。
+pub fn query(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchResult, KiError> {
+    match ENGINE {
+        Engine::Memory => legacy::query(root, query, refresh),
+        Engine::Fts => service::search(root, query, refresh),
+    }
+}

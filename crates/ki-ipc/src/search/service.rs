@@ -32,10 +32,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ki_core::{KiError, ScanResult};
-use ki_search::{project, token_stream};
-use ki_store::{IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats};
-use ki_vault::{flatten_files, name_lower_for_path, read_note, FileRef, MAX_INDEX_BYTES};
+use ki_core::{KiError, ScanResult, SearchHit, SearchResult};
+use ki_search::{fuse, plan, project, token_stream, Mode, Plan};
+use ki_store::{
+    Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
+};
+use ki_vault::{
+    flatten_files, fold_ascii, name_lower_for_path, read_note, FileRef, NoteLocator, MAX_HITS,
+    MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+};
 
 use super::cache::{canonical_root, ensure_root, lock};
 
@@ -44,6 +49,16 @@ use super::cache::{canonical_root, ensure_root, lock};
 /// 256 是个折中：太小则提交次数多（10k 篇 = 40 次提交变成 100 次），
 /// 太大则单批的读盘时间会明显拉长（用户在这期间看到的还是旧索引）。
 const BATCH_SIZE: usize = 256;
+
+/// 每条 FTS 通道取前多少篇。
+const CHANNEL_LIMIT: usize = 200;
+
+/// 文件名通道取前多少篇。它**全部进池**——`name_hit` 是排序契约的第一键，
+/// 被截断挤掉会让「按文件名搜」直接失效。
+const NAME_LIMIT: usize = 400;
+
+/// 候选池上限。超过就只保留 RRF 分数最高的那些，并把结果标成 `truncated`。
+const POOL_LIMIT: usize = 400;
 
 /// 一次同步的结果。
 #[derive(Debug, Clone)]
@@ -212,14 +227,7 @@ fn prepare(
                 // 下次扫描才不会误判成"未变"而漏掉这次改动。
                 stats.bytes_read += note.size;
                 out.push(Prepared::Index {
-                    note: IndexedNote {
-                        path: note.path.clone(),
-                        name_lower: name_lower_for_path(&note.path),
-                        size: note.size,
-                        mtime: note.mtime,
-                        body_ascii: project(&note.content),
-                        body_tokens: token_stream(&note.content),
-                    },
+                    note: indexed_note(&note),
                     existed,
                 });
             }
@@ -260,4 +268,265 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// 查询路径
+// ---------------------------------------------------------------------------
+
+/// 用 FTS5 索引回答一次查询。
+///
+/// # 分工：索引选候选，定位器出结果
+///
+/// FTS5 只回答「哪些笔记值得看」；行号、UTF-16 列号、摘要窗口全部由
+/// [`NoteLocator`] 的字面子串扫描产出。这条分工是整次换芯的支点：
+///
+/// - 18 条既有行为契约（一行一条、长行窗口化、跨行跳过…）自动继续成立，
+///   因为它们是**同一份代码**在跑；
+/// - 检索精度与旧引擎完全相同，差异只可能来自候选集；
+/// - 不需要 `snippet()`（contentless 表本来也不支持），也不需要在库里存原文。
+///
+/// # 最终顺序仍由定位器决定
+///
+/// RRF 的分数只用来决定**谁进候选池**（池满 400 时）。命中行的最终顺序还是
+/// `name_hit desc → path asc → line asc`，与旧引擎逐字一致——否则前端列表的
+/// 顺序会变，而那是没有契约支撑的行为变更。
+///
+/// 相关性排序（让"最相关"的笔记排在前面）**仍然没有做**。它需要新的排序契约
+/// 与前端文案，不属于「换实现」的范围。ADR-007 记了这条。
+pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchResult, KiError> {
+    let root = canonical_root(root)?;
+    let mut cache = lock();
+    ensure_root(&mut cache, &root);
+
+    let mut open_ms = 0u64;
+    if cache.store.is_none() {
+        let started = Instant::now();
+        let (db, _) = IndexDb::open(&root)?;
+        cache.store = Some(db);
+        cache.builds += 1;
+        open_ms = started.elapsed().as_millis() as u64;
+    }
+
+    // 取走并清零：这是「本次搜索之前最近一次索引维护耗时」，只该被报告一次。
+    // 第二次搜索显示 0，与旧引擎「命中缓存时为 0」的语义一致。
+    let pending_ms = std::mem::take(&mut cache.pending_index_ms);
+    let builds = cache.builds;
+    let db = cache.store.as_mut().expect("上面刚保证过 store 非空");
+
+    if let Some(path) = refresh {
+        // 刷新失败不该让搜索失败：用户要的是结果，不是错误。
+        let _ = refresh_path(db, &root, path);
+    }
+
+    let counts = db.counts()?;
+    let qplan = plan(query);
+
+    let mut result = match qplan.mode {
+        Mode::Empty => finish(Vec::new(), 0, counts, false),
+        // 全扫：索引里没有可查的 token（单字、纯 emoji、孤立 CJK 单字），
+        // 只能把已索引的笔记全部过一遍定位器。代价与旧引擎建索引时读一遍全库
+        // 相当——不存正文就必须重新读，这是 contentless 的必然结果。
+        Mode::FullScan => {
+            let pool: Vec<String> = db
+                .ok_candidates()?
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .collect();
+            locate_all(&root, &pool, query, counts, false)
+        }
+        Mode::Ascii | Mode::Cjk => indexed_search(db, &root, query, &qplan, counts)?,
+    };
+
+    result.index_ms = pending_ms + open_ms;
+    result.builds = builds;
+    Ok(result)
+}
+
+/// 走 FTS 通道：候选 → RRF 融合 → 定位。
+fn indexed_search(
+    db: &IndexDb,
+    root: &Path,
+    query: &str,
+    qplan: &Plan,
+    counts: Counts,
+) -> Result<SearchResult, KiError> {
+    let channel = match qplan.mode {
+        Mode::Ascii => db.match_ascii(&qplan.expr, CHANNEL_LIMIT)?,
+        Mode::Cjk => db.match_zh(&qplan.expr, CHANNEL_LIMIT)?,
+        _ => unreachable!("indexed_search 只处理 Ascii / Cjk"),
+    };
+    // 取满了就说明池可能被截断，`total` 从「准确值」降级为「下界」。
+    let channel_saturated = channel.len() >= CHANNEL_LIMIT;
+
+    // 文件名通道与 FTS 通道互不替代：`name_hit` 是排序契约的第一键，
+    // 一篇文件名命中但正文没命中的笔记必须进池，否则「按文件名搜」直接失效。
+    let needle = fold_ascii(query.trim());
+    let names = if needle.is_empty() {
+        Vec::new()
+    } else {
+        db.match_name(&needle, NAME_LIMIT)?
+    };
+
+    let fused = fuse(&[
+        channel.iter().map(|c| c.id).collect(),
+        names.iter().map(|c| c.id).collect(),
+    ]);
+
+    let mut paths: HashMap<i64, &str> = HashMap::with_capacity(channel.len() + names.len());
+    for candidate in channel.iter().chain(names.iter()) {
+        paths.insert(candidate.id, candidate.path.as_str());
+    }
+
+    let pool_saturated = channel_saturated || fused.len() > POOL_LIMIT;
+    let pool: Vec<String> = fused
+        .iter()
+        .take(POOL_LIMIT)
+        .filter_map(|hit| paths.get(&hit.id).map(|path| (*path).to_string()))
+        .collect();
+
+    Ok(locate_all(root, &pool, query, counts, pool_saturated))
+}
+
+/// 对候选池逐篇定位，产出最终结果。
+///
+/// 读不到的文件静默跳过：它可能在扫描与搜索之间被删掉了。**不要**因此把
+/// 整次搜索变成错误——一篇被删的笔记不该让用户搜不了整个库。
+fn locate_all(
+    root: &Path,
+    pool: &[String],
+    query: &str,
+    counts: Counts,
+    pool_saturated: bool,
+) -> SearchResult {
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut total = 0usize;
+
+    for path in pool {
+        let Ok(note) = read_note(root, path) else {
+            continue;
+        };
+        let file_hits = NoteLocator::new(note.path, note.content).hits(query, MAX_HITS_PER_FILE);
+        total += file_hits.len();
+        hits.extend(file_hits);
+    }
+
+    finish(hits, total, counts, pool_saturated)
+}
+
+/// 排序、截断、填诊断字段。
+///
+/// 排序键与旧引擎**逐字相同**：文件名命中优先 → 路径 → 行号。三者都是确定的，
+/// 所以结果与遍历顺序无关（候选池的顺序来自 RRF，但它不影响最终顺序）。
+fn finish(
+    mut hits: Vec<SearchHit>,
+    total: usize,
+    counts: Counts,
+    pool_saturated: bool,
+) -> SearchResult {
+    hits.sort_by(|a, b| {
+        b.name_hit
+            .cmp(&a.name_hit)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+
+    let truncated = hits.len() > MAX_HITS || pool_saturated;
+    hits.truncate(MAX_HITS);
+
+    SearchResult {
+        hits,
+        total,
+        truncated,
+        indexed_files: counts.ok,
+        skipped_files: counts.skipped,
+        index_ms: 0,
+        builds: 0,
+    }
+}
+
+/// 把「当前正在编辑的那一篇」重新索引一次。
+///
+/// 每次搜索只重读一个文件，换来的是「刚打的字立刻能搜到」。若改成整库重建，
+/// 连打 3 个字符就是 3 次全库 IO；若完全不刷新，用户会认定「刚写的搜不到」
+/// 是 bug。
+///
+/// 四种结果对应四种处置，与旧引擎的 `refresh` 一一对应：
+///
+/// | 磁盘状态 | 处置 |
+/// |---|---|
+/// | 内容没变（size + mtime 都没动） | 不写库 |
+/// | 变了 / 上次是跳过的 | `upsert_ok` |
+/// | 超过 2MB 上限 | `upsert_skipped(TooLarge)` |
+/// | 读不到 | **删行**（读不到的不该继续贡献命中） |
+fn refresh_path(db: &mut IndexDb, root: &Path, path: &str) -> Result<(), KiError> {
+    // 不在库里就什么都不做：新文件要等下一次 `vault_scan` 才可见。
+    // 这是 B-09 的既有边界，不在这里偷偷补一个"文件系统监听"。
+    let Some(prev) = db.note_state(path)? else {
+        return Ok(());
+    };
+
+    let now = now_ms();
+    match read_note(root, path) {
+        Ok(note) if note.size <= MAX_INDEX_BYTES => {
+            if prev.ok && prev.size == note.size && prev.mtime == note.mtime {
+                return Ok(());
+            }
+            db.upsert_ok(&indexed_note(&note), now)?;
+        }
+        Ok(note) => {
+            db.upsert_skipped(
+                &SkippedNote {
+                    name_lower: name_lower_for_path(&note.path),
+                    path: note.path,
+                    size: note.size,
+                    mtime: note.mtime,
+                    reason: SkipReason::TooLarge,
+                },
+                now,
+            )?;
+        }
+        Err(KiError::TooLarge { size, .. }) => {
+            db.upsert_skipped(
+                &SkippedNote {
+                    path: path.to_string(),
+                    name_lower: name_lower_for_path(path),
+                    size,
+                    // 读失败拿不到 mtime，沿用库里的值：下次扫描看到 size 变了
+                    // 就会重试，而 size 没变时重试也没意义。
+                    mtime: prev.mtime,
+                    reason: SkipReason::TooLarge,
+                },
+                now,
+            )?;
+        }
+        Err(KiError::InvalidEncoding { .. }) => {
+            db.upsert_skipped(
+                &SkippedNote {
+                    path: path.to_string(),
+                    name_lower: name_lower_for_path(path),
+                    size: prev.size,
+                    mtime: prev.mtime,
+                    reason: SkipReason::InvalidUtf8,
+                },
+                now,
+            )?;
+        }
+        Err(_) => {
+            db.delete_by_path(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// 正文 → 待写库的行。同步与刷新共用，保证两边算出来的 token 完全一致。
+fn indexed_note(note: &ki_core::NoteContent) -> IndexedNote {
+    IndexedNote {
+        path: note.path.clone(),
+        name_lower: name_lower_for_path(&note.path),
+        size: note.size,
+        mtime: note.mtime,
+        body_ascii: project(&note.content),
+        body_tokens: token_stream(&note.content),
+    }
 }

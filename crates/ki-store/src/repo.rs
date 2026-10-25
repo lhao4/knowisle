@@ -230,6 +230,52 @@ impl IndexDb {
         Ok(out)
     }
 
+    /// 读一篇笔记的同步状态。不存在返回 `None`。
+    ///
+    /// 「刷新当前编辑篇」每次搜索都要问一次，所以不能复用 [`IndexDb::load_state`]——
+    /// 那是全表扫描，10k 行 2ms，而这条走 `path` 的唯一索引。
+    pub fn note_state(&self, path: &str) -> Result<Option<NoteState>, KiError> {
+        fn inner(conn: &Connection, path: &str) -> rusqlite::Result<Option<NoteState>> {
+            conn.query_row(
+                "SELECT id, path, size, mtime, status = 'ok' FROM note WHERE path = ?1",
+                [path],
+                |r| {
+                    Ok(NoteState {
+                        id: r.get(0)?,
+                        path: r.get(1)?,
+                        size: r.get::<_, i64>(2)? as u64,
+                        mtime: r.get(3)?,
+                        ok: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        }
+        inner(self.conn(), path).map_err(|e| index_err(self.path(), &e))
+    }
+
+    /// 全部已索引成功的笔记，按路径升序。
+    ///
+    /// 全扫模式（单字查询、纯 emoji 查询）用它当候选池。**这是唯一会拉全表的
+    /// 查询**，代价与旧引擎建索引时读一遍全库相当——不存正文就必须重新读，
+    /// 这是 contentless 的必然结果（公理 A1 要求索引里没有第二份真相）。
+    pub fn ok_candidates(&self) -> Result<Vec<Candidate>, KiError> {
+        fn inner(conn: &Connection) -> rusqlite::Result<Vec<Candidate>> {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, path, name_lower FROM note WHERE status = 'ok' ORDER BY path",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(Candidate {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    name_lower: r.get(2)?,
+                })
+            })?;
+            rows.collect()
+        }
+        inner(self.conn()).map_err(|e| index_err(self.path(), &e))
+    }
+
     /// 通道 A（ASCII 投影）查询。`expr` 必须是**已经拼好的 FTS5 表达式**，
     /// 语法由 `ki-search::plan` 负责生成。
     ///
