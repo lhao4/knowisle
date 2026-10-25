@@ -1056,7 +1056,7 @@ unsafe { cmd.pre_exec(|| { setrlimit(RLIMIT_AS, 512MB); setsid(); Ok(()) }); }
 | 全局搜索响应 | ≤ 60ms (P95) | 基准测试（`criterion`） |
 | 击键到像素 | ≤ 16ms (P99) | Playwright + PerformanceObserver |
 | 10 万字文档滚动 | 60fps 稳定 | 帧率采样 |
-| 安装包体积 | ≤ 20MB | `release.yml` 的 bundle job（逐包断言，超限即红） |
+| 安装包体积 | Win/macOS ≤ 20MB；AppImage ≤ 100MB | `release.yml` 的 bundle job（逐包断言，超限即红）。实测 msi 3.29 / nsis 2.27 / dmg 2.68 / AppImage 77.6 MiB——AppImage 的大头是随包的 WebKitGTK，不是我们的代码 |
 | 空载 RSS | ≤ 150MB | 进程采样 |
 | 主 chunk（gzip） | ≤ 350KB | `vite-bundle-visualizer` |
 
