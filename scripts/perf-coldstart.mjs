@@ -95,6 +95,47 @@ function findApp() {
 const killTree = (pid) => tryRun(`taskkill /PID ${pid} /T /F`)
 const killAll = () => tryRun('taskkill /F /IM knowisle.exe')
 
+/**
+ * 列出该 pid 的**子孙**进程名，只在启动失败时调用。
+ *
+ * 这是「起不来」唯一能分辨病因的证据：WebView2 一旦成功创建环境，一定会派生
+ * 出若干 `msedgewebview2.exe`（浏览器 / GPU / 渲染器）。
+ *   - 一个都没有 → 运行时缺失或环境创建失败（`--remote-debugging-port` 根本没机会生效）
+ *   - 有一堆但端口没开 → 参数没传到 WebView2，或者端口被别的东西占了
+ * 光看「进程还在」这两种情况长得一模一样，CI 上为此白跑过两轮。
+ */
+function descendants(pid) {
+  try {
+    const out = psRun(`
+$all = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name
+$byParent = @{}
+foreach ($p in $all) {
+  $k = [int]$p.ParentProcessId
+  if (-not $byParent.ContainsKey($k)) { $byParent[$k] = @() }
+  $byParent[$k] += $p
+}
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue(${pid})
+$seen = @{}
+$names = @()
+while ($queue.Count -gt 0) {
+  $cur = [int]$queue.Dequeue()
+  if ($seen.ContainsKey($cur)) { continue }
+  $seen[$cur] = $true
+  foreach ($c in $byParent[$cur]) {
+    $names += $c.Name
+    $queue.Enqueue([int]$c.ProcessId)
+  }
+}
+if ($names.Count -eq 0) { Write-Output '(无子进程)' }
+else { Write-Output (($names | Sort-Object -Unique) -join ', ') }
+`)
+    return out || '(空)'
+  } catch (error) {
+    return `(枚举失败: ${error.message})`
+  }
+}
+
 const psRun = (script) => {
   const b64 = Buffer.from(script, 'utf16le').toString('base64')
   return execSync(`powershell -NoProfile -NonInteractive -EncodedCommand ${b64}`, {
@@ -277,8 +318,13 @@ async function boot(timeoutMs = 30000) {
         return false
       }
     })()
+    const kids = alive ? descendants(child.pid) : ''
     killTree(child.pid)
-    throw new Error(`调试端口没开（进程${alive ? '仍在，卡在 WebView2 初始化' : '已退出，初始化阶段就崩了'}）`)
+    throw new Error(
+      `调试端口没开（进程${
+        alive ? `仍在，卡在 WebView2 初始化；子孙进程: ${kids}` : '已退出，初始化阶段就崩了'
+      }）`,
+    )
   }
   const cdp = await openWs(wsUrl)
   await cdp.send('Runtime.enable')

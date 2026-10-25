@@ -176,6 +176,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 这条不是可选的准备工作，是实测出来的前提：缺 WebView2 运行时的时候，
+      # 应用进程**照样活着**、窗口照样创建（所以 K1 会过），但 WebView2 永远
+      # 初始化不出来，表现为「调试端口 30 秒没开、进程仍在」。三次重试都一样，
+      # 因为缺的东西不会因为重试而出现。
+      - name: WebView2 runtime
+        shell: pwsh
+        run: |
+          $guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $keys = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$guid",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid",
+            "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid"
+          )
+          $ver = $null
+          foreach ($k in $keys) {
+            if (Test-Path $k) {
+              $v = (Get-ItemProperty $k -ErrorAction SilentlyContinue).pv
+              if ($v) { $ver = $v; break }
+            }
+          }
+          if ($ver) {
+            Write-Output "WebView2 runtime 已存在: $ver"
+            exit 0
+          }
+          Write-Output "WebView2 runtime 缺失，装 bootstrapper"
+          $exe = Join-Path $env:TEMP 'MicrosoftEdgeWebView2Setup.exe'
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $exe
+          Start-Process -FilePath $exe -ArgumentList '/silent', '/install' -Wait
+          foreach ($k in $keys) {
+            if (Test-Path $k) {
+              $v = (Get-ItemProperty $k -ErrorAction SilentlyContinue).pv
+              if ($v) { Write-Output "安装完成: $v"; exit 0 }
+            }
+          }
+          Write-Output "::error::WebView2 运行时安装后仍未检测到"
+          exit 1
+
       - uses: pnpm/action-setup@v4
         with:
           version: 12.15.0
@@ -193,6 +230,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # 必须是 `tauri build`，不能是 `cargo build --release`：后者产出的二进制
+      # 仍指向 devUrl（tauri-build 只在 `tauri build` 环境里才关 dev cfg 并
+      # 把前端嵌进二进制），量出来的是「连不上 vite 的空白页有多快」。
       - name: Build release binary
         working-directory: apps/desktop
         run: pnpm exec tauri build --no-bundle --ci
