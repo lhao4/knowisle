@@ -1713,6 +1713,8 @@ version = "0.1.0"
 dependencies = [
  "dunce",
  "ki-core",
+ "ki-search",
+ "ki-store",
  "ki-vault",
  "serde",
  "specta",
@@ -1720,6 +1722,10 @@ dependencies = [
  "tauri-specta",
  "tempfile",
 ]
+
+[[package]]
+name = "ki-search"
+version = "0.1.0"
 
 [[package]]
 name = "ki-store"

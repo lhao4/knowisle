@@ -298,6 +298,40 @@ pub fn read_note(root: &Path, rel: &str) -> Result<NoteContent, KiError> {
     })
 }
 
+/// 树里的一篇笔记（扁平化的结果）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRef {
+    /// Vault 相对路径（POSIX）。
+    pub path: String,
+    /// 扫描时读到的字节数。
+    pub size: u64,
+    /// 扫描时读到的 mtime（Unix 毫秒）。
+    pub mtime: i64,
+}
+
+/// 把树压成文件列表。
+///
+/// **顺序未定义**（内部用显式栈，与树的深度无关），调用方要确定性顺序就自己排。
+///
+/// 扫描与增量同步共用这一个函数：两边对「什么算一篇笔记」的判断只能有一份，
+/// 否则会出现「树里有这篇、索引里没有」这种不报错的不一致——
+/// 它表现为"侧栏看得到、搜不到"，是最难排查的一类 bug。
+pub fn flatten_files(tree: &FileNode) -> Vec<FileRef> {
+    let mut out = Vec::new();
+    let mut stack = vec![tree];
+    while let Some(node) = stack.pop() {
+        match &node.children {
+            Some(children) => stack.extend(children.iter()),
+            None => out.push(FileRef {
+                path: node.path.clone(),
+                size: node.size,
+                mtime: node.mtime,
+            }),
+        }
+    }
+    out
+}
+
 /// 是否应该继续下降。
 ///
 /// `depth() == 0` 永远放行——用户完全可能选了一个名叫 `dist` 或 `target`

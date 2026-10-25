@@ -4,6 +4,7 @@ members = [
     "apps/desktop/src-tauri",
     "crates/ki-core",
     "crates/ki-ipc",
+    "crates/ki-search",
     "crates/ki-store",
     "crates/ki-vault",
 ]
@@ -17,6 +18,7 @@ license = "AGPL-3.0-or-later"
 [workspace.dependencies]
 ki-core = { path = "crates/ki-core" }
 ki-ipc = { path = "crates/ki-ipc" }
+ki-search = { path = "crates/ki-search" }
 ki-store = { path = "crates/ki-store" }
 ki-vault = { path = "crates/ki-vault" }
 serde = { version = "1", features = ["derive"] }

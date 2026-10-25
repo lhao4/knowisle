@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 ki-core = { workspace = true }
+ki-search = { workspace = true }
+ki-store = { workspace = true }
 ki-vault = { workspace = true }
 serde = { workspace = true }
 # 只为了把 Vault 根规范化成与 `scan_vault` 相同的形态：搜索缓存按 root 做键，

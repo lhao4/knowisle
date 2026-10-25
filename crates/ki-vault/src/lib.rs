@@ -27,6 +27,9 @@ pub use autosave::{SaveThrottle, AUTOSAVE_INTERVAL};
 pub use fileops::{create_note, delete_note, rename_note, TRASH_DIR};
 pub use naming::normalize_note_name;
 pub use path::{resolve_for_write, resolve_in_vault, to_posix};
-pub use scan::{read_note, scan_vault, ScanOptions, MAX_SAFE_DEPTH};
-pub use search::{SearchIndex, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES};
+pub use scan::{flatten_files, read_note, scan_vault, FileRef, ScanOptions, MAX_SAFE_DEPTH};
+pub use search::{
+    fold_ascii, name_lower_for_path, note_stem, NoteLocator, SearchIndex, MAX_HITS,
+    MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+};
 pub use write::{write_note, write_note_checked};

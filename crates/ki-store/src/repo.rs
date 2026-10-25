@@ -15,6 +15,7 @@
 //! 混在一个返回类型里。
 
 use std::fmt;
+use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -171,54 +172,7 @@ impl IndexDb {
     ///
     /// [`RowCountMismatch`]: crate::RebuildReason::RowCountMismatch
     pub fn upsert_ok(&mut self, note: &IndexedNote, now: i64) -> Result<i64, KiError> {
-        fn inner(conn: &Connection, note: &IndexedNote, now: i64) -> rusqlite::Result<i64> {
-            let tx = conn.unchecked_transaction()?;
-            let existing: Option<i64> = tx
-                .query_row("SELECT id FROM note WHERE path = ?1", [&note.path], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-
-            let id = match existing {
-                Some(id) => {
-                    tx.execute(
-                        "UPDATE note SET name_lower = ?2, size = ?3, mtime = ?4,
-                                         status = 'ok', skip_reason = NULL, indexed_at = ?5
-                         WHERE id = ?1",
-                        params![id, note.name_lower, size_of(note.size), note.mtime, now],
-                    )?;
-                    tx.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
-                    tx.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
-                    id
-                }
-                None => {
-                    tx.execute(
-                        "INSERT INTO note(path, name_lower, size, mtime, status, indexed_at)
-                         VALUES(?1, ?2, ?3, ?4, 'ok', ?5)",
-                        params![
-                            note.path,
-                            note.name_lower,
-                            size_of(note.size),
-                            note.mtime,
-                            now
-                        ],
-                    )?;
-                    tx.last_insert_rowid()
-                }
-            };
-
-            tx.execute(
-                "INSERT INTO note_fts(rowid, body_ascii) VALUES(?1, ?2)",
-                params![id, note.body_ascii],
-            )?;
-            tx.execute(
-                "INSERT INTO note_fts_zh(rowid, body_tokens) VALUES(?1, ?2)",
-                params![id, note.body_tokens],
-            )?;
-            tx.commit()?;
-            Ok(id)
-        }
-        inner(self.conn(), note, now).map_err(|e| index_err(self.path(), &e))
+        self.in_tx(|conn| upsert_ok_sql(conn, note, now))
     }
 
     /// 写入（或覆盖）一篇索引失败的笔记。
@@ -227,73 +181,53 @@ impl IndexDb {
     /// 是成功的（比如刚长过 2MB 上限），必须把两张 FTS 表里的旧行删掉——
     /// 否则会留下「正文已不可索引，却还能被搜出来」的幽灵命中。
     pub fn upsert_skipped(&mut self, note: &SkippedNote, now: i64) -> Result<i64, KiError> {
-        fn inner(conn: &Connection, note: &SkippedNote, now: i64) -> rusqlite::Result<i64> {
-            let tx = conn.unchecked_transaction()?;
-            let existing: Option<i64> = tx
-                .query_row("SELECT id FROM note WHERE path = ?1", [&note.path], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-
-            let id = match existing {
-                Some(id) => {
-                    tx.execute(
-                        "UPDATE note SET name_lower = ?2, size = ?3, mtime = ?4,
-                                         status = 'skipped', skip_reason = ?5, indexed_at = ?6
-                         WHERE id = ?1",
-                        params![
-                            id,
-                            note.name_lower,
-                            size_of(note.size),
-                            note.mtime,
-                            note.reason.as_str(),
-                            now
-                        ],
-                    )?;
-                    tx.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
-                    tx.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
-                    id
-                }
-                None => {
-                    tx.execute(
-                        "INSERT INTO note(path, name_lower, size, mtime, status, skip_reason, indexed_at)
-                         VALUES(?1, ?2, ?3, ?4, 'skipped', ?5, ?6)",
-                        params![
-                            note.path,
-                            note.name_lower,
-                            size_of(note.size),
-                            note.mtime,
-                            note.reason.as_str(),
-                            now
-                        ],
-                    )?;
-                    tx.last_insert_rowid()
-                }
-            };
-            tx.commit()?;
-            Ok(id)
-        }
-        inner(self.conn(), note, now).map_err(|e| index_err(self.path(), &e))
+        self.in_tx(|conn| upsert_skipped_sql(conn, note, now))
     }
 
     /// 删掉一篇笔记（含两张 FTS 表里的行）。返回它之前是否存在。
     pub fn delete_by_path(&mut self, path: &str) -> Result<bool, KiError> {
-        fn inner(conn: &Connection, path: &str) -> rusqlite::Result<bool> {
-            let tx = conn.unchecked_transaction()?;
-            let id: Option<i64> = tx
-                .query_row("SELECT id FROM note WHERE path = ?1", [path], |r| r.get(0))
-                .optional()?;
-            let Some(id) = id else {
-                // 没这行就直接返回，事务随 drop 回滚（本来也没写东西）。
-                return Ok(false);
-            };
-            tx.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
-            tx.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
-            tx.execute("DELETE FROM note WHERE id = ?1", [id])?;
-            tx.commit()?;
-            Ok(true)
-        }
-        inner(self.conn(), path).map_err(|e| index_err(self.path(), &e))
+        self.in_tx(|conn| delete_by_path_sql(conn, path))
+    }
+
+    /// 单条写入：一个事务一次提交。
+    ///
+    /// 只在「刷新当前编辑篇」这类单篇场景用它。批量同步必须走 [`IndexDb::batch`]，
+    /// 否则 10k 篇就是 10k 次提交。
+    fn in_tx<T>(
+        &mut self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, KiError> {
+        let conn = self.conn();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| index_err(self.path(), &e))?;
+        let out = f(&tx).map_err(|e| index_err(self.path(), &e))?;
+        tx.commit().map_err(|e| index_err(self.path(), &e))?;
+        Ok(out)
+    }
+
+    /// 批量写：整批共用一个事务，由调用方决定「多少篇一批」。
+    ///
+    /// 为什么要分批而不是一个大事务：首次建 10k 篇的库时，一个大事务会让
+    /// WAL 一直长到全库大小、内存里的页缓存也一直涨；而每 256 篇提交一次
+    /// 的代价只是 40 次提交。分批的**语义**代价是「崩溃时可能只写进前 N 批」，
+    /// 但那只是一种 `RowCountMismatch` 之外的中间态——体检会在下次打开时
+    /// 发现行数不一致并重建，所以不影响正确性。
+    ///
+    /// `f` 返回 `Err` 时整批回滚（`tx` 随 drop 回滚），不会留下半批。
+    pub fn batch<T>(
+        &mut self,
+        f: impl FnOnce(&mut NoteBatch<'_>) -> Result<T, KiError>,
+    ) -> Result<T, KiError> {
+        let conn = self.conn();
+        let path = self.path();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| index_err(path, &e))?;
+        let mut batch = NoteBatch { conn: &tx, path };
+        let out = f(&mut batch)?;
+        tx.commit().map_err(|e| index_err(path, &e))?;
+        Ok(out)
     }
 
     /// 通道 A（ASCII 投影）查询。`expr` 必须是**已经拼好的 FTS5 表达式**，
@@ -400,6 +334,134 @@ impl IndexDb {
         }
         inner(self.conn()).map_err(|e| index_err(self.path(), &e))
     }
+}
+
+/// 一批写入的句柄。
+///
+/// 方法都**不开事务**——事务由 [`IndexDb::batch`] 统一持有。这样同一条 SQL
+/// 只有一份实现，单条写入与批量写入走的是同一段代码。
+pub struct NoteBatch<'a> {
+    conn: &'a Connection,
+    /// 出错时要写进 `KiError::Index` 的路径。
+    path: &'a Path,
+}
+
+impl NoteBatch<'_> {
+    pub fn upsert_ok(&mut self, note: &IndexedNote, now: i64) -> Result<i64, KiError> {
+        upsert_ok_sql(self.conn, note, now).map_err(|e| index_err(self.path, &e))
+    }
+
+    pub fn upsert_skipped(&mut self, note: &SkippedNote, now: i64) -> Result<i64, KiError> {
+        upsert_skipped_sql(self.conn, note, now).map_err(|e| index_err(self.path, &e))
+    }
+
+    pub fn delete_by_path(&mut self, path: &str) -> Result<bool, KiError> {
+        delete_by_path_sql(self.conn, path).map_err(|e| index_err(self.path, &e))
+    }
+}
+
+fn upsert_ok_sql(conn: &Connection, note: &IndexedNote, now: i64) -> rusqlite::Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row("SELECT id FROM note WHERE path = ?1", [&note.path], |r| {
+            r.get(0)
+        })
+        .optional()?;
+
+    let id = match existing {
+        Some(id) => {
+            conn.execute(
+                "UPDATE note SET name_lower = ?2, size = ?3, mtime = ?4,
+                                 status = 'ok', skip_reason = NULL, indexed_at = ?5
+                 WHERE id = ?1",
+                params![id, note.name_lower, size_of(note.size), note.mtime, now],
+            )?;
+            conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
+            conn.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
+            id
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO note(path, name_lower, size, mtime, status, indexed_at)
+                 VALUES(?1, ?2, ?3, ?4, 'ok', ?5)",
+                params![
+                    note.path,
+                    note.name_lower,
+                    size_of(note.size),
+                    note.mtime,
+                    now
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    conn.execute(
+        "INSERT INTO note_fts(rowid, body_ascii) VALUES(?1, ?2)",
+        params![id, note.body_ascii],
+    )?;
+    conn.execute(
+        "INSERT INTO note_fts_zh(rowid, body_tokens) VALUES(?1, ?2)",
+        params![id, note.body_tokens],
+    )?;
+    Ok(id)
+}
+
+fn upsert_skipped_sql(conn: &Connection, note: &SkippedNote, now: i64) -> rusqlite::Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row("SELECT id FROM note WHERE path = ?1", [&note.path], |r| {
+            r.get(0)
+        })
+        .optional()?;
+
+    let id = match existing {
+        Some(id) => {
+            conn.execute(
+                "UPDATE note SET name_lower = ?2, size = ?3, mtime = ?4,
+                                 status = 'skipped', skip_reason = ?5, indexed_at = ?6
+                 WHERE id = ?1",
+                params![
+                    id,
+                    note.name_lower,
+                    size_of(note.size),
+                    note.mtime,
+                    note.reason.as_str(),
+                    now
+                ],
+            )?;
+            conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
+            conn.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
+            id
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO note(path, name_lower, size, mtime, status, skip_reason, indexed_at)
+                 VALUES(?1, ?2, ?3, ?4, 'skipped', ?5, ?6)",
+                params![
+                    note.path,
+                    note.name_lower,
+                    size_of(note.size),
+                    note.mtime,
+                    note.reason.as_str(),
+                    now
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+    Ok(id)
+}
+
+fn delete_by_path_sql(conn: &Connection, path: &str) -> rusqlite::Result<bool> {
+    let id: Option<i64> = conn
+        .query_row("SELECT id FROM note WHERE path = ?1", [path], |r| r.get(0))
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(false);
+    };
+    conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
+    conn.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
+    conn.execute("DELETE FROM note WHERE id = ?1", [id])?;
+    Ok(true)
 }
 
 /// `u64 → i64` 的安全转换。
@@ -599,5 +661,47 @@ mod tests {
         assert_eq!(db.synced_at().expect("初值"), 0);
         db.set_synced_at(NOW).expect("写入");
         assert_eq!(db.synced_at().expect("读回"), NOW);
+    }
+
+    /// 批量写：整批一个事务，写完三条都在。
+    #[test]
+    fn batch_writes_many_rows_in_one_transaction() {
+        let (_dir, mut db) = opened_vault();
+        let notes: Vec<IndexedNote> = (0..8)
+            .map(|i| indexed(&format!("n{i}.md"), "alpha", "al lp"))
+            .collect();
+
+        db.batch(|batch| {
+            for note in &notes {
+                batch.upsert_ok(note, NOW)?;
+            }
+            Ok(())
+        })
+        .expect("批量写入");
+
+        assert_eq!(db.counts().expect("读计数").ok, 8);
+        assert_eq!(db.match_ascii("\"alpha\"", 100).expect("查").len(), 8);
+    }
+
+    /// 批次里任一条失败 → 整批回滚，不留半批。
+    ///
+    /// 这是「分 256 篇一批」的安全前提：崩溃或错误只会丢掉**整批**，
+    /// 不会留下「note 有了、FTS 没有」的行。
+    #[test]
+    fn batch_error_rolls_back_the_whole_batch() {
+        let (_dir, mut db) = opened_vault();
+
+        let result: Result<(), KiError> = db.batch(|batch| {
+            batch.upsert_ok(&indexed("a.md", "alpha", "al lp"), NOW)?;
+            batch.upsert_ok(&indexed("b.md", "bravo", "br ra"), NOW)?;
+            Err(KiError::Index {
+                path: "simulated".to_string(),
+                message: "模拟第 3 篇读取失败".to_string(),
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(db.counts().expect("读计数"), Counts::default());
+        assert!(db.match_ascii("\"alpha\"", 10).expect("查").is_empty());
     }
 }

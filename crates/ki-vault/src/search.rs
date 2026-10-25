@@ -1,41 +1,32 @@
-//! 进程内全文索引（M2 第三刀）。
+//! 字面定位器与进程内全文索引。
 //!
 //! # 这不是搜索引擎
 //!
 //! 匹配规则只有一条：**ASCII 大小写折叠之后的子串匹配**。不模糊、不分词、
-//! 不支持正则。中文天然可用——UTF-8 的子串匹配对中文是精确的，代价是没有任何
-//! 相关性排序（结果只按「文件名命中 > 路径 > 行号」排）。
+//! 不支持正则。中文天然可用——UTF-8 的子串匹配对中文是精确的。
 //!
 //! 为什么不做模糊：用户按 `Cmd+Shift+F` 时想找的是"哪篇笔记写了这句话"，
 //! 不是"哪篇笔记的字母顺序最接近"。模糊匹配在文件名上是对的（见 `quick-open`），
 //! 在正文上只会把噪音排到前面。
 //!
-//! # 为什么只在内存里
+//! # 两个角色，一个实现
 //!
-//! 磁盘上的 Markdown 是唯一真相源（公理 A1）。没有 watcher（B-09）时，
-//! 持久化索引**必然**与磁盘漂移，而且漂移是不可见的：用户改了文件，
-//! 搜出来的还是旧句子，没有任何提示。内存索引把这份风险限制在"本次会话"，
-//! 重新扫描（`vault_scan`）就丢缓存，语义干净。
+//! - [`NoteLocator`]：**给定一篇正文**，找出所有命中行（行号、UTF-16 列号、摘要窗口）。
+//!   它是精度的唯一来源，且与索引无关——`ki-search` 的 FTS5 只决定"哪些笔记进候选"，
+//!   进池之后仍然由它逐行字面判定。
+//! - [`SearchIndex`]：M2 的进程内实现，把整个 Vault 读进内存再逐篇调定位器。
+//!   M4 之后它是**旧引擎**，与新引擎共用同一个 `NoteLocator`——这是"新旧对拍"
+//!   能成立的前提：两条路径的判定逻辑是同一份代码，差异只可能来自候选集。
 //!
-//! 代价写在明处：
+//! # 偏移量约定
 //!
-//! - 冷启动要读一遍全库（1000 篇实测 100–200ms），首次搜索慢；
-//! - 外部改动在重新扫描之前搜不到（B-09 的既有缺口，不是本模块引入的）；
-//! - 内存约为库内正文的 **两倍**（原文 + ASCII 小写副本）。
-//!
-//! M3 会用 `ki-search` 的 FTS5 索引替换本模块。届时"索引可重建"这条不变量
-//! 必须原样保留：删掉索引文件，功能仍然完整，只是第一次搜索变慢。
-//!
-//! # 索引长什么样
-//!
-//! 每篇笔记存两份字符串：原文（切片用）与小写副本（匹配用）。
-//! 小写化只动 ASCII 字母，因此**两份的字节长度逐字节相同**——
-//! 匹配到的字节偏移可以直接拿去切原文，不需要任何偏移换算。
-//! 这是"只折叠 ASCII"这个决定带来的第二个好处（第一个是中文天然可用）。
+//! `fold_ascii` 只映射 `A-Z`，**不改变字节长度**。因此小写副本里的字节偏移
+//! 可以直接拿去切原文，不需要任何偏移换算。这是"只折叠 ASCII"这个决定
+//! 带来的第二个好处（第一个是中文天然可用）。
 
 use std::path::{Path, PathBuf};
 
-use ki_core::{FileNode, KiError, SearchHit, SearchResult};
+use ki_core::{KiError, SearchHit, SearchResult};
 
 use crate::scan::{read_note, scan_vault, ScanOptions};
 
@@ -64,8 +55,11 @@ const SNIPPET_BEFORE: usize = 60;
 /// 它的主要作用不是省流量，而是让"一行 5000 字"的笔记不会把列表撑变形。
 const SNIPPET_CHARS: usize = 240;
 
-/// 一篇进了索引的笔记。
-struct IndexedFile {
+/// 一篇正文的定位器。
+///
+/// 构造之后只读。它同时持有原文与小写副本（内存约为正文两倍），
+/// 换来的是"一次折叠、多次查询"。
+pub struct NoteLocator {
     /// Vault 相对路径（POSIX）。同时是排序键与二分查找键。
     path: String,
     /// 文件名的 ASCII 小写形式。只用来判断「文件名是否也命中」。
@@ -78,13 +72,11 @@ struct IndexedFile {
     line_starts: Vec<u32>,
 }
 
-impl IndexedFile {
-    fn new(path: String, content: String) -> Self {
-        let name = match path.rsplit_once('/') {
-            Some((_, name)) => name,
-            None => path.as_str(),
-        };
-        let name_lower = fold_ascii(note_stem(name));
+impl NoteLocator {
+    pub fn new(path: impl Into<String>, content: impl Into<String>) -> Self {
+        let path = path.into();
+        let content = content.into();
+        let name_lower = name_lower_for_path(&path);
         let lower = fold_ascii(&content);
         let line_starts = line_starts(&content);
         Self {
@@ -96,6 +88,59 @@ impl IndexedFile {
         }
     }
 
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// 文件名的 ASCII 小写形式（已剥扩展名）。
+    pub fn name_lower(&self) -> &str {
+        &self.name_lower
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// 找出这篇正文里最多 `max` 条命中行。
+    ///
+    /// 传入的是**原始 query**（内部自行 trim + 折叠）。查询为空时返回空——
+    /// 空 needle 会让 `find` 在偏移 0 处恒命中，把每篇都变成一条命中。
+    pub fn hits(&self, query: &str, max: usize) -> Vec<SearchHit> {
+        let needle = fold_ascii(query.trim());
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        self.hits_with_needle(&needle, max)
+    }
+
+    /// 已经折叠好的 needle。批量查询时省掉每篇一次 `fold_ascii` 的分配。
+    pub(crate) fn hits_with_needle(&self, needle: &str, max: usize) -> Vec<SearchHit> {
+        if needle.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let name_hit = self.name_lower.contains(needle);
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(max.min(MAX_HITS_PER_FILE));
+        let mut cursor = 0usize;
+
+        // 每轮最多产出一条命中，然后跳到下一行——同一行的后续命中不再单独成条。
+        // 注意 `hits.len()` 而不是 `cursor`：跨行被跳过的命中不消耗每篇的配额。
+        while hits.len() < max {
+            let Some(offset) = self.lower[cursor..].find(needle) else {
+                break;
+            };
+            let at = cursor + offset;
+            if let Some(hit) = self.make_hit(at, needle.len(), name_hit) {
+                hits.push(hit);
+            }
+            cursor = self.next_line_start(at);
+            if cursor >= self.content.len() {
+                break;
+            }
+        }
+
+        hits
+    }
+
     /// 命中位置所在行的下一行起始偏移。用来保证"一行只出一条命中"。
     fn next_line_start(&self, at: usize) -> usize {
         let index = line_index(&self.line_starts, at);
@@ -104,15 +149,72 @@ impl IndexedFile {
             None => self.content.len(),
         }
     }
+
+    /// 组装一条命中；命中横跨两行时返回 `None`。
+    ///
+    /// `at` 是命中在**小写副本**里的字节偏移；因为折叠不改变字节长度，
+    /// 它同时是原文里的偏移。
+    fn make_hit(&self, at: usize, len: usize, name_hit: bool) -> Option<SearchHit> {
+        let index = line_index(&self.line_starts, at);
+        let (line_start, line_end) = line_bounds(&self.content, &self.line_starts, index);
+        let line = &self.content[line_start..line_end];
+
+        let hit_start = at - line_start;
+        if hit_start + len > line.len() {
+            // 查询里带 `\n` 时会走到这里：命中跨行，不属于任何一行。
+            return None;
+        }
+        let hit_end = hit_start + len;
+        let matched = &line[hit_start..hit_end];
+
+        let column = utf16_len(&line[..hit_start]);
+        let column_end = column + utf16_len(matched);
+
+        // 窗口：命中前最多 SNIPPET_BEFORE 个字符，整体不超过 SNIPPET_CHARS 个字符。
+        let mut window_start = hit_start;
+        let mut before = 0usize;
+        while before < SNIPPET_BEFORE {
+            let Some((index, _)) = line[..window_start].char_indices().next_back() else {
+                break;
+            };
+            window_start = index;
+            before += 1;
+        }
+
+        let mut window_end = hit_end;
+        let mut after = 0usize;
+        let budget = SNIPPET_CHARS.saturating_sub(SNIPPET_BEFORE + matched.chars().count());
+        while after < budget {
+            let Some(ch) = line[window_end..].chars().next() else {
+                break;
+            };
+            window_end += ch.len_utf8();
+            after += 1;
+        }
+
+        Some(SearchHit {
+            path: self.path.clone(),
+            line: index as u32 + 1,
+            text: line[window_start..window_end].to_owned(),
+            from: utf16_len(&line[window_start..hit_start]),
+            to: utf16_len(&line[window_start..hit_end]),
+            column,
+            column_end,
+            name_hit,
+        })
+    }
 }
 
-/// 一个 Vault 的全文索引。
+/// 一个 Vault 的全文索引（M2 的旧引擎）。
 ///
 /// 构建之后只读，除了 [`SearchIndex::refresh`]——它把"当前正在编辑的那一篇"
 /// 从磁盘重读一次，让刚打的字立刻能搜到。索引的其余部分在会话内不变。
+///
+/// M4 之后这条路径由 `ki-ipc` 的 `Engine::Memory` 开关选择，只用于新旧对拍
+/// 与回滚。它仍然完整可用——"索引可重建"这条不变量对它是天然的（本来就在内存里）。
 pub struct SearchIndex {
     root: PathBuf,
-    files: Vec<IndexedFile>,
+    files: Vec<NoteLocator>,
     skipped: usize,
     built_ms: u64,
 }
@@ -136,22 +238,21 @@ impl SearchIndex {
         let scan = scan_vault(root, &ScanOptions::default())?;
         let root = PathBuf::from(scan.root);
 
-        let mut entries: Vec<(String, u64)> = Vec::new();
-        collect_files(&scan.tree, &mut entries);
+        let mut entries = crate::scan::flatten_files(&scan.tree);
         // 扫描器的顺序是「目录优先 + 名字不区分大小写」；索引只要一个确定性顺序。
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
 
         let mut files = Vec::with_capacity(entries.len());
         let mut skipped = 0usize;
-        for (path, size) in entries {
+        for entry in entries {
             // 先用扫描时拿到的 size 挡掉超大文件：省一次 open+read。
             // 扫描之后被换掉的文件由 `read_note` 的 10MB 上限兜底。
-            if size > MAX_INDEX_BYTES {
+            if entry.size > MAX_INDEX_BYTES {
                 skipped += 1;
                 continue;
             }
-            match read_note(&root, &path) {
-                Ok(note) => files.push(IndexedFile::new(path, note.content)),
+            match read_note(&root, &entry.path) {
+                Ok(note) => files.push(NoteLocator::new(entry.path, note.content)),
                 Err(_) => skipped += 1,
             }
         }
@@ -189,28 +290,9 @@ impl SearchIndex {
         let mut total = 0usize;
 
         for file in &self.files {
-            let name_hit = file.name_lower.contains(&needle);
-            let mut cursor = 0usize;
-            let mut used = 0usize;
-
-            while used < MAX_HITS_PER_FILE {
-                let Some(offset) = file.lower[cursor..].find(&needle) else {
-                    break;
-                };
-                let at = cursor + offset;
-                // 查询里带换行（正常输入框打不出来，但 IPC 可以被直接调用）时，
-                // 命中可能横跨两行。那种命中没有"哪一行"可言，跳过而不是硬切。
-                if let Some(hit) = make_hit(file, at, needle.len(), name_hit) {
-                    hits.push(hit);
-                    total += 1;
-                    used += 1;
-                }
-                // 同一行的后续命中不再单独成条：跳到下一行。
-                cursor = file.next_line_start(at);
-                if cursor >= file.content.len() {
-                    break;
-                }
-            }
+            let file_hits = file.hits_with_needle(&needle, MAX_HITS_PER_FILE);
+            total += file_hits.len();
+            hits.extend(file_hits);
         }
 
         // 文件名命中优先，再按 path、行号。三者都是确定的，所以结果与遍历顺序无关。
@@ -247,15 +329,12 @@ impl SearchIndex {
     ///
     /// 重读失败就把它从索引里摘掉——磁盘上读不到的文件不该继续贡献命中。
     fn refresh(&mut self, path: &str) {
-        let Ok(index) = self
-            .files
-            .binary_search_by(|file| file.path.as_str().cmp(path))
-        else {
+        let Ok(index) = self.files.binary_search_by(|file| file.path().cmp(path)) else {
             return;
         };
         match read_note(&self.root, path) {
             Ok(note) if note.size <= MAX_INDEX_BYTES => {
-                self.files[index] = IndexedFile::new(path.to_owned(), note.content);
+                self.files[index] = NoteLocator::new(path.to_owned(), note.content);
             }
             _ => {
                 self.files.remove(index);
@@ -272,7 +351,7 @@ impl SearchIndex {
 /// 刻意不做 Unicode 大小写折叠：`İ` 的小写是 `i̇`（两个码位），长度会变，
 /// 那套偏移映射足以写出一个月的 bug；而全角 `Ａ` 与半角 `A` 也不该互相命中
 /// （它们是不同的字符，用户输入哪个就该搜哪个）。
-fn fold_ascii(input: &str) -> String {
+pub fn fold_ascii(input: &str) -> String {
     input
         .chars()
         .map(|c| {
@@ -283,6 +362,36 @@ fn fold_ascii(input: &str) -> String {
             }
         })
         .collect()
+}
+
+/// 去掉笔记扩展名之后的文件名。
+///
+/// 不剥的话，查询 `md` 会让库里**每一篇**都算"文件名命中"，排序立刻失去意义。
+pub fn note_stem(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(index) => {
+            let suffix = &name[index..];
+            if suffix.eq_ignore_ascii_case(".md") || suffix.eq_ignore_ascii_case(".markdown") {
+                &name[..index]
+            } else {
+                name
+            }
+        }
+        None => name,
+    }
+}
+
+/// 一个 Vault 相对路径对应的 `name_lower`。
+///
+/// 这是**唯一**的规则：`ki-store` 的 `note.name_lower` 列与 `NoteLocator`
+/// 必须由它算出来。两处各写一遍的话，文件名通道会与定位器对不上，
+/// 表现为"文件名命中排在后面"这种没有报错、只是看起来不对劲的 bug。
+pub fn name_lower_for_path(path: &str) -> String {
+    let name = match path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => path,
+    };
+    fold_ascii(note_stem(name))
 }
 
 fn line_starts(content: &str) -> Vec<u32> {
@@ -316,89 +425,4 @@ fn line_bounds(content: &str, starts: &[u32], index: usize) -> (usize, usize) {
 
 fn utf16_len(text: &str) -> u32 {
     text.chars().map(|c| c.len_utf16() as u32).sum()
-}
-
-/// 组装一条命中；命中横跨两行时返回 `None`。
-///
-/// `at` 是命中在**小写副本**里的字节偏移；因为折叠不改变字节长度，
-/// 它同时是原文里的偏移。
-fn make_hit(file: &IndexedFile, at: usize, len: usize, name_hit: bool) -> Option<SearchHit> {
-    let index = line_index(&file.line_starts, at);
-    let (line_start, line_end) = line_bounds(&file.content, &file.line_starts, index);
-    let line = &file.content[line_start..line_end];
-
-    let hit_start = at - line_start;
-    if hit_start + len > line.len() {
-        // 查询里带 `\n` 时会走到这里：命中跨行，不属于任何一行。
-        return None;
-    }
-    let hit_end = hit_start + len;
-    let matched = &line[hit_start..hit_end];
-
-    let column = utf16_len(&line[..hit_start]);
-    let column_end = column + utf16_len(matched);
-
-    // 窗口：命中前最多 SNIPPET_BEFORE 个字符，整体不超过 SNIPPET_CHARS 个字符。
-    let mut window_start = hit_start;
-    let mut before = 0usize;
-    while before < SNIPPET_BEFORE {
-        let Some((index, _)) = line[..window_start].char_indices().next_back() else {
-            break;
-        };
-        window_start = index;
-        before += 1;
-    }
-
-    let mut window_end = hit_end;
-    let mut after = 0usize;
-    let budget = SNIPPET_CHARS.saturating_sub(SNIPPET_BEFORE + matched.chars().count());
-    while after < budget {
-        let Some(ch) = line[window_end..].chars().next() else {
-            break;
-        };
-        window_end += ch.len_utf8();
-        after += 1;
-    }
-
-    Some(SearchHit {
-        path: file.path.clone(),
-        line: index as u32 + 1,
-        text: line[window_start..window_end].to_owned(),
-        from: utf16_len(&line[window_start..hit_start]),
-        to: utf16_len(&line[window_start..hit_end]),
-        column,
-        column_end,
-        name_hit,
-    })
-}
-
-/// 去掉笔记扩展名之后的文件名。
-///
-/// 不剥的话，查询 `md` 会让库里**每一篇**都算"文件名命中"，排序立刻失去意义。
-fn note_stem(name: &str) -> &str {
-    match name.rfind('.') {
-        Some(index) => {
-            let suffix = &name[index..];
-            if suffix.eq_ignore_ascii_case(".md") || suffix.eq_ignore_ascii_case(".markdown") {
-                &name[..index]
-            } else {
-                name
-            }
-        }
-        None => name,
-    }
-}
-
-/// 把树压成 `(相对路径, 字节数)`。用显式栈，与扫描器的深度上限无关。
-fn collect_files(tree: &FileNode, out: &mut Vec<(String, u64)>) {
-    let mut stack = vec![tree];
-    while let Some(node) = stack.pop() {
-        if let Some(children) = &node.children {
-            for child in children {
-                stack.push(child);
-            }
-        } else {
-            out.push((node.path.clone(), node.size));
-        }
-    }
 }

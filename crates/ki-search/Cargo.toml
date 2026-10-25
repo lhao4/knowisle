@@ -1,0 +1,12 @@
+[package]
+name = "ki-search"
+description = "知屿 KnowIsle 的检索规则：bigram 切分、ASCII 投影、查询计划、RRF 融合（纯函数，零依赖）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 刻意**零依赖**：这个 crate 只有字符串处理与排序，没有任何 IO。
+# 这样它可以用十万组随机 case 做 property test 而不链 SQLite（毫秒级），
+# 也能被将来的 CLI / WASM / RAG 直接复用。
+[dependencies]

@@ -25,7 +25,9 @@ mod repo;
 mod schema;
 
 pub use db::{IndexDb, OpenOutcome, RebuildReason};
-pub use repo::{Candidate, Counts, IndexedNote, NoteState, SkipReason, SkippedNote, SyncStats};
+pub use repo::{
+    Candidate, Counts, IndexedNote, NoteBatch, NoteState, SkipReason, SkippedNote, SyncStats,
+};
 pub use schema::{DB_FILE, SCHEMA_VERSION, TOKENIZER_VERSION};
 
 /// 测试夹具。放在 crate 里而不是 `tests/` 下，是因为它们要用 `IndexDb::conn()`
