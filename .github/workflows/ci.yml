@@ -94,7 +94,13 @@ jobs:
       # 于是没人会跑。
       #
       # 用 `-e normal` 排除 dev-dependencies：测试里用什么是另一回事。
+      #
+      # `shell: bash` 是**必需**的，不是风格选择：Windows runner 上 `run:` 的
+      # 默认 shell 是 pwsh，而 `if cmd \` + `| grep` 这套续行与管道在 PowerShell
+      # 里是语法错误（`Missing '(' after 'if'`），会红在一个跟依赖毫无关系的
+      # 解析错误上。GitHub 的 windows-latest 自带 Git Bash，写死更省事。
       - name: Layering guard (core / vault / search stay IO-free)
+        shell: bash
         run: |
           if cargo tree -p ki-core -p ki-vault -p ki-search -e normal \
                | grep -qiE 'rusqlite|libsqlite3'; then
