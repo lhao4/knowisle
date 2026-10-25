@@ -2,30 +2,74 @@
 
 > 把知识，安放在自己的岛上。
 
-本地优先、AI 驱动的开源 Markdown 个人知识库。所有笔记都是磁盘上普通的 `.md` 文件，索引与数据库只是可以随时重建的派生物 —— 删掉应用，你的知识还在原地。
+本地优先的开源 Markdown 个人知识库。所有笔记都是磁盘上普通的 `.md` 文件，索引与数据库只是可以随时重建的派生物 —— 删掉应用，你的知识还在原地。
 
-当前处于 **M0（骨架）** 阶段：Vault 扫描、文件树、只读渲染链路已打通，检索与 AI 能力尚未开始。
+![演示](docs/assets/demo.gif)
+
+## 现在能做什么
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| Vault 扫描与文件树 | 已实现 | 磁盘上有的目录树里就有；空文件夹也不藏 |
+| Markdown 编辑 | 已实现 | CodeMirror 6，语法高亮、加粗/斜体、撤销栈 |
+| 崩溃安全保存 | 已实现 | 写入走 `tmp → fsync → rename`；CI 里真的 `kill -9` 验证 |
+| 快速打开 | 已实现 | `Cmd/Ctrl+P`，子序列模糊匹配 |
+| 全文搜索 | 已实现 | `Cmd/Ctrl+Shift+F`，中文按词切分 |
+| 大纲 | 已实现 | 随光标高亮当前章节 |
+| 新建 / 重命名 / 删除 | 已实现 | 删除进回收目录，不直接抹掉 |
+| 主题 | 已实现 | 跟随系统 / 浅色 / 深色，首帧就生效，不闪白 |
+| 安装包 | 已实现 | Windows msi/nsis、macOS dmg、Linux AppImage |
+| 检索索引（FTS5 + jieba） | 未开始 | 当前是首次搜索时把全库读进内存建索引、内存子串匹配；规模上去必须换 |
+| AI 能力 | 未开始 | — |
+| 多端同步 | 未开始 | — |
+
+当前处于 **M3** 阶段：单机可用、能装能编辑。里程碑与验收口径见 [`docs/MVP-SCOPE.md`](docs/MVP-SCOPE.md)。
+
+## 快捷键
+
+| 键 | 动作 |
+|---|---|
+| `Cmd/Ctrl+P` | 快速打开 |
+| `Cmd/Ctrl+Shift+F` | 全文搜索 |
+| `Cmd/Ctrl+N` | 新建笔记 |
+| `Cmd/Ctrl+\` | 收起 / 展开侧栏 |
+| `Cmd/Ctrl+S` | 立即保存（平时自动保存） |
+| `Cmd/Ctrl+B` / `Cmd/Ctrl+I` | 加粗 / 斜体 |
 
 ## 技术栈
 
 | 层 | 选型 |
 |---|---|
 | 外壳 | Tauri 2（Rust core + 系统 WebView） |
-| 前端 | React 19 + TypeScript + Vite 8 + TanStack Router |
+| 前端 | React 19 + TypeScript + Vite 8 |
 | 编辑器 | CodeMirror 6（唯一主编辑内核） |
-| 存储 | SQLite + rusqlite（bundled）+ refinery 迁移，手写 Repository |
-| 检索 | jieba-rs 预分词 + FTS5 双通道 + RRF 融合 |
+| 存储 | SQLite + rusqlite（bundled）+ refinery 迁移，手写 Repository，不用 ORM |
+| 检索 | jieba-rs 预分词 + FTS5 双通道 + RRF 融合（尚未接入） |
 | 样式 | Tailwind v4 + 三层 CSS 变量 token |
+| IPC 契约 | tauri-specta 生成 `bindings.ts` 并入库，CI 校验漂移 |
 
 架构决策的完整依据见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，它是本项目的唯一真相源；改动架构前先写 ADR，再改文档。
+
+### 五条不可协商的约束
+
+1. 磁盘上的 Markdown 是唯一真相源，DB 只是可重建的派生索引。
+2. 核心逻辑不依赖 UI：`isle` CLI 与 GUI 共享 `ki-core`，core 内禁止出现 `tauri::`。
+3. 编辑态（CodeMirror）与渲染态（remark/rehype）是两条独立管线。
+4. 启动关键路径上不允许出现任何插件代码。
+5. 所有写操作必须 `tmp → fsync → rename`，崩溃后可自愈。
 
 ## 目录结构
 
 ```
-crates/          # Rust 工作区：ki-core / ki-vault / ki-store / ki-search ...
-apps/desktop/    # Tauri 应用：src-tauri（Rust 外壳）+ src（React 前端）
-packages/        # 共享 TS 包：ui / editor / sdk / bindings
-docs/            # 架构与范围文档
+crates/
+  ki-core/       # 领域模型与错误模型（无 UI、无 IO 框架）
+  ki-vault/      # Vault 扫描、读写、崩溃安全落盘
+  ki-ipc/        # Tauri 命令层（≤15 行/命令：解包 → 调 service → 序列化）
+apps/desktop/
+  src-tauri/     # 应用壳：注册插件、起窗口、关窗前落盘
+  src/           # React 前端
+docs/            # 架构、范围、里程碑
+scripts/         # CI 用的验收脚本（崩溃一致性、性能）
 ```
 
 ## 本地环境要求
@@ -36,16 +80,6 @@ docs/            # 架构与范围文档
 | pnpm | 12.15.0 | 由 `packageManager` 字段固定，建议用 corepack 启用 |
 | Rust | stable (msvc) | Windows 下必须是 `x86_64-pc-windows-msvc` 工具链 |
 | WebView2 | 系统自带 | Windows 10/11 默认已安装 |
-
-### 两个必须保留的配置（踩过的坑）
-
-**1. pnpm 必须使用 `nodeLinker: hoisted`**
-
-见 [`pnpm-workspace.yaml`](pnpm-workspace.yaml)。Windows 下创建目录符号链接需要开发者模式或管理员权限，缺权限时 pnpm 的默认隔离布局会**静默失败**——安装看似成功，运行时却找不到模块。`hoisted` 用真实目录代替 symlink，代价是失去 pnpm 的严格依赖隔离，换来「在任何 Windows 机器上 `pnpm install` 都不会静默失败」。
-
-**2. Vite 必须显式绑定 `server.host: '127.0.0.1'`**
-
-见 [`apps/desktop/vite.config.ts`](apps/desktop/vite.config.ts)。Node 18+ 的 `localhost` 在 Windows 上会优先解析到 `::1`，于是 Vite 只监听 `[::1]:1420`；而 WebView2 解析 `localhost` 时优先走 `127.0.0.1`，结果就是**应用窗口一片空白、控制台没有任何报错**。`tauri.conf.json` 的 `devUrl` 因此也写死为 `http://127.0.0.1:1420`，两处必须一致。
 
 ## 快速开始
 
@@ -62,7 +96,41 @@ pnpm typecheck    # tsc -b，全工作区
 pnpm lint         # oxlint
 pnpm check        # cargo check --workspace
 pnpm test         # cargo test --workspace
+pnpm bindings:check   # IPC 契约是否漂移
 ```
+
+出安装包：
+
+```bash
+cd apps/desktop && pnpm exec tauri build --bundles nsis --ci
+```
+
+## 三个必须保留的配置（都踩过坑）
+
+**1. pnpm 必须使用 `nodeLinker: hoisted`**
+
+见 [`pnpm-workspace.yaml`](pnpm-workspace.yaml)。Windows 下创建目录符号链接需要开发者模式或管理员权限，缺权限时 pnpm 的默认隔离布局会**静默失败**——安装看似成功，运行时却找不到模块。`hoisted` 用真实目录代替 symlink，代价是失去 pnpm 的严格依赖隔离，换来「在任何 Windows 机器上 `pnpm install` 都不会静默失败」。
+
+**2. Vite 必须显式绑定 `server.host: '127.0.0.1'`**
+
+见 [`apps/desktop/vite.config.ts`](apps/desktop/vite.config.ts)。Node 18+ 的 `localhost` 在 Windows 上会优先解析到 `::1`，于是 Vite 只监听 `[::1]:1420`；而 WebView2 解析 `localhost` 时优先走 `127.0.0.1`，结果就是**应用窗口一片空白、控制台没有任何报错**。`tauri.conf.json` 的 `devUrl` 因此也写死为 `http://127.0.0.1:1420`，两处必须一致。
+
+**3. 契约导出器必须用 feature 门控**
+
+见 [`apps/desktop/src-tauri/Cargo.toml`](apps/desktop/src-tauri/Cargo.toml)。`tauri build` 会把 crate 里**所有** bin 一起塞进安装包——不加 `required-features` 时，内部工具 `export_bindings.exe` 会跟着发出去，实测让 NSIS 载荷多出 3.76MB（占 38%）。
+
+## 性能预算
+
+数字写在 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的 2.7 节，由 CI 与 `scripts/` 下的脚本守着。两条冷启动指标分开量，因为量到的根本不是一回事：
+
+| 指标 | 预算 | 实测（本机 Windows） |
+|---|---|---|
+| K1 窗口首次可见 | ≤ 600ms | p95 395ms |
+| K2 侧栏树渲染完 | ≤ 2000ms | p95 1774ms |
+| 安装包（msi / nsis / dmg） | ≤ 20MiB | 3.29 / 2.27 / 2.68 MiB |
+| 安装包（AppImage） | ≤ 100MiB | 77.6 MiB（内含 WebKitGTK） |
+
+K2 那 1.7 秒里有约 1.7 秒是 Tauri + WebView2 的进程与环境初始化：把前端换成一张 165 字节的空白页，这个数仍然是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度。
 
 ## 许可证
 

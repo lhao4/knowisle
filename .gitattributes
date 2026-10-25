@@ -9,6 +9,7 @@
 
 # 二进制
 *.png binary
+*.gif binary
 *.jpg binary
 *.ico binary
 *.icns binary

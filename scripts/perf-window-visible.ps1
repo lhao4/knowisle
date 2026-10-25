@@ -1,4 +1,4 @@
-# 冷启动 K1：从 CreateProcess 到窗口首次可见（IsWindowVisible = true）。
+﻿# 冷启动 K1：从 CreateProcess 到窗口首次可见（IsWindowVisible = true）。
 #
 # 为什么不用 CDP 那条路：那条必须给 WebView2 加 `--no-sandbox` 与
 # `--remote-debugging-port`，两者都会改变浏览器的进程模型与启动路径，

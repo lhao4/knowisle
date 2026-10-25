@@ -926,7 +926,7 @@ export default function App() {
         <div className="brand">
           <span className="brand__mark">◈</span>
           <span className="brand__name">知屿 KnowIsle</span>
-          <span className="brand__tag">M2</span>
+          <span className="brand__tag">M3</span>
         </div>
 
         {/*
