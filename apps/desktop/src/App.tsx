@@ -8,8 +8,10 @@ import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
 import { Outline, type OutlineHandle } from './components/Outline'
 import { QuickOpen } from './components/QuickOpen'
 import { SearchOverlay } from './components/SearchOverlay'
+import { ThemeToggle } from './components/ThemeToggle'
 import type { OutlineItem } from './lib/outline'
 import { flattenVault, type QuickItem } from './lib/quick-open'
+import { useTheme } from './lib/theme'
 import {
   appPing,
   describeError,
@@ -132,6 +134,17 @@ export default function App() {
    * 建表摊到每一次击键上，而结果每次都一样。
    */
   const quickItems = useRef<QuickItem[]>([])
+
+  /**
+   * 主题。
+   *
+   * 状态**只**落在这里与 `<html data-theme>` 上：它绝不进 `NoteEditor` 的
+   * props 或 `docId`，否则切主题会重建 `EditorState`，撤销栈与光标一起归零。
+   * 编辑器里所有颜色都走 `var(--ki-*)`，覆盖 L2 即自动跟随。
+   *
+   * 首帧的值由 `index.html` 的内联脚本设好，这里管的是之后的每一次变化。
+   */
+  const { pref: themePref, cycle: cycleTheme } = useTheme()
 
   /**
    * 安装一次扫描结果：树进 state，扁平候选表进 ref。
@@ -726,9 +739,14 @@ export default function App() {
         <div className="brand">
           <span className="brand__mark">◈</span>
           <span className="brand__name">知屿 KnowIsle</span>
-          <span className="brand__tag">M1</span>
+          <span className="brand__tag">M2</span>
         </div>
 
+        {/*
+          这个容器是**唯一**在「还没打开库」时也在的横条。主题按钮挂在这里
+          而不是侧栏：侧栏在未打开库时整块是 placeholder，按钮挂那儿会在
+          首次启动、还没选库时消失——而那正是最需要切主题的时刻。
+        */}
         <div className="topbar__actions">
           {vault && (
             <span className="stats" title={vault.root}>
@@ -736,6 +754,7 @@ export default function App() {
               {vault.skipped > 0 && ` · 跳过 ${vault.skipped}`}
             </span>
           )}
+          <ThemeToggle pref={themePref} onCycle={cycleTheme} />
           <button type="button" className="btn" onClick={pickVault} disabled={busy}>
             {busy ? '扫描中…' : '选择文件夹'}
           </button>

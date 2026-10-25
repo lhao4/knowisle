@@ -2,6 +2,35 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <!--
+      主题必须在**这里**定下来，早于任何一次渲染。
+
+      等 React 挂载再设就晚了一帧——暗色系统里启动闪一下白底，用户会直接
+      归因为「这软件不做暗色」。所以这段同步内联脚本放在 `<head>` 最前面，
+      `data-theme` 会在 `<body>` 被解析之前就挂到 `<html>` 上。
+
+      它与 `src/lib/theme.ts` 是同一套判定（读 key → 校验 → 回落 matchMedia），
+      两份都改才算改：内联脚本不能 import 模块，那是异步的。
+
+      任何异常（隐私模式下 `localStorage` 的 getter 会直接抛）都静默回落到
+      系统主题——启动关键路径上不许出现未捕获异常，白屏比"主题记不住"严重得多。
+    -->
+    <script>
+      (function () {
+        var pref = 'system'
+        try {
+          var saved = localStorage.getItem('knowisle.theme')
+          if (saved === 'system' || saved === 'light' || saved === 'dark') pref = saved
+        } catch (e) {
+          /* 隐私模式：当作没存过 */
+        }
+        var dark = pref === 'dark'
+        if (pref === 'system') {
+          dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+        }
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+      })()
+    </script>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>知屿 KnowIsle</title>

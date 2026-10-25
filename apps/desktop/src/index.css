@@ -3,45 +3,114 @@
  *
  * 但 token 结构现在就按架构文档 ADR-006 的三层建好：
  *   L1 Primitive（物理色值） → L2 Semantic（语义） → 组件直接消费 L2
- * 因为写死 `#2563eb` 的地方，以后换主题要一个个改；
+ * 因为写死色值的地方，以后换主题要一个个改；
  * 而写 `var(--ki-accent)` 的地方，加主题只是覆盖一层变量。
- * Tailwind 在 M2 接入，届时这套变量原封不动地变成 @theme。
+ * 暗色就是这条性质的第一次兑现：`[data-theme='dark']` 只覆写 L2，组件零改动。
+ * Tailwind 在 M2 之后接入，届时这套变量原封不动地变成 @theme。
  */
 
 :root {
-  /* L1 · Primitive */
+  /* ── L1 · Primitive ──────────────────────────────────────────────
+   *
+   * 物理色板。组件**永远不**直接引用这一层——`var(--ki-slate-400)` 出现在
+   * 组件规则里就是漏了一层。名字沿用 zinc 的档位，但值是"物理"的：
+   * 不承诺与任何色板一致，只承诺"这一档有多亮"。
+   *
+   * 同一档在两种主题下都会被引用（`--ki-slate-900` 在亮色是正文色，
+   * 在暗色是侧栏底色），所以**加主题时一个已有值都不许改**。
+   */
+  --ki-white: #ffffff;
   --ki-slate-50: #fafafa;
   --ki-slate-100: #f4f4f5;
   --ki-slate-200: #e4e4e7;
   --ki-slate-400: #a1a1aa;
   --ki-slate-500: #71717a;
+  --ki-slate-600: #52525b;
   --ki-slate-700: #3f3f46;
+  --ki-slate-800: #27272a;
+  --ki-slate-850: #1f1f23;
   --ki-slate-900: #18181b;
-  --ki-blue-500: #2563eb;
+  --ki-slate-950: #0f0f11;
   --ki-blue-50: #eff6ff;
+  --ki-blue-400: #60a5fa;
+  --ki-blue-500: #2563eb;
+  /* 刻意**不是** tailwind 的 blue-900（#1e3a8a）：那个值对暗色画布只有
+   * 1.85:1，树里的"当前笔记"与编辑器选区会双双消失。这一档是按"在
+   * #0f0f11 上要 ≥3:1"定的（实测 3.37:1），不是按色板序号定的。 */
+  --ki-blue-900: #41689e;
+  --ki-amber-50: #fffbeb;
   --ki-amber-100: #fef3c7;
   --ki-amber-600: #d97706;
+  --ki-amber-700: #b45309;
+  --ki-amber-900: #78350f;
+  /* 只给暗色用的"柔和底色"（横幅）。亮色对应的是 -50 那一档。 */
+  --ki-amber-950: #241a08;
+  --ki-red-50: #fef2f2;
+  --ki-red-400: #f87171;
   --ki-red-600: #dc2626;
   --ki-red-700: #b91c1c;
+  --ki-red-950: #2a1416;
 
-  /* L2 · Semantic */
-  --ki-bg-canvas: #ffffff;
+  /* ── L2 · Semantic ───────────────────────────────────────────────
+   *
+   * 组件只认这一层。主题切换 = 覆写这一层，别的什么都不动。
+   */
+  --ki-bg-canvas: var(--ki-white);
   --ki-bg-surface: var(--ki-slate-50);
   --ki-bg-hover: var(--ki-slate-100);
   --ki-bg-active: var(--ki-blue-50);
+  --ki-bg-code: var(--ki-slate-200);
+  --ki-bg-disabled: var(--ki-slate-400);
   --ki-text-primary: var(--ki-slate-900);
   --ki-text-muted: var(--ki-slate-500);
   --ki-text-faint: var(--ki-slate-400);
   --ki-border-subtle: var(--ki-slate-200);
+  --ki-border-strong: var(--ki-slate-400);
   --ki-border-quote: var(--ki-slate-400);
-  --ki-bg-code: var(--ki-slate-200);
+
   --ki-accent: var(--ki-blue-500);
+  /* accent 的"实心"版本：按钮底色。与 `--ki-accent` 分开是因为两者对明度的
+   * 要求相反——文字色要够亮才看得清，实心底色要够深才压得住白字。 */
+  --ki-accent-solid: var(--ki-blue-500);
+  --ki-accent-solid-hover: var(--ki-blue-500);
+  --ki-on-accent: var(--ki-white);
+  /* 选中态（树 / 大纲 / 浮层列表 / 右键菜单）上的文字。
+   * 不直接用 `--ki-accent`：`--ki-bg-active` 在暗色下必须够亮（见暗色块），
+   * 亮底上再压 accent 只剩 2.2:1。拆成 token 之后 light 侧取 accent，
+   * 视觉零变化。 */
+  --ki-text-on-active: var(--ki-accent);
+
   /* 破坏性动作。只有"这一步做错了要丢东西"的按钮用它——
-   * 用得多就等于没有强调，所以它刻意不参与普通按钮的 hover 体系。 */
+   * 用得多就等于没有强调，所以它刻意不参与普通按钮的 hover 体系。
+   *
+   * 一个值当两种用途时，暗色下必然有一头是错的：它同时是错误提示的**文字色**
+   * （要浅）与危险按钮的**底色**（要深，才压得住白字）。所以拆成三档。 */
   --ki-danger: var(--ki-red-600);
-  --ki-danger-hover: var(--ki-red-700);
-  /* 搜索命中的底色。刻意用暖色：它必须在一屏冷色的正文里一眼跳出来。 */
+  --ki-danger-solid: var(--ki-red-600);
+  --ki-danger-solid-hover: var(--ki-red-700);
+  --ki-on-danger: var(--ki-white);
+
+  /* 警告横幅（保存冲突）。文字与底色分开，理由同 danger。
+   * 亮色用 amber-700 而不是原来的 amber-600：后者压在 amber-50 上只有
+   * 3.07:1，横幅里那句话是正文，达不到 4.5。这是本刀唯一改动的亮色数值。 */
+  --ki-warn: var(--ki-amber-700);
+  --ki-bg-warn-soft: var(--ki-amber-50);
+  --ki-bg-danger-soft: var(--ki-red-50);
+
+  /* 搜索命中的底色。刻意用暖色：它必须在一屏冷色的正文里一眼跳出来。
+   * 暗色换成 amber-900（白字 9:1）——沿用 amber-100 会得到"亮黄块 + 白字"。 */
   --ki-bg-mark: var(--ki-amber-100);
+
+  /* 浮层遮罩。三档对应"用户要做多大的决定"：看 / 输名字 / 丢文件。
+   * 它是 alpha 合成，不是物理色，所以留在 L2。 */
+  --ki-scrim-weak: rgb(24 24 27 / 22%);
+  --ki-scrim-strong: rgb(24 24 27 / 32%);
+  --ki-scrim-max: rgb(24 24 27 / 44%);
+
+  /* 浮层投影。整条 shadow 收进 token（含几何）：暗色下投影要靠"更黑"而不是
+   * "更亮"来分层，几何不变、颜色必须换，拆开写就一定会漏一处。 */
+  --ki-shadow-panel: 0 16px 48px rgb(24 24 27 / 24%);
+  --ki-shadow-menu: 0 8px 24px rgb(24 24 27 / 18%);
 
   --ki-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --ki-font-mono: ui-monospace, 'Cascadia Code', Consolas, 'Microsoft YaHei Mono', monospace;
@@ -62,6 +131,72 @@
   color: var(--ki-text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/*
+ * ── 暗色 ────────────────────────────────────────────────────────
+ *
+ * **只覆写 L2**，L1 一个值都不动。
+ *
+ * 选择器是 `[data-theme='dark']` 而不是 `@media (prefers-color-scheme: dark)`：
+ * 「跟随系统」在写属性之前就解析掉了，所以"系统暗 + 用户手动选亮"不会打架，
+ * 两条路径（跟随 / 手选）在 CSS 里是同一条。`@media` 版本则必须把整套变量
+ * 再写一遍，两处漂移是必然的。
+ *
+ * `color-scheme` 不是装饰：滚动条、原生 `<input>`、`::selection`、WebView 的
+ * 默认背景全靠它。漏了会得到"大部分是暗的，滚动条是白的"。
+ */
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --ki-bg-canvas: var(--ki-slate-950);
+  --ki-bg-surface: var(--ki-slate-900);
+  --ki-bg-hover: var(--ki-slate-850);
+  /* 选中态底色。**这是暗色里最容易选错的一个值**：直觉会配"极深的蓝"，
+   * 但 #1e2a4a 对画布只有 1.35:1——树里的"当前笔记"和编辑器选区双双看不见。
+   * 这一档是 blue-900（3.37:1），见 L1 里的说明。 */
+  --ki-bg-active: var(--ki-blue-900);
+  --ki-bg-code: var(--ki-slate-800);
+  --ki-bg-disabled: var(--ki-slate-700);
+  --ki-text-primary: var(--ki-slate-100);
+  --ki-text-muted: var(--ki-slate-400);
+  /* 比 muted 再暗一档。注意方向与亮色相反：亮色里 faint 更亮（更淡），
+   * 暗色里 faint 更暗（也更淡）。语义不变——faint 永远比 muted 次要。 */
+  --ki-text-faint: var(--ki-slate-500);
+  --ki-border-subtle: var(--ki-slate-800);
+  --ki-border-strong: var(--ki-slate-600);
+  --ki-border-quote: var(--ki-slate-600);
+
+  /* 文字用的 accent 必须够亮（对画布 7.6:1），按钮底色则必须够深。 */
+  --ki-accent: var(--ki-blue-400);
+  --ki-accent-solid: var(--ki-blue-500);
+  --ki-accent-solid-hover: var(--ki-blue-500);
+  --ki-on-accent: var(--ki-white);
+  /* 亮底（blue-900）上的文字：近白，对 #41689e 是 5.2:1。 */
+  --ki-text-on-active: var(--ki-slate-100);
+
+  /* 错误文字要浅（red-400），危险按钮底色要深（red-700，白字 6.5:1）。 */
+  --ki-danger: var(--ki-red-400);
+  --ki-danger-solid: var(--ki-red-700);
+  --ki-danger-solid-hover: var(--ki-red-600);
+  --ki-on-danger: var(--ki-white);
+
+  --ki-warn: var(--ki-amber-600);
+  --ki-bg-warn-soft: var(--ki-amber-950);
+  --ki-bg-danger-soft: var(--ki-red-950);
+
+  --ki-bg-mark: var(--ki-amber-900);
+
+  /* 暗色下"半透明黑"要更重才有遮罩感：底本来就接近黑，
+   * 22% 的黑在 #0f0f11 上几乎看不出层次。 */
+  --ki-scrim-weak: rgb(0 0 0 / 55%);
+  --ki-scrim-strong: rgb(0 0 0 / 65%);
+  --ki-scrim-max: rgb(0 0 0 / 72%);
+
+  /* 投影在暗色下只能靠"更黑"分层：亮色那份 24% 的 #18181b 压在 #0f0f11 上
+   * 几乎不可见，而纯黑加深到 55% 才让浮层"浮"起来。 */
+  --ki-shadow-panel: 0 16px 48px rgb(0 0 0 / 55%);
+  --ki-shadow-menu: 0 8px 24px rgb(0 0 0 / 45%);
 }
 
 * {
@@ -120,7 +255,7 @@ body {
 .brand__tag {
   padding: 1px 6px;
   border-radius: 4px;
-  background: var(--ki-slate-200);
+  background: var(--ki-bg-code);
   color: var(--ki-text-muted);
   font-size: 10px;
   font-weight: 600;
@@ -154,12 +289,52 @@ body {
 
 .btn:hover:not(:disabled) {
   background: var(--ki-bg-hover);
-  border-color: var(--ki-slate-400);
+  border-color: var(--ki-border-strong);
 }
 
 .btn:disabled {
   color: var(--ki-text-faint);
   cursor: progress;
+}
+
+/*
+ * 主题切换按钮。刻意**不继承 `.btn`**：
+ *
+ * 1. `.btn` 带 120ms 的背景过渡（服务于 hover）。挂在它下面的话，切主题时
+ *    按钮底色会独自渐变 120ms，而周围是瞬间切换——一帧错色被拉成一段错色。
+ * 2. 三态需要一个固定宽度的标签（「跟随系统」比「亮色」宽一倍），
+ *    否则每点一次顶栏都会左右抖一下。
+ */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 6px;
+  background: var(--ki-bg-canvas);
+  color: var(--ki-text-muted);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.theme-toggle:hover {
+  background: var(--ki-bg-hover);
+  border-color: var(--ki-border-strong);
+  color: var(--ki-text-primary);
+}
+
+.theme-toggle__icon {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--ki-accent);
+}
+
+/* 四个汉字（跟随系统）在 12px 下是 48px，留一点余量避免贴边。 */
+.theme-toggle__label {
+  min-width: 52px;
+  text-align: left;
 }
 
 .banner {
@@ -171,13 +346,13 @@ body {
 }
 
 .banner--error {
-  background: #fef2f2;
-  color: var(--ki-red-600);
+  background: var(--ki-bg-danger-soft);
+  color: var(--ki-danger);
 }
 
 .banner--warn {
-  background: #fffbeb;
-  color: var(--ki-amber-600);
+  background: var(--ki-bg-warn-soft);
+  color: var(--ki-warn);
   /* 冲突横幅里带一个按钮，所以不能只用 pre-wrap 排文本。 */
   display: flex;
   align-items: center;
@@ -193,22 +368,22 @@ body {
 
 /* 确认类动作（新建 / 重命名）。整屏只有一个，用 accent 把它和「取消」分开。 */
 .btn--primary {
-  border-color: var(--ki-accent);
-  background: var(--ki-accent);
-  color: #fff;
+  border-color: var(--ki-accent-solid);
+  background: var(--ki-accent-solid);
+  color: var(--ki-on-accent);
 }
 
 .btn--primary:hover:not(:disabled) {
-  border-color: var(--ki-blue-500);
-  background: var(--ki-blue-500);
+  border-color: var(--ki-accent-solid-hover);
+  background: var(--ki-accent-solid-hover);
   filter: brightness(1.08);
 }
 
 .btn--primary:disabled {
   /* 与 `.btn:disabled` 的灰字区分：这里底色还在，只是变淡。 */
-  background: var(--ki-slate-400);
-  border-color: var(--ki-slate-400);
-  color: #fff;
+  background: var(--ki-bg-disabled);
+  border-color: var(--ki-bg-disabled);
+  color: var(--ki-on-accent);
 }
 
 /*
@@ -218,20 +393,20 @@ body {
  * 粉红，看起来像"被禁用"。改用更深的一档（L1 的 red-700）。
  */
 .btn--danger {
-  border-color: var(--ki-danger);
-  background: var(--ki-danger);
-  color: #fff;
+  border-color: var(--ki-danger-solid);
+  background: var(--ki-danger-solid);
+  color: var(--ki-on-danger);
 }
 
 .btn--danger:hover:not(:disabled) {
-  border-color: var(--ki-danger-hover);
-  background: var(--ki-danger-hover);
+  border-color: var(--ki-danger-solid-hover);
+  background: var(--ki-danger-solid-hover);
 }
 
 .btn--danger:disabled {
-  border-color: var(--ki-slate-400);
-  background: var(--ki-slate-400);
-  color: #fff;
+  border-color: var(--ki-bg-disabled);
+  background: var(--ki-bg-disabled);
+  color: var(--ki-on-danger);
 }
 
 .workspace {
@@ -331,7 +506,7 @@ body {
 
 .tree-row.is-active {
   background: var(--ki-bg-active);
-  color: var(--ki-accent);
+  color: var(--ki-text-on-active);
   font-weight: 500;
 }
 
@@ -438,7 +613,7 @@ body {
 /*
  * CM6 的主题走 CSS 变量，不写 JS 主题对象。
  *
- * 理由与整个文件一致：写死 `#2563eb` 的地方换主题要一个个改，
+ * 理由与整个文件一致：写死色值的地方换主题要一个个改，
  * 写 `var(--ki-accent)` 的地方只覆盖一层变量。CM6 的 `.cm-*` 类名是稳定 API，
  * 官方文档明确说"用 CSS 定制主题"是受支持的路径之一。
  */
@@ -624,7 +799,7 @@ body {
 /* 必须在级别规则之后：同权重时后者生效，否则 H1 的高亮会被 600 字重吃掉。 */
 .outline__item.is-active {
   background: var(--ki-bg-active);
-  color: var(--ki-accent);
+  color: var(--ki-text-on-active);
   font-weight: 500;
 }
 
@@ -656,7 +831,7 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding-top: 12vh;
-  background: rgb(24 24 27 / 22%);
+  background: var(--ki-scrim-weak);
 }
 
 .quick-open {
@@ -668,7 +843,7 @@ body {
   border: 1px solid var(--ki-border-subtle);
   border-radius: 10px;
   background: var(--ki-bg-canvas);
-  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+  box-shadow: var(--ki-shadow-panel);
 }
 
 .quick-open__input {
@@ -734,7 +909,7 @@ body {
 }
 
 .quick-open__item.is-active .quick-open__name {
-  color: var(--ki-accent);
+  color: var(--ki-text-on-active);
   font-weight: 500;
 }
 
@@ -783,7 +958,7 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding-top: 10vh;
-  background: rgb(24 24 27 / 22%);
+  background: var(--ki-scrim-weak);
 }
 
 .search-panel {
@@ -795,7 +970,7 @@ body {
   border: 1px solid var(--ki-border-subtle);
   border-radius: 10px;
   background: var(--ki-bg-canvas);
-  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+  box-shadow: var(--ki-shadow-panel);
 }
 
 .search__input {
@@ -854,7 +1029,7 @@ body {
 }
 
 .search__item.is-active .search__path {
-  color: var(--ki-accent);
+  color: var(--ki-text-on-active);
 }
 
 .search__line {
@@ -867,8 +1042,8 @@ body {
   flex: 0 0 auto;
   padding: 0 5px;
   border-radius: 3px;
-  background: var(--ki-blue-50);
-  color: var(--ki-accent);
+  background: var(--ki-bg-active);
+  color: var(--ki-text-on-active);
   font-size: 10px;
   line-height: 16px;
 }
@@ -942,7 +1117,7 @@ body {
   border: 1px solid var(--ki-border-subtle);
   border-radius: 8px;
   background: var(--ki-bg-canvas);
-  box-shadow: 0 8px 24px rgb(24 24 27 / 18%);
+  box-shadow: var(--ki-shadow-menu);
 }
 
 .context-menu__item {
@@ -962,7 +1137,7 @@ body {
 .context-menu__item:hover,
 .context-menu__item:focus-visible {
   background: var(--ki-bg-active);
-  color: var(--ki-accent);
+  color: var(--ki-text-on-active);
   outline: none;
 }
 
@@ -983,7 +1158,7 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding-top: 18vh;
-  background: rgb(24 24 27 / 32%);
+  background: var(--ki-scrim-strong);
 }
 
 .prompt {
@@ -995,7 +1170,7 @@ body {
   border: 1px solid var(--ki-border-subtle);
   border-radius: 10px;
   background: var(--ki-bg-canvas);
-  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+  box-shadow: var(--ki-shadow-panel);
 }
 
 .prompt__title {
@@ -1022,7 +1197,7 @@ body {
 }
 
 .prompt__input[aria-invalid='true'] {
-  border-color: var(--ki-red-600);
+  border-color: var(--ki-danger);
 }
 
 .prompt__hint {
@@ -1035,7 +1210,7 @@ body {
 /* 即时提示与服务端错误共用一种样式：对用户来说都是"这个名字现在不能提交"。 */
 .prompt__error {
   margin: 0;
-  color: var(--ki-red-600);
+  color: var(--ki-danger);
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
@@ -1066,7 +1241,7 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding-top: 22vh;
-  background: rgb(24 24 27 / 44%);
+  background: var(--ki-scrim-max);
 }
 
 .confirm {
@@ -1078,7 +1253,7 @@ body {
   border: 1px solid var(--ki-border-subtle);
   border-radius: 10px;
   background: var(--ki-bg-canvas);
-  box-shadow: 0 16px 48px rgb(24 24 27 / 24%);
+  box-shadow: var(--ki-shadow-panel);
 }
 
 .confirm__title {
