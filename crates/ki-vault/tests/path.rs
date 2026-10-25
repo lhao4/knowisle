@@ -143,7 +143,12 @@ fn resolve_for_write_rejects_directory_target() {
     fs::create_dir_all(vault.path().join("sub")).unwrap();
 
     let err = resolve_for_write(vault.path(), "sub").expect_err("目标是目录本身，不能当文件写");
-    assert!(format!("{err:?}").contains("Io"), "实际 {err:?}");
+    // 必须是 NotAFile 而不是 Io：这是「选错对象」，用户该换目标，
+    // 不是去查权限或磁盘。混成 Io 会让前端给出完全错误的下一步建议。
+    match err {
+        ki_core::KiError::NotAFile { path } => assert_eq!(path, "sub"),
+        other => panic!("应当是 NotAFile，实际 {other:?}"),
+    }
 }
 
 /// 缺口 2：`alias.md -> real.md`（都在库内）时，写入必须被拒绝。

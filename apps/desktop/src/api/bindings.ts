@@ -204,6 +204,11 @@ export type FileNode = {
  *  领域错误。变体数量刻意保持很少：错误分类的粒度应该由**处理方式**决定，
  *  而不是由"出错的地方"决定。
  * 
+ *  M3 加 [`KiError::NotAFile`] / [`KiError::ReservedPath`] 时，这条规矩被具体化
+ *  了一次：它们不是"另一个出错位置"，而是两种**下一步动作不同**的拒绝——
+ *  前者是选错了对象（去选文件），后者是这块地方根本不许动（去选库里的笔记）。
+ *  判据始终是"前端要不要给出不同的话"，不是"错误发生在哪个函数里"。
+ * 
  *  # 为什么 derive `Type`
  * 
  *  前端要写 `switch (err.code)`，就必须知道 `code` 的全部取值以及每个取值下
@@ -215,19 +220,74 @@ export type FileNode = {
  *  `rename_all` 管**变体名**（`Io` → `"IO"`），`rename_all_fields` 管**字段名**
  *  （`expected_mtime` → `"expectedMtime"`）。两者分开是因为变体要 SCREAMING_SNAKE
  *  才好在 `switch` 里读，而字段要和其它所有类型一样是 camelCase。
+ *  IO 失败的**可操作分类**。
+ * 
+ *  分类粒度由「用户下一步该做什么」决定，而不是由 errno 决定：
+ *  改权限 / 关掉占用程序 / 清磁盘 / 重新扫描 / 没有建议。
+ *  这是 [`KiError`] 那条「粒度按处理方式」的规矩在 IO 里的落地。
+ * 
+ *  # 为什么是这五个
+ * 
+ *  - `PermissionDenied`：用户能修（改 ACL、去掉只读、换目录）。
+ *  - `Busy`：用户能修，但动作是**关掉别的程序**而不是改权限。
+ *  - `StorageFull`：用户能修，但要清磁盘；且此刻内容还没落盘，文案不能许诺安全。
+ *  - `NotFound`：用户能修，动作是**重新扫描**（磁盘上确实没了，重试没有意义）。
+ *  - `Other`：没有可执行建议，只能把 OS 原文摆出来。
+ * 
+ *  序列化是 `SCREAMING_SNAKE_CASE`（`PERMISSION_DENIED` / `BUSY` / …），
+ *  与 `code` 的写法一致，前端 `switch` 里读起来不分心。
  */
+export type IoKind = 
+/**  没有权限（ACL、只读、系统保护）。 */
+"PERMISSION_DENIED" | 
+/**  文件被别的进程占用 / 锁定。 */
+"BUSY" | 
+/**  磁盘空间不足。 */
+"STORAGE_FULL" | 
+/**  文件或路径已经不存在。 */
+"NOT_FOUND" | 
+/**  无法归类的 IO 失败。 */
+"OTHER";
+
 export type KiError = 
 /**  传入的路径存在，但不是目录。 */
 { code: "NOT_A_DIRECTORY"; detail: {
+	path: string,
+} } | 
+/**
+ *  传入的路径存在，但不是普通文件（目录、设备、FIFO 等）。
+ * 
+ *  与 [`KiError::NotADirectory`] 对称：那是「要目录却给了文件」，
+ *  这是「要文件却给了目录」。两者都是**选错对象**，不是磁盘出错——
+ *  所以不能塞进 [`KiError::Io`]，否则前端只能显示「读写失败」，
+ *  用户会去查权限和磁盘，而真正该做的是换一个目标。
+ */
+{ code: "NOT_A_FILE"; detail: {
 	path: string,
 } } | 
 /**  路径试图逃出 Vault（`..`、绝对路径、盘符、符号链接指向外部）。 */
 { code: "PATH_ESCAPE"; detail: {
 	path: string,
 } } | 
-/**  文件系统读写失败。 */
+/**
+ *  路径落在应用自己的元数据目录（`.knowisle/`）里。
+ * 
+ *  这是**规则拒绝**，不是磁盘故障：文件完全可读可写，只是不许改名 / 删除。
+ *  单独成变体是为了让前端说「这里不能动」，而不是让用户去查权限。
+ */
+{ code: "RESERVED_PATH"; detail: {
+	path: string,
+} } | 
+/**
+ *  文件系统读写失败。
+ * 
+ *  `kind` 是给用户下一步动作的分类；`message` 是 OS 原文，只在
+ *  [`IoKind::Other`] 时作为补充细节展示。**禁止**解析 `message` 做分支——
+ *  它随平台与语言变化，不构成契约。
+ */
 { code: "IO"; detail: {
 	path: string,
+	kind: IoKind,
 	message: string,
 } } | 
 /**  文件名或文件内容不是合法 UTF-8。 */

@@ -125,9 +125,8 @@ pub fn rename_note(root: &Path, path: &str, raw_name: &str) -> Result<String, Ki
     // `fs::rename` 对目录是完全合法的，所以这道闸必须显式写出来。
     let meta = std::fs::metadata(&source).map_err(|err| KiError::io(path, &err))?;
     if !meta.is_file() {
-        return Err(KiError::Io {
+        return Err(KiError::NotAFile {
             path: path.to_owned(),
-            message: "只能重命名文件，不能重命名目录".to_owned(),
         });
     }
 
@@ -200,9 +199,8 @@ pub fn delete_note(root: &Path, path: &str) -> Result<String, KiError> {
     // 闸 3：只删文件。理由见上面的「只删文件」。
     let meta = std::fs::metadata(&source).map_err(|err| KiError::io(path, &err))?;
     if !meta.is_file() {
-        return Err(KiError::Io {
+        return Err(KiError::NotAFile {
             path: path.to_owned(),
-            message: "只能删除文件，不能删除目录".to_owned(),
         });
     }
 
@@ -220,9 +218,13 @@ pub fn delete_note(root: &Path, path: &str) -> Result<String, KiError> {
     let trash = canonical_root.join(TRASH_DIR);
 
     // 建不出来就报错返回：此时文件还在原位，用户只是删不掉，而不是丢了。
-    std::fs::create_dir_all(&trash).map_err(|err| KiError::Io {
-        path: TRASH_DIR.to_owned(),
-        message: format!("无法创建回收目录（已取消删除，不会降级为永久删除）：{err}"),
+    // 这句「不会降级为永久删除」是这条路径上唯一能防真实数据丢失的话，不许省。
+    std::fs::create_dir_all(&trash).map_err(|err| {
+        KiError::io_msg(
+            TRASH_DIR,
+            &err,
+            "无法创建回收目录（已取消删除，不会降级为永久删除）",
+        )
     })?;
 
     // `.knowisle` 本身可能是软链 / junction。`create_dir_all` 会顺着它建到库外，
@@ -241,9 +243,10 @@ pub fn delete_note(root: &Path, path: &str) -> Result<String, KiError> {
     let candidate = unique_trash_name(stamp, name, |candidate| {
         std::fs::symlink_metadata(trash_real.join(candidate)).is_ok()
     })
-    .ok_or_else(|| KiError::Io {
-        path: path.to_owned(),
-        message: format!("回收目录里已有 {TRASH_SEQ_LIMIT} 个同毫秒同名的文件，已放弃删除"),
+    .ok_or_else(|| {
+        KiError::Internal(format!(
+            "回收目录里已有 {TRASH_SEQ_LIMIT} 个同毫秒同名的文件，已放弃删除：{path}"
+        ))
     })?;
 
     std::fs::rename(&source, trash_real.join(&candidate)).map_err(|err| KiError::io(path, &err))?;

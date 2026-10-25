@@ -123,9 +123,8 @@ fn validate_rel(rel: &str) -> Result<&Path, KiError> {
 pub(crate) fn reject_metadata_path(rel: &str) -> Result<(), KiError> {
     let first = rel.split(['/', '\\']).next().unwrap_or("");
     if first.eq_ignore_ascii_case(METADATA_DIR) {
-        return Err(KiError::Io {
+        return Err(KiError::ReservedPath {
             path: rel.to_owned(),
-            message: format!("{METADATA_DIR}/ 是应用自己的元数据，不能改名或删除"),
         });
     }
     Ok(())
@@ -272,9 +271,8 @@ pub fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
     // 这里只剩"普通目录"这一种情况。
     if let Ok(meta) = std::fs::symlink_metadata(&target) {
         if meta.file_type().is_dir() {
-            return Err(KiError::Io {
+            return Err(KiError::NotAFile {
                 path: rel.to_owned(),
-                message: "目标是目录，不能当文件写入".to_owned(),
             });
         }
     }

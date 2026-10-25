@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use common::{skip_unless, try_link_dir, try_link_file};
+use ki_core::KiError::Io;
 use ki_vault::{read_note, scan_vault, write_note, write_note_checked, ScanOptions};
 use tempfile::TempDir;
 
@@ -527,4 +528,91 @@ fn checked_write_without_a_base_is_an_unconditional_overwrite() {
 
     write_note_checked(vault.path(), "a.md", "NEW", None).expect("无基线时应当直接覆盖");
     assert_eq!(read_note(vault.path(), "a.md").unwrap().content, "NEW");
+}
+
+/* ───────────────────── 错误分类：权限不足 ───────────────────── */
+
+/// 权限不足必须报 `Io { kind: PermissionDenied }`，且**磁盘上的旧内容一个字节不变**。
+///
+/// 两个平台的可复现构造不同，这不是测试偷懒，是操作系统语义不同：
+///
+/// - **Windows**：只读属性让「`rename` 覆盖目标」返回 winerror 5（已实测）。
+///   文件本身仍可读，所以这条路径恰好验证「写不进去，但旧内容还在」。
+/// - **Unix**：`rename` 覆盖只读文件**完全合法**（权限看父目录，不看文件），
+///   所以只能把父目录设成 555，让 tmp 文件根本建不出来。
+///   若照抄 Windows 的写法，Linux/macOS 上会「测试通过但什么都没验证」。
+#[cfg(windows)]
+#[test]
+// 收尾时要清掉只读位，否则 TempDir 删不掉这个文件。该 lint 的告警是
+// 「Unix 上 set_readonly(false) 会变成 world-writable」——本函数整个被
+// `#[cfg(windows)]` 圈住，Unix 分支根本不存在，所以这里不适用。
+#[allow(clippy::permissions_set_readonly_false)]
+fn permission_denied_when_the_target_is_read_only() {
+    let vault = TempDir::new().unwrap();
+    let target = vault.path().join("a.md");
+    fs::write(&target, "旧内容").unwrap();
+
+    let mut perms = fs::metadata(&target).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&target, perms).unwrap();
+
+    let err = write_note(vault.path(), "a.md", "新内容").expect_err("只读目标必须写不进去");
+    match err {
+        Io { kind, .. } => {
+            assert_eq!(kind, ki_core::IoKind::PermissionDenied, "实际 {kind:?}");
+        }
+        other => panic!("应当是 Io，实际 {other:?}"),
+    }
+
+    // 原子写的承诺是「失败时目标不动」，不是「失败时尽量不动」。
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "旧内容",
+        "写失败时旧内容必须原封不动"
+    );
+    assert!(
+        tmp_leftovers(vault.path()).is_empty(),
+        "失败后不许留下 tmp：{:?}",
+        tmp_leftovers(vault.path())
+    );
+
+    // 收尾：去掉只读，否则 TempDir 在 Windows 上删不掉这个文件，会留下临时目录。
+    let mut perms = fs::metadata(&target).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&target, perms).unwrap();
+}
+
+/// Unix 版：父目录只读 → 建不出 tmp → `EACCES`。
+#[cfg(unix)]
+#[test]
+fn permission_denied_when_the_parent_directory_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let vault = TempDir::new().unwrap();
+    let dir = vault.path().join("notes");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a.md"), "旧内容").unwrap();
+
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&dir, perms).unwrap();
+
+    let err = write_note(vault.path(), "notes/a.md", "新内容").expect_err("只读目录必须写不进去");
+    match err {
+        Io { kind, .. } => {
+            assert_eq!(kind, ki_core::IoKind::PermissionDenied, "实际 {kind:?}");
+        }
+        other => panic!("应当是 Io，实际 {other:?}"),
+    }
+
+    assert_eq!(
+        fs::read_to_string(dir.join("a.md")).unwrap(),
+        "旧内容",
+        "写失败时旧内容必须原封不动"
+    );
+
+    // 恢复写权限，否则 TempDir 清理不掉。
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&dir, perms).unwrap();
 }

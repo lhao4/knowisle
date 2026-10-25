@@ -266,9 +266,8 @@ pub fn read_note(root: &Path, rel: &str) -> Result<NoteContent, KiError> {
     let meta = std::fs::metadata(&absolute).map_err(|e| KiError::io(rel, &e))?;
 
     if !meta.is_file() {
-        return Err(KiError::Io {
+        return Err(KiError::NotAFile {
             path: rel.to_owned(),
-            message: "不是普通文件".to_owned(),
         });
     }
     if meta.len() > MAX_NOTE_BYTES {

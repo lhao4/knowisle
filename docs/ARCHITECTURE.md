@@ -787,22 +787,52 @@ Chromium 在窗口失焦或最小化时把后台定时器压到约 1 次/分钟�
 #### 错误模型
 
 ```rust
-#[derive(Serialize, thiserror::Error)]
-#[serde(tag = "code", content = "detail")]
+#[derive(Debug, Clone, thiserror::Error, Serialize, Type)]
+#[serde(
+    tag = "code",
+    content = "detail",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    rename_all_fields = "camelCase"
+)]
 pub enum KiError {
-    #[error("note not found")]
-    NoteNotFound { id: String },
-    #[error("conflict detected")]
-    Conflict { path: String, local_hash: String, disk_hash: String },
-    #[error("vault locked")]
-    VaultLocked { by: String },
-    #[error("io error")]
-    Io { message: String, path: Option<String> },
-    // ...
+    NotADirectory { path: String },
+    NotAFile { path: String },
+    PathEscape { path: String },
+    ReservedPath { path: String },
+    Io { path: String, kind: IoKind, message: String },
+    InvalidEncoding { path: String },
+    InvalidName { name: String, reason: String },
+    NameTaken { path: String },
+    TooLarge { path: String, size: u64 },
+    Conflict { path: String, expected_mtime: i64, disk_mtime: Option<i64> },
+    Internal(String),
+}
+
+/// IO 失败的**可操作分类**：改权限 / 关掉占用程序 / 清磁盘 / 重新扫描 / 没有建议。
+#[derive(Serialize, Type)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IoKind {
+    PermissionDenied,
+    Busy,
+    StorageFull,
+    NotFound,
+    Other,
 }
 ```
 
-前端拿到的是 `{ code: "Conflict", detail: {...} }`，用 `switch (err.code)` 做映射。**永远不要 `err.message.includes('not found')`** —— 那是把国际化、日志格式、用户文案三者耦合在一起的经典错误。
+前端拿到的是：
+
+```json
+{ "code": "IO", "detail": { "path": "notes/a.md", "kind": "PERMISSION_DENIED", "message": "拒绝访问" } }
+```
+
+用 `switch (err.code)` 做第一层映射，`IO` 再用 `switch (detail.kind)` 做第二层。**永远不要 `err.message.includes('not found')`** —— 那是把国际化、日志格式、用户文案三者耦合在一起的经典错误；`kind` 存在的意义就是让这句话不必成立。
+
+三条约束：
+
+1. **粒度按处理方式，不按出错位置。** 判据是「前端要不要给出不同的下一步」，不是「错误发生在哪个函数里」。所以「目标是目录」是 `NotAFile` 而不是 `Io`——它不是磁盘故障，用户该换目标而不是查权限；「`.knowisle/` 不许动」是 `ReservedPath`，因为文件本身完全可读写。
+2. **前端 `switch` 不许写 `default`。** 有了 `default`，`error` 只会被收窄成「剩余成员」而不是 `never`，`tsc` 不会报错，新变体就静默落进兜底文案。`apps/desktop/src/api/errors.ts` 末尾的 `const _exhaustive: never = error` 是这条约束的可执行形式，删掉任一 case 都会让 `tsc` 失败。
+3. **`IO` 的 `message` 不是契约。** 它随平台与语言变化，只在 `kind === 'OTHER'` 时作为补充细节展示。`kind` 的判定顺序是「先 `ErrorKind`（1.0 就稳定的 `PermissionDenied` / `NotFound`），再 raw os code 分平台查表」——`StorageFull` / `ResourceBusy` 这类 `ErrorKind` 是 Rust 1.83 才稳定的，而 MSRV 是 1.82，所以磁盘满与占用只能走 raw code 表。
 
 #### 三条铁律
 

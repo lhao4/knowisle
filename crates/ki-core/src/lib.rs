@@ -17,6 +17,6 @@ pub mod error;
 pub mod node;
 pub mod search;
 
-pub use error::KiError;
+pub use error::{IoKind, KiError};
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{SearchHit, SearchResult};

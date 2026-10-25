@@ -187,13 +187,19 @@ fn delete_refuses_anything_under_the_metadata_dir() {
         ".knowisle\\index.sqlite",
     ] {
         let err = delete_note(vault.path(), path).expect_err("必须拒绝");
-        match err {
-            KiError::Io { message, .. } => assert!(
-                message.contains(".knowisle"),
-                "{path} 的错误必须说清是元数据目录：{message}"
-            ),
-            other => panic!("{path} 报的是 {other:?}"),
-        }
+        // 先断言性质：这是「规则拒绝」，不是「磁盘读写失败」。混成 IO 的话
+        // 前端会显示"请检查权限 / 磁盘"，而用户真正该知道的是这块地方不许动。
+        assert!(
+            matches!(err, KiError::ReservedPath { .. }),
+            "{path} 应当是 ReservedPath，实际 {err:?}"
+        );
+        // 再断言文案说清了是哪块地方。大小写不敏感是必须的：`.KnowIsle` 变体
+        // 也必须命中，与扫描器的 `eq_ignore_ascii_case` 用同一把尺。
+        let text = err.to_string();
+        assert!(
+            text.to_lowercase().contains(".knowisle"),
+            "{path} 的错误必须说清是元数据目录：{text}"
+        );
     }
 
     assert_eq!(
@@ -269,7 +275,7 @@ fn rename_refuses_metadata_paths_too() {
     fs::write(vault.path().join(TRASH_DIR).join("x.md"), "x").unwrap();
 
     let err = rename_note(vault.path(), ".knowisle/trash/x.md", "y").expect_err("必须拒绝");
-    assert!(matches!(err, KiError::Io { .. }), "实际 {err:?}");
+    assert!(matches!(err, KiError::ReservedPath { .. }), "实际 {err:?}");
     assert_eq!(
         trash_entries(&vault),
         vec!["x.md"],
