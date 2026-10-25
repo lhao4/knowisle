@@ -17,6 +17,19 @@ default-run = "knowisle"
 name = "knowisle_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# 契约导出器只在开发时需要，所以用 feature 门控。
+#
+# 不加门控的后果是实测出来的：`tauri build` 会把**所有** bin 一起塞进安装包，
+# NSIS 载荷里于是多出 3.76MB 的 export_bindings.exe（占 38%），
+# 而且把一个纯内部工具发给了用户。它也不该被 CI 的 `cargo build -p knowisle` 顺带编出来。
+bindings-export = []
+
+[[bin]]
+name = "export_bindings"
+path = "src/bin/export_bindings.rs"
+required-features = ["bindings-export"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

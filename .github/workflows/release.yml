@@ -1,0 +1,144 @@
+name: Release
+
+# 出安装包。与 ci.yml 分工明确：
+#   ci.yml   —— 每次 push 都跑，守的是「代码还是对的」（七 job，不打包）
+#   release  —— 手动或打 tag 才跑，守的是「产物还是能装的」（三平台，只打包）
+#
+# 为什么不塞进 ci.yml：出包要下载 WiX / NSIS / linuxdeploy，三平台各 3-6 分钟，
+# 而 99% 的 push 不需要安装包。混在一起会让每次 push 都慢一截，还会把
+# 「编译过了」和「能装上」两种失败混在同一个红叉里。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# 最小权限：本 workflow 只读仓库、只上传 artifact，不建 Release。
+# （用 tauri-action 的话它要 contents: write 才能建 Release——本刀不要那个副作用。）
+permissions:
+  contents: read
+
+# 出包不并发：两次构建同时往 target/ 写会互相污染，且 cancel-in-progress
+# 会把已经跑了一半的打包扔掉。宁可排队。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # 每个平台只出它真正需要的包。平台差异**只在这里表达**——
+        # tauri.conf.json 的 bundle.targets 保持 "all"（= 平台默认集）。
+        # 把四个平台的类型混写进 conf，一旦被 bundler 静默过滤，
+        # 产物少了不会报错；写在这里，写错会被 clap 当场拒绝。
+        include:
+          - os: windows-latest
+            bundles: msi,nsis
+            artifact: knowisle-windows
+            paths: |
+              target/release/bundle/msi/*.msi
+              target/release/bundle/nsis/*.exe
+          - os: macos-latest
+            bundles: dmg
+            artifact: knowisle-macos
+            paths: target/release/bundle/dmg/*.dmg
+          # 22.04 而不是 latest：AppImage 的 glibc 基线跟着构建机走，
+          # 24.04 出的包在 Debian 12 / Ubuntu 22.04 上会 GLIBC_2.39 not found。
+          - os: ubuntu-22.04
+            bundles: appimage
+            artifact: knowisle-linux
+            paths: target/release/bundle/appimage/*.AppImage
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            patchelf \
+            libfuse2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # 安装包文件名里带版本号，版本号来自 tauri.conf.json。tag 与它不一致时
+      # 产出的包名会和 tag 对不上，发出去之后没人能靠文件名判断装的是哪一版。
+      # 所以宁可在这一步就红，不要等打完包才发现。
+      - name: Tag 与 version 一致
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 tauri.conf.json 的 version $ver 不一致"
+            exit 1
+          fi
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # key 前缀刻意与 ci.yml 的 rust- / shell- 区分：三条缓存各自独立，
+      # 互不挤占（rust-cache 会在 key 后面自动附加 Cargo.lock / rustc 的哈希）。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}
+
+      # tauri build 会先跑 beforeBuildCommand（= pnpm build），把前端产物
+      # 嵌进二进制，再交给 bundler。--ci 跳过所有交互提问。
+      - name: Build installers
+        working-directory: apps/desktop
+        run: pnpm exec tauri build --bundles ${{ matrix.bundles }} --ci
+
+      # ARCHITECTURE.md 的性能预算：安装包 ≤ 20MB。以前这条只是文档里的一句话，
+      # 现在它是构建阻断条件。判据用 wc -c（表观字节数 = 用户下载到的字节数），
+      # 不用 du：du 数的是分配块，NTFS 的 4KB 簇会让边界跳 4KB。
+      - name: 安装包体积卡口（每个 ≤ 20 MiB）
+        run: |
+          set -euo pipefail
+          limit=$((20 * 1024 * 1024))
+          shopt -s nullglob
+          files=(target/release/bundle/{msi/*.msi,nsis/*.exe,dmg/*.dmg,appimage/*.AppImage})
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::没有任何安装包产出——检查 --bundles 与 bundle 输出路径"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            size=$(wc -c < "$f" | tr -d '[:space:]')
+            printf '%-58s %10s bytes\n' "$f" "$size"
+            if [ "$size" -gt "$limit" ]; then
+              echo "::error file=$f::$(basename "$f") 为 $((size / 1048576)) MiB，超过 20 MiB 预算"
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.paths }}
+          if-no-files-found: error
+          retention-days: 14

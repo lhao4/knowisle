@@ -33,3 +33,19 @@ dunce = "1"
 specta = { version = "=2.0.0-rc.26", features = ["derive", "function"] }
 specta-typescript = "=0.0.13"
 tauri-specta = { version = "=2.0.0-rc.26", features = ["derive", "typescript"] }
+
+# ---- 发布构建 ----
+# 默认 release（opt-level=3 / 无 LTO / codegen-units=16 / 不 strip）产出 10.3MB。
+# 这里换的是三件事：让优化跨 crate 生效（thin LTO）、把代码生成收成单单元、
+# 以及剥掉符号。目标是**更少的页要缺页进来**——启动时省的是 IO 与重定位，
+# 不是 CPU。
+#
+# 不用 `lto = true`（fat）：那是全程序单线程优化，对 400 多个依赖 crate 的
+# Tauri 树要编译十几分钟，换来的边际收益只有几 MB。
+# 不用 `panic = "abort"`：省不了多少，却会改掉 unwind 语义，
+# 把 `catch_unwind` 一类兜底悄悄变成进程直接死。
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+

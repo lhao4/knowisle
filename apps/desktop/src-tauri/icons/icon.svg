@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    知屿 KnowIsle 应用图标 · 唯一真相源。
+    改图标只改这个文件，然后 pnpm exec tauri icon src-tauri/icons/icon.svg
+
+    与界面里每一屏都出现的 ◈ 同形（菱形套菱形）。三处取色都来自 index.css 的 L1 层：
+    底色比 ki-blue-900 (#41689e) 深一档（深蓝在浅色任务栏上更立得住），
+    描边 = ki-blue-400 (#60a5fa)，内芯 = ki-blue-50 (#eff6ff)。
+    这里写死色值而不是引用变量：图标是编译期嵌进二进制的位图，不是主题的一部分。
+
+    描边 76 不是随手取的：1024 缩到 16px 是 1/64，76 缩下去还有 1.19px；
+    若用 60，16px 下只剩 0.94px，任务栏上会糊成一圈灰边。
+  -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="#0E1B33"/>
+  <path d="M512 232 792 512 512 792 232 512Z" fill="none"
+        stroke="#60A5FA" stroke-width="76" stroke-linejoin="round"/>
+  <path d="M512 436 588 512 512 588 436 512Z" fill="#EFF6FF"/>
+</svg>
