@@ -81,6 +81,10 @@ export function describeError(error: unknown): string {
       return error.detail.diskMtime === null
         ? `磁盘上已经没有这个文件了：${error.detail.path}\n它被别的程序删除或改名了，保存前请重新扫描库。`
         : `文件已被外部修改：${error.detail.path}\n磁盘上的版本比你打开的更新。重新加载后再改，或覆盖它。`
+    case 'INDEX':
+      // 索引是派生数据（公理 A1），所以这里的建议是「删掉它」而不是「修好它」。
+      // 不要写成「请检查权限」——那是 IO 的台词，用户照做只会白忙。
+      return `搜索索引不可用：${error.detail.path}\n删掉这个文件后重新扫描库，索引会自动重建。\n${error.detail.message}`
     case 'INTERNAL':
       return `内部错误：${error.detail}`
   }

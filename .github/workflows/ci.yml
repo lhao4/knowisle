@@ -70,13 +70,32 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
-      # 只 lint 两个纯逻辑 crate：src-tauri 的 clippy 需要 Linux 系统库，
+      # 只 lint 三个纯逻辑 crate：src-tauri 的 clippy 需要 Linux 系统库，
       # 而它本身几乎没有逻辑，编译验证交给下面的 shell job。
+      #
+      # ki-store 放在这里而不是 shell job：它只依赖 rusqlite（bundled C 源码，
+      # 三平台自带编译器就够）和 ki-core，**不碰 tauri**。这是分层设计带来的
+      # 直接好处——索引库的全部测试能在 20 分钟的 rust job 里三平台跑完。
       - name: Clippy
-        run: cargo clippy -p ki-core -p ki-vault --all-targets -- -D warnings
+        run: cargo clippy -p ki-core -p ki-vault -p ki-store --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test -p ki-core -p ki-vault
+        run: cargo test -p ki-core -p ki-vault -p ki-store
+
+      # 公理 A2 的机械形式：领域层不许长出基础设施依赖。
+      #
+      # 这条守卫的价值不在今天——今天它显然是空的——而在「哪天有人为了让
+      # `KiError::Index` 好写一点，顺手在 ki-core 里 `use rusqlite`」的那一刻。
+      # 那时 `cargo tree` 会红，而 code review 里没人会注意到多了一行依赖。
+      #
+      # 用 `-e normal` 排除 dev-dependencies：测试里用什么是另一回事。
+      - name: Layering guard (ki-core stays IO-free)
+        run: |
+          if cargo tree -p ki-core -e normal | grep -qiE 'rusqlite|libsqlite3|sqlite'; then
+            echo "::error::ki-core 依赖了 SQLite，违反公理 A2（core 不得依赖基础设施）"
+            cargo tree -p ki-core -e normal
+            exit 1
+          fi
 
   shell:
     name: shell (${{ matrix.os }})

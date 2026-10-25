@@ -4,6 +4,7 @@ members = [
     "apps/desktop/src-tauri",
     "crates/ki-core",
     "crates/ki-ipc",
+    "crates/ki-store",
     "crates/ki-vault",
 ]
 
@@ -16,12 +17,21 @@ license = "AGPL-3.0-or-later"
 [workspace.dependencies]
 ki-core = { path = "crates/ki-core" }
 ki-ipc = { path = "crates/ki-ipc" }
+ki-store = { path = "crates/ki-store" }
 ki-vault = { path = "crates/ki-vault" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 walkdir = "2.5"
 dunce = "1"
+
+# ---- SQLite ----
+# `bundled` 会**顺带**开 FTS5：libsqlite3-sys 的 bundled 构建脚本里写死了
+# `-DSQLITE_ENABLE_FTS5`，不需要额外 feature（也没有单独的 `fts5` feature）。
+# 版本钉在 0.32 是因为它 bundled 的 SQLite 是 3.46，而 `contentless_delete`
+# 要求 3.43+；再往上的 rusqlite 会把 workspace 的 MSRV 1.82 顶掉。
+# 索引库对 SQLite 的依赖只有两处不可替代的能力：FTS5 与 contentless_delete。
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # ---- IPC 类型生成（tauri-specta）----
 # 三行必须同时升级，且必须用 `=` 精确钉死，理由不是洁癖：

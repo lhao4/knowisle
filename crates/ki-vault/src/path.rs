@@ -36,7 +36,11 @@ use ki_core::KiError;
 ///
 /// 它同时出现在 `scan::IGNORED_DIRS` 里——两处引用同一个常量，是为了让
 /// "扫描器看不见它" 与 "破坏性操作不许碰它" 不会各自漂移。
-pub(crate) const METADATA_DIR: &str = ".knowisle";
+///
+/// 定义搬到了 `ki-core`：索引库（`ki-store`）也要用同一个名字，而它不该为了
+/// 一个字符串常量反向依赖文件系统层。这里只做再导出，`crate::path::METADATA_DIR`
+/// 的写法在 `ki-vault` 内部保持不变。
+pub(crate) use ki_core::METADATA_DIR;
 
 /// 把文件系统路径转成 POSIX 风格的相对路径。
 ///

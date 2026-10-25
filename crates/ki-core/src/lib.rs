@@ -20,3 +20,14 @@ pub mod search;
 pub use error::{IoKind, KiError};
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{SearchHit, SearchResult};
+
+/// 本应用的元数据目录（Vault 相对路径的第一级）。
+///
+/// 三处必须引用同一个常量，否则会各自漂移：
+/// - `ki-vault::scan` 的忽略名单（扫描器「看不见它」）
+/// - `ki-vault::path` 的破坏性操作闸（改名/删除不许碰它）
+/// - `ki-store` 的索引库位置（`<root>/.knowisle/index.sqlite`）
+///
+/// 它放在领域层而不是 `ki-vault`：索引库也要用它，而 `ki-store` 不该为了一个
+/// 字符串常量去依赖文件系统层。
+pub const METADATA_DIR: &str = ".knowisle";

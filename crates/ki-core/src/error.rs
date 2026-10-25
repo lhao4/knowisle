@@ -195,6 +195,18 @@ pub enum KiError {
         disk_mtime: Option<i64>,
     },
 
+    /// 本地索引库不可用（打开失败、损坏、磁盘满、被占用超时）。
+    ///
+    /// 索引是**派生数据**（公理 A1）：删掉 `.knowisle/index.sqlite` 后重新打开库，
+    /// 它会自动重建。所以它不能塞进 [`KiError::Io`]——`IoKind` 的五种分类对应的是
+    /// 「改权限 / 关掉占用程序 / 清磁盘 / 重新扫描 / 没有建议」，而这里该做的是
+    /// **第六种动作：删掉索引让它重建**。硬塞进 `Io` 只会让前端给出错误的建议。
+    ///
+    /// 也不能塞进 [`KiError::Internal`]：那是「不该发生的 bug」，而索引损坏是
+    /// 可预期、可自愈的。
+    #[error("索引库不可用（{path}）：{message}")]
+    Index { path: String, message: String },
+
     /// 不应发生的内部错误（后台任务 panic、序列化失败等）。
     #[error("{0}")]
     Internal(String),
