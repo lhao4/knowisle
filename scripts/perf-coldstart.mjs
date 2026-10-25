@@ -59,7 +59,7 @@ const VAULT = path.join(ROOT, '.tmp', 'vault-perf')
 const PORT = 9222
 // 全部可调，CI 用环境变量压轮数以省时间；本地默认 10 轮。
 const ROUNDS = Number(process.env.PERF_ROUNDS ?? 10)
-const COOLDOWN_MS = Number(process.env.PERF_COOLDOWN_MS ?? 1200)
+const COOLDOWN_MS = Number(process.env.PERF_COOLDOWN_MS ?? 2000)
 // K2 预算：spawn → 侧栏树渲染完毕。
 // 注意这里面有约 1.7s 是 Tauri + WebView2 的进程与环境初始化（实测：一张
 // 165 字节的空白页也要 1.7s），所以它卡的是「前端与扫描的回归」，不是「启动有多快」。
@@ -263,12 +263,22 @@ const ENV = {
 const launch = () => spawn(APP, [], { detached: true, stdio: 'ignore', env: ENV })
 
 /** 起一个实例、连上 CDP、等文档就绪。返回 { child, cdp }。 */
-async function boot(timeoutMs = 20000) {
+async function boot(timeoutMs = 30000) {
   const child = launch()
   const wsUrl = await waitForPage(Date.now() + timeoutMs)
   if (wsUrl === null) {
+    // 进程死没死是这里唯一有用的诊断：还活着说明是 WebView2 起不来，
+    // 已经退出了说明应用在初始化阶段就崩了（多半是用户数据目录被上一轮占着）。
+    const alive = (() => {
+      try {
+        process.kill(child.pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    })()
     killTree(child.pid)
-    throw new Error('调试端口没开')
+    throw new Error(`调试端口没开（进程${alive ? '仍在，卡在 WebView2 初始化' : '已退出，初始化阶段就崩了'}）`)
   }
   const cdp = await openWs(wsUrl)
   await cdp.send('Runtime.enable')
@@ -277,16 +287,44 @@ async function boot(timeoutMs = 20000) {
   return { child, cdp, href }
 }
 
+/**
+ * 起不来就清理干净重试。
+ *
+ * 这条不是防御性编程，是 CI 上真红过的：K1 那一步刚把应用连同 WebView2 一起
+ * 强杀，K2 立刻再起一个，此时用户数据目录可能还被上一轮的浏览器进程占着，
+ * 新实例创建 WebView2 环境失败直接退出——表现就是「20 秒内调试端口没开」。
+ * 本地几乎撞不上（进程退得快），共享 runner 上撞得上。
+ */
+async function bootWithRetry(attempts = 3) {
+  let lastError = null
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await boot()
+    } catch (error) {
+      lastError = error
+      console.log(`  启动失败（第 ${i}/${attempts} 次）：${error.message}`)
+      killAll()
+      tryRun('taskkill /F /IM msedgewebview2.exe')
+      await waitPortClosed(8000)
+      await sleep(2000)
+    }
+  }
+  throw lastError
+}
+
 /* ───────────────────── 预热：把 lastVault 写进去并落盘 ───────────────────── */
 //
 // 不预置的话，HEAD 的首次启动会**自己弹文件夹选择器**（M3 第三刀的行为），
 // 于是每一轮测到的都是「对话框弹出来要多久」，而不是「界面就绪要多久」。
 
 killAll()
+tryRun('taskkill /F /IM msedgewebview2.exe')
 await waitPortClosed()
-await sleep(400)
+// 给上一轮被杀掉的浏览器进程留出真正退场的时间：用户数据目录的锁是它持有的，
+// 抢在它前面启动新实例会直接失败。
+await sleep(2000)
 {
-  const { child, cdp, href } = await boot()
+  const { child, cdp, href } = await bootWithRetry()
   const written = await evaluate(
     cdp,
     `(() => {
@@ -310,7 +348,7 @@ await sleep(400)
 
 // 校验落盘：再起一次，读回 lastVault 并且树要能出来。
 {
-  const { child, cdp } = await boot()
+  const { child, cdp } = await bootWithRetry()
   const back = await evaluate(cdp, `localStorage.getItem('knowisle.lastVault')`)
   // 必须轮询。`waitForDocument` 在 `location.href` 一变成 tauri.localhost 就返回，
   // 那一刻 React 还没挂载、`vaultScan` 更没回来，直接读行数永远是 0——曾据此
@@ -423,13 +461,16 @@ Get-CimInstance Win32_Process |
 }
 
 killAll()
+tryRun('taskkill /F /IM msedgewebview2.exe')
 await waitPortClosed()
-await sleep(400)
+// 给上一轮被杀掉的浏览器进程留出真正退场的时间：用户数据目录的锁是它持有的，
+// 抢在它前面启动新实例会直接失败。
+await sleep(2000)
 let rss = null
 let tEdit = null
 let tEditFocused = null
 {
-  const { child, cdp } = await boot()
+  const { child, cdp } = await bootWithRetry()
   const deadline = Date.now() + 20000
   while (Date.now() < deadline) {
     const probe = await evaluate(cdp, PROBE).catch(() => null)
