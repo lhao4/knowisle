@@ -1057,7 +1057,7 @@ unsafe { cmd.pre_exec(|| { setrlimit(RLIMIT_AS, 512MB); setsid(); Ok(()) }); }
 | 击键到像素 | ≤ 16ms (P99) | Playwright + PerformanceObserver |
 | 10 万字文档滚动 | 60fps 稳定 | 帧率采样 |
 | 安装包体积 | Win/macOS ≤ 20MB；AppImage ≤ 100MB | `release.yml` 的 bundle job（逐包断言，超限即红）。实测 msi 3.29 / nsis 2.27 / dmg 2.68 / AppImage 77.6 MiB——AppImage 的大头是随包的 WebKitGTK，不是我们的代码 |
-| 空载 RSS | ≤ 150MB | 进程采样 |
+| 空载 RSS | `knowisle.exe` 私有 ≤ 40MB | 按 pid 父子递归采样。WebView2 子树只记基线不设卡口——它的进程数与显存策略由系统决定，同一份代码换台机器就能差 100MB。实测主进程私有 5.7MB；整树私有 204MB（6 个 `msedgewebview2.exe`，其中 GPU 进程单个就占 103.9MB） |
 | 主 chunk（gzip） | ≤ 350KB | `vite-bundle-visualizer` |
 
 ---
