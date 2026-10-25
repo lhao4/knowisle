@@ -105,6 +105,11 @@ pnpm bindings:check   # IPC 契约是否漂移
 cd apps/desktop && pnpm exec tauri build --bundles nsis --ci
 ```
 
+产出的包**没有代码签名**（M3 明确不做 Authenticode 与 macOS 公证）。所以：
+
+- **macOS**：别的机器上会被 Gatekeeper 拦下，去掉隔离标记即可 —— `xattr -d com.apple.quarantine /Applications/知屿.app`
+- **Windows**：SmartScreen 提示「未知发布者」，点「更多信息 → 仍要运行」
+
 ## 三个必须保留的配置（都踩过坑）
 
 **1. pnpm 必须使用 `nodeLinker: hoisted`**
@@ -130,7 +135,7 @@ cd apps/desktop && pnpm exec tauri build --bundles nsis --ci
 | 安装包（msi / nsis / dmg） | ≤ 20MiB | 3.29 / 2.27 / 2.68 MiB |
 | 安装包（AppImage） | ≤ 100MiB | 77.6 MiB（内含 WebKitGTK） |
 
-K2 那 1.7 秒里有约 1.7 秒是 Tauri + WebView2 的进程与环境初始化：把前端换成一张 165 字节的空白页，这个数仍然是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度。
+K2 那 1.7 秒几乎全是 Tauri + WebView2 的进程与环境初始化：把前端换成一张 165 字节的空白页，这个数仍然是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度。
 
 ## 许可证
 
