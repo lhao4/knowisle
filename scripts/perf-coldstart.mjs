@@ -1,9 +1,19 @@
-// 冷启动与空载内存的测量脚本（release 版，Windows）。
+// 冷启动 K2 与空载内存的测量脚本（release 版，Windows）。
+//
+// 冷启动拆成两个指标，因为它们量的根本不是一回事：
+//   K1 窗口首次可见   —— scripts/perf-window-visible.ps1（不带任何 CDP 参数）
+//   K2 树渲染完       —— 本脚本（必须带 CDP 才能判断「渲染完了」）
+//
+// 为什么必须拆：实测一张 165 字节的空白页（没有 React、没有 CodeMirror）
+// 从 spawn 到画出第一个 DOM 也要 1.7s。也就是说 K2 里有 1.7s 是 Tauri +
+// WebView2 的进程与环境初始化，与我们的代码无关；而 K1 只有 200ms 上下。
+// 把两者混成一个数，就永远说不清「变慢了」是变慢在平台还是在产品上。
 //
 // 前置（**必须用 tauri CLI 构建**）：
 //   cd apps/desktop && pnpm exec tauri build --no-bundle --ci
 // 用法：
 //   node scripts/perf-coldstart.mjs
+//   PERF_ROUNDS=5 PERF_K2_MS=2000 node scripts/perf-coldstart.mjs   # CI
 //
 // # 为什么不能只跑 `cargo build --release`
 //
@@ -47,8 +57,18 @@ import { execSync, spawn } from 'node:child_process'
 const ROOT = path.resolve(import.meta.dirname, '..')
 const VAULT = path.join(ROOT, '.tmp', 'vault-perf')
 const PORT = 9222
-const ROUNDS = 10
-const COOLDOWN_MS = 1200
+// 全部可调，CI 用环境变量压轮数以省时间；本地默认 10 轮。
+const ROUNDS = Number(process.env.PERF_ROUNDS ?? 10)
+const COOLDOWN_MS = Number(process.env.PERF_COOLDOWN_MS ?? 1200)
+// K2 预算：spawn → 侧栏树渲染完毕。
+// 注意这里面有约 1.7s 是 Tauri + WebView2 的进程与环境初始化（实测：一张
+// 165 字节的空白页也要 1.7s），所以它卡的是「前端与扫描的回归」，不是「启动有多快」。
+// 真正衡量启动速度的是 K1（scripts/perf-window-visible.ps1）。
+const LIMIT_MS = Number(process.env.PERF_K2_MS ?? 2000)
+// 空载内存只卡我们自己的那部分。WebView2 子树只记基线——它的进程数与显存
+// 策略由系统决定，同一份代码换台机器就能差一百兆。
+const LIMIT_SELF_MB = Number(process.env.PERF_SELF_MB ?? 40)
+const IDLE_SECONDS = Number(process.env.PERF_IDLE_SECONDS ?? 15)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const ms = (t0) => Number(process.hrtime.bigint() - t0) / 1e6
@@ -362,12 +382,12 @@ const p95 = pick(0.95)
 
 /* ───────────────────── 空载 RSS + T_edit ───────────────────── */
 
-/** 该进程子树的工作集之和（字节）。rootPid 是 spawn 拿到的 knowisle.exe。 */
+/** 该进程子树的工作集之和与私有字节之和（字节）。rootPid 是 spawn 拿到的 knowisle.exe。 */
 const treeRss = (rootPid) => {
   const raw = psRun(`
 $ProgressPreference = 'SilentlyContinue'
 Get-CimInstance Win32_Process |
-  Select-Object ProcessId, ParentProcessId, Name, WorkingSetSize |
+  Select-Object ProcessId, ParentProcessId, Name, WorkingSetSize, PrivatePageCount |
   ConvertTo-Json -Compress
 `)
   const all = JSON.parse(raw)
@@ -382,6 +402,7 @@ Get-CimInstance Win32_Process |
   }
   let total = 0
   let self = 0
+  let selfPrivate = 0
   let count = 0
   const stack = [rootPid]
   while (stack.length > 0) {
@@ -390,12 +411,15 @@ Get-CimInstance Win32_Process |
     if (node) {
       const ws = Number(node.WorkingSetSize)
       total += ws
-      if (pid === rootPid) self = ws
+      if (pid === rootPid) {
+        self = ws
+        selfPrivate = Number(node.PrivatePageCount)
+      }
       count += 1
     }
     for (const child of byParent.get(pid) ?? []) stack.push(child)
   }
-  return { total, self, children: total - self, count }
+  return { total, self, selfPrivate, children: total - self, count }
 }
 
 killAll()
@@ -413,9 +437,9 @@ let tEditFocused = null
     await sleep(20)
   }
 
-  // 空载定义：打开库、不打开笔记、窗口在前台、静置 15s。
+  // 空载定义：打开库、不打开笔记、窗口在前台、静置 IDLE_SECONDS。
   await cdp.send('Page.bringToFront').catch(() => {})
-  await sleep(15000)
+  await sleep(IDLE_SECONDS * 1000)
   const samples = []
   for (let i = 0; i < 5; i += 1) {
     samples.push(treeRss(child.pid))
@@ -425,6 +449,7 @@ let tEditFocused = null
   rss = {
     totalMB: +(med(samples.map((s) => s.total)) / 1048576).toFixed(1),
     selfMB: +(med(samples.map((s) => s.self)) / 1048576).toFixed(1),
+    selfPrivateMB: +(med(samples.map((s) => s.selfPrivate)) / 1048576).toFixed(1),
     childrenMB: +(med(samples.map((s) => s.children)) / 1048576).toFixed(1),
     processCount: samples[0].count,
   }
@@ -493,21 +518,27 @@ let tEditFocused = null
 const report = {
   app: path.basename(APP),
   rounds: cold,
-  coldStartP50Ms: p50,
-  coldStartP95Ms: p95,
-  coldStartMinMs: sorted[0],
-  coldStartMaxMs: sorted.at(-1),
+  // K2：spawn → 侧栏树渲染完毕。含约 1.7s 的 Tauri + WebView2 固定成本。
+  k2ColdStartP50Ms: p50,
+  k2ColdStartP95Ms: p95,
+  k2ColdStartMinMs: sorted[0],
+  k2ColdStartMaxMs: sorted.at(-1),
+  k2BudgetMs: LIMIT_MS,
   idleRss: rss,
+  selfPrivateBudgetMB: LIMIT_SELF_MB,
   openNoteToEditorMs: tEdit,
   openNoteGotFocus: tEditFocused,
 }
 
 console.log(JSON.stringify(report, null, 2))
 
-const ok = p95 <= 800 && rss !== null && rss.totalMB <= 150
-console.log(
-  ok
-    ? 'PERF PASS'
-    : `PERF FAIL (p95=${p95}ms / 预算 800ms；RSS=${rss?.totalMB}MB / 预算 150MB)`,
-)
-process.exit(ok ? 0 : 1)
+const k2Ok = p95 <= LIMIT_MS
+const rssOk = rss !== null && rss.selfPrivateMB <= LIMIT_SELF_MB
+if (k2Ok && rssOk) {
+  console.log('PERF PASS')
+} else {
+  if (!k2Ok) console.log(`K2 超预算：p95 ${p95}ms > ${LIMIT_MS}ms`)
+  if (!rssOk) console.log(`空载内存超预算：knowisle.exe 私有 ${rss?.selfPrivateMB}MB > ${LIMIT_SELF_MB}MB`)
+  console.log('PERF FAIL')
+}
+process.exit(k2Ok && rssOk ? 0 : 1)

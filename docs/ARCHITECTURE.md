@@ -1051,7 +1051,8 @@ unsafe { cmd.pre_exec(|| { setrlimit(RLIMIT_AS, 512MB); setsid(); Ok(()) }); }
 
 | 指标 | 目标 | 测量方式 |
 |------|------|----------|
-| 冷启动到可输入 | ≤ 600ms (P95, Win11 / M1) | 埋点上报到 CI 基准库 |
+| K1 冷启动：窗口首次可见 | ≤ 600ms (P95) | `scripts/perf-window-visible.ps1`（Win32 `IsWindowVisible` 忙等，不带 CDP 参数）。实测 P95 395ms |
+| K2 冷启动：侧栏树渲染完 | ≤ 2000ms (P95) | `scripts/perf-coldstart.mjs`（CDP 判 `.tree-row`）。实测 P95 1774ms——**其中约 1.7s 是 Tauri + WebView2 的进程与环境初始化**：把前端换成一张 165 字节的空白页，这个数仍是 1709ms。所以 K2 卡的是前端与扫描的回归，不是启动速度 |
 | 打开 10k 笔记 Vault | ≤ 1.2s | E2E 脚本 |
 | 全局搜索响应 | ≤ 60ms (P95) | 基准测试（`criterion`） |
 | 击键到像素 | ≤ 16ms (P99) | Playwright + PerformanceObserver |
