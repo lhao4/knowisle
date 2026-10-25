@@ -81,18 +81,27 @@ fn refresh_path_ignores_files_outside_the_index() {
     assert!(result.hits.is_empty(), "索引里没有的文件不该被偷偷加进来");
 }
 
-/// 从没扫描过的库：搜索不报错，返回空，且索引库是新建的。
+/// 从没扫描过的库：搜索**自己先扫一遍**，而不是静默返回空。
+///
+/// 旧引擎的 `query` 是自足的（没索引就当场建）。新引擎若不自足，
+/// 「直接调 `vault_search` 而没先 `vault_scan`」会返回空结果——不报错，
+/// 只是找不到东西，这是最糟的失败模式。
 #[test]
-fn search_without_a_scan_returns_empty() {
+fn search_without_a_prior_scan_syncs_first() {
     let _guard = serial();
     let dir = vault();
     fs::write(dir.path().join("a.md"), "alpha").expect("写");
+    fs::write(dir.path().join("b.md"), "bravo").expect("写");
 
     let result = service::search(dir.path(), "alpha", None).expect("搜索");
-    assert!(result.hits.is_empty());
-    assert_eq!(result.total, 0);
-    assert_eq!(result.indexed_files, 0);
+    assert_eq!(result.hits.len(), 1, "没扫描过也要能搜到");
+    assert_eq!(result.indexed_files, 2);
     assert_eq!(result.builds, 1, "第一次搜索要把索引库打开");
+
+    // 第二次搜索不该再扫一遍：`synced_at` 已经落下。
+    let again = service::search(dir.path(), "bravo", None).expect("再搜");
+    assert_eq!(again.hits.len(), 1);
+    assert_eq!(again.builds, 1, "不该重新打开索引库");
 }
 
 /// `index_ms` 只被报告一次：它是「本次搜索之前最近一次索引维护耗时」。

@@ -301,7 +301,13 @@ function summaryOf(
 
   const parts: string[] = []
   parts.push(
-    result.truncated ? `前 ${result.hits.length} 条 · 共 ${result.total} 条` : `${result.hits.length} 条`,
+    // 「至少」不是谦虚：`truncated` 有两种成因——命中超过 200 条，
+    // 或者候选池饱和（某条通道取满了上限）。后者的 `total` 是**下界**，
+    // 因为 contentless 的 FTS 表不存正文，要数全库就得读全库。
+    // 两种成因在契约里合并成同一个布尔值，所以文案统一说「至少」。
+    result.truncated
+      ? `前 ${result.hits.length} 条 · 至少 ${result.total} 条`
+      : `${result.hits.length} 条`,
   )
   parts.push(`索引 ${result.indexedFiles} 篇`)
   if (result.skippedFiles > 0) parts.push(`跳过 ${result.skippedFiles}`)

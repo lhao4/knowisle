@@ -71,3 +71,20 @@ pub(crate) fn ensure_root(cache: &mut Cache, root: &Path) {
     cache.builds = 0;
     cache.pending_index_ms = 0;
 }
+
+/// 丢掉某个 Vault 的进程内派生状态（旧索引 + 索引库连接）。
+///
+/// `vault_scan` 调用它：用户点「选择文件夹」就是明确要求"重新看一眼磁盘"，
+/// 此时还留着旧索引，等于把"外部改动要重新扫描才可见"这句话变成谎言。
+///
+/// **`builds` 不清零**：它是「本进程为这个 Vault 建过几次索引」的累计值，
+/// 重新扫描正是要让它 +1。切库才归零（见 [`ensure_root`]）。
+///
+/// 索引库的**文件**不动——它马上会被 `sync_after_scan` 更新，删掉只会让
+/// 紧接着的同步多做一次体检与全量重建。
+pub(crate) fn invalidate(cache: &mut Cache, root: &Path) {
+    if cache.root.as_deref() == Some(root) {
+        cache.legacy = None;
+        cache.store = None;
+    }
+}

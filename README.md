@@ -14,16 +14,16 @@
 | Markdown 编辑 | 已实现 | CodeMirror 6，语法高亮、加粗/斜体、撤销栈 |
 | 崩溃安全保存 | 已实现 | 写入走 `tmp → fsync → rename`；CI 里真的 `kill -9` 验证 |
 | 快速打开 | 已实现 | `Cmd/Ctrl+P`，子序列模糊匹配 |
-| 全文搜索 | 已实现 | `Cmd/Ctrl+Shift+F`，子串匹配（尚未分词，见下一行的未完成项） |
+| 全文搜索 | 已实现 | `Cmd/Ctrl+Shift+F`，FTS5 索引 + 中文 bigram 预切分；命中仍是**字面子串**语义 |
 | 大纲 | 已实现 | 随光标高亮当前章节 |
 | 新建 / 重命名 / 删除 | 已实现 | 删除是移进 `.knowisle/` 回收目录，不直接抹掉（应用内暂无恢复入口） |
 | 主题 | 已实现 | 跟随系统 / 浅色 / 深色，首帧就生效，不闪白 |
 | 安装包 | 已实现 | Windows msi/nsis、macOS dmg、Linux AppImage |
-| 检索索引（FTS5 + jieba） | 未开始 | 当前是首次搜索时把全库读进内存建索引、内存子串匹配；规模上去必须换 |
+| 检索索引 | 已实现 | `.knowisle/index.sqlite`，**派生数据、删了自动重建**；`vault_scan` 时按 mtime+size 增量同步 |
 | AI 能力 | 未开始 | — |
 | 多端同步 | 未开始 | — |
 
-当前处于 **M3** 阶段：单机可用、能装能编辑。里程碑与验收口径见 [`docs/MVP-SCOPE.md`](docs/MVP-SCOPE.md)。
+当前处于 **M4** 阶段：单机可用、能装能编辑、检索不再把全库读进内存。里程碑与验收口径见 [`docs/MVP-SCOPE.md`](docs/MVP-SCOPE.md)。
 
 ## 快捷键
 
@@ -43,8 +43,8 @@
 | 外壳 | Tauri 2（Rust core + 系统 WebView） |
 | 前端 | React 19 + TypeScript + Vite 8 |
 | 编辑器 | CodeMirror 6（唯一主编辑内核） |
-| 存储 | SQLite + rusqlite（bundled）+ refinery 迁移，手写 Repository，不用 ORM |
-| 检索 | jieba-rs 预分词 + FTS5 双通道 + RRF 融合（尚未接入） |
+| 存储 | SQLite + rusqlite（bundled），手写 Repository，不用 ORM；索引库是派生数据，**无迁移、整库重建** |
+| 检索 | FTS5 双通道（ASCII 投影 + CJK bigram 预切分）+ RRF 融合，定位仍由字面子串扫描产出（ADR-007） |
 | 样式 | Tailwind v4 + 三层 CSS 变量 token |
 | IPC 契约 | tauri-specta 生成 `bindings.ts` 并入库，CI 校验漂移 |
 
@@ -64,6 +64,8 @@
 crates/
   ki-core/       # 领域模型与错误模型（无 UI、无 IO 框架）
   ki-vault/      # Vault 扫描、读写、崩溃安全落盘
+  ki-store/      # SQLite 索引库：schema、体检/重建、手写 Repository
+  ki-search/     # 纯函数检索规划：bigram 切分、ASCII 投影、FTS5 表达式、RRF
   ki-ipc/        # Tauri 命令层（≤15 行/命令：解包 → 调 service → 序列化）
 apps/desktop/
   src-tauri/     # 应用壳：注册插件、起窗口、关窗前落盘

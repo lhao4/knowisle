@@ -43,20 +43,3 @@ pub fn query(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchRe
     result.builds = builds;
     Ok(result)
 }
-
-/// 丢掉某个 Vault 的缓存索引。
-///
-/// `vault_scan` 调用它：用户点「选择文件夹」就是明确要求"重新看一眼磁盘"，
-/// 此时还留着旧索引，等于把"外部改动要重新扫描才可见"这句话变成谎言。
-///
-/// **不动索引库连接**：库是要被 `sync_after_scan` 更新的，关掉它只会让
-/// 紧接着的同步多做一次体检。
-pub fn invalidate(root: &Path) {
-    let Ok(root) = dunce::canonicalize(root) else {
-        return;
-    };
-    let mut cache = lock();
-    if cache.root.as_deref() == Some(root.as_path()) {
-        cache.legacy = None;
-    }
-}

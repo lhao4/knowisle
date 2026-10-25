@@ -34,13 +34,30 @@ export type {
 export const vaultScan = commands.vaultScan
 
 /**
- * 全文搜索：ASCII 大小写折叠后的**子串**匹配，不模糊、不分词、不支持正则。
+ * 全文搜索。
+ *
+ * # 语义
+ *
+ * **命中内容仍然是字面子串**（ASCII 大小写折叠之后），不模糊、不支持正则。
+ * 变的是"怎么找到候选"：M4 之后候选由 SQLite FTS5 选出（英文走词首前缀，
+ * 中文走 bigram），再由同一个定位器逐行做字面判定。所以检索精度与之前相同。
+ *
+ * 两处已知差异，都写在 ADR-007 里：
+ * - **ASCII 词中子串不保证**：`us` 搜不到正文里的 `Rust`（词首前缀 `ru` 可以）。
+ * - `truncated` 为真时 `total` 是**下界**，UI 必须说「至少 N 条」。
+ *
+ * # 参数
  *
  * `refreshPath` 传当前正在编辑的笔记路径：Rust 会把它从磁盘重读一次，
  * 让刚打的字立刻可见。其余文件不重读。
  *
  * 调用方必须**先** flush 当前笔记（`noteEdit` → `noteFlush`），
  * 否则磁盘上还没有刚打的字，搜索自然找不到——那不是搜索的 bug。
+ *
+ * # 索引从哪来
+ *
+ * `vaultScan` 之后增量同步（判据 `size + mtime`，没变化就读 0 字节）。
+ * 索引库从没同步过时，搜索会自己先扫一遍，所以单独调它也不会静默返回空。
  */
 export const vaultSearch = commands.vaultSearch
 

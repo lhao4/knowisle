@@ -38,8 +38,8 @@ use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
 };
 use ki_vault::{
-    flatten_files, fold_ascii, name_lower_for_path, read_note, FileRef, NoteLocator, MAX_HITS,
-    MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+    flatten_files, fold_ascii, name_lower_for_path, read_note, scan_vault, FileRef, NoteLocator,
+    ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
 };
 
 use super::cache::{canonical_root, ensure_root, lock};
@@ -313,6 +313,23 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
     let pending_ms = std::mem::take(&mut cache.pending_index_ms);
     let builds = cache.builds;
     let db = cache.store.as_mut().expect("上面刚保证过 store 非空");
+
+    // 索引库从没同步过 → 先扫一遍再搜。
+    //
+    // 旧引擎的 `query` 是自足的：没有索引就当场建一份。新引擎若不自足，
+    // 「直接调 `vault_search` 而没先 `vault_scan`」会静默返回空结果——
+    // 那是最糟的失败模式（不报错，只是找不到东西）。
+    //
+    // 代价：只有**全新索引库**会走这条路（`synced_at` 为 0）。真实使用里
+    // 打开库一定先 `vault_scan`，所以这是给直接调用 IPC 与测试准备的保险。
+    if db.synced_at()? == 0 {
+        let started = Instant::now();
+        let scan = scan_vault(&root, &ScanOptions::default())?;
+        let now = now_ms();
+        sync(db, &root, &scan, now)?;
+        db.set_synced_at(now)?;
+        open_ms += started.elapsed().as_millis() as u64;
+    }
 
     if let Some(path) = refresh {
         // 刷新失败不该让搜索失败：用户要的是结果，不是错误。

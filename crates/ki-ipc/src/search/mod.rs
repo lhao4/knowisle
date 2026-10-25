@@ -30,12 +30,25 @@ mod cache;
 pub mod legacy;
 pub mod service;
 
-pub use legacy::invalidate;
 pub use service::{sync_after_scan, SyncReport};
 
 use std::path::Path;
 
 use ki_core::{KiError, SearchResult};
+
+/// 丢掉某个 Vault 的进程内派生状态（旧索引 + 索引库连接）。
+///
+/// `vault_scan` 调用它：用户点「选择文件夹」就是明确要求"重新看一眼磁盘"，
+/// 此时还留着旧索引，等于把"外部改动要重新扫描才可见"这句话变成谎言。
+///
+/// 它与引擎无关——两个引擎共用同一份缓存，所以作废也必须是同一个动作。
+pub fn invalidate(root: &Path) {
+    let Ok(root) = dunce::canonicalize(root) else {
+        return;
+    };
+    let mut cache = cache::lock();
+    cache::invalidate(&mut cache, &root);
+}
 
 /// 检索引擎。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +64,14 @@ pub enum Engine {
 /// 换引擎改这一行即可，不需要动前端、数据库或命令签名。对拍测试直接调
 /// [`legacy::query`] 与 [`service::search`]，不经过这里——否则它就成了
 /// 「用同一份代码对比自己」。
-pub const ENGINE: Engine = Engine::Memory;
+///
+/// # 为什么现在指向 `Fts`
+///
+/// 对拍（`tests/search_parity.rs`）已经证明两条路径逐字一致，包括
+/// 「旧引擎有、新引擎没有」这种最难查的方向。翻开关之前它是 `Memory`，
+/// 翻过来之后旧引擎仍然保留一个 release：它是回滚路径，
+/// 也是下一次改检索时的参照实现。
+pub const ENGINE: Engine = Engine::Fts;
 
 /// 查询全文索引。这是 `vault_search` 命令唯一会调的函数。
 pub fn query(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchResult, KiError> {

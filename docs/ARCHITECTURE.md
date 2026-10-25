@@ -222,6 +222,12 @@ EditorState.doc  ← 唯一真相（纯 Markdown 文本）
 
 ### ADR-004 · 本地存储：SQLite + rusqlite（无 ORM）
 
+> **⚠️ 本 ADR 的检索部分与迁移方案已被下方 ADR-007 取代（M4 落地时实测推翻）。**
+>
+> 保留原文是为了让后来者看清**前提错在哪**：第 2 点「中文分词」的实现方案（`jieba-rs` 预分词 + `unicode61`）建立在「`unicode61` 按字切分中文」这个错误认知上；`refinery` 迁移也一并取消（索引库是派生数据，整库重建即可）。
+>
+> **仍然有效**：SQLite + `rusqlite`(bundled) + 手写 Repository、坚决不用 ORM、PRAGMA 基线、Consequences 里 `spawn_blocking` 与「UI 线程永不直连」的约束。
+
 #### Context
 
 数据库承担三个角色，性质完全不同：
@@ -236,7 +242,7 @@ EditorState.doc  ← 唯一真相（纯 Markdown 文本）
 
 | 方案 | 类型安全 | 迁移 | FTS5 / 自定义分词 | 构建摩擦 | 异步模型 | 结论 |
 |------|----------|------|-------------------|----------|----------|------|
-| **rusqlite + refinery + 手写 Repository** | 手写映射（编译期保证） | refinery 内嵌，随二进制走 | **完全掌控** | **低**（bundled feature，零系统依赖） | 同步（配 `spawn_blocking`） | ✅ **选用** |
+| **rusqlite + 手写 Repository**（~~refinery~~ 已按 ADR-007 取消） | 手写映射（编译期保证） | 索引库**整库重建**，无迁移 | **完全掌控** | **低**（bundled feature，零系统依赖） | 同步（配 `spawn_blocking`） | ✅ **选用** |
 | Diesel | 编译期最强 | 需 `diesel_cli` | 需绕开 DSL 写裸 SQL | 高（宏重、编译慢、错误信息晦涩） | 同步 | ❌ |
 | SeaORM | 运行期 + 部分编译期 | 内置 | 受限（难注册 tokenizer） | 中（被迫引入 tokio 全栈） | 异步 | ❌ |
 | sqlx | 编译期（需 `DATABASE_URL` 或 `.sqlx` 离线缓存） | 需外部工具 | 受限 | **中高**（离线缓存极易与 schema 漂移，贡献者首跑必踩坑） | 异步 | ❌ |
@@ -248,9 +254,10 @@ EditorState.doc  ← 唯一真相（纯 Markdown 文本）
 
 关键考量是**中文全文检索**。FTS5 内置的 `unicode61` 分词器对中文是**按字切分**的——搜"知识库"会命中任何包含"知""识""库"三个字的文档，召回率 100%，准确率接近 0。这是国产知识库产品的头号体验杀手。
 
-我们的方案是**双通道索引**：
+我们的方案是**双通道索引**（⚠️ 下方 DDL 已被 ADR-007 取代，保留原文以对照前提错在哪，**勿照抄**；现行 DDL 见 `crates/ki-store/src/schema.rs`）：
 
 ```sql
+-- ⚠️ 已被 ADR-007 取代：unicode61 不按字切分中文，jieba 预分词做不了子串查询
 -- 通道 A：原文 + unicode61（服务英文与代码标识符）
 CREATE VIRTUAL TABLE note_fts USING fts5(
     title, body, tags,
@@ -268,6 +275,8 @@ CREATE VIRTUAL TABLE note_fts_zh USING fts5(
 ```
 
 写入时用 `jieba-rs` 做一次分词（10 万字约 40ms，跑在索引线程池），查询时用同样的分词器处理 query，两条通道结果用 RRF（Reciprocal Rank Fusion）融合排序。
+
+> ⚠️ **上一段的两个前提都不成立**（M4 实测）：① `unicode61` 把连续汉字合成**一个** token，不是按字切分，「召回率 100%、准确率 0」这个判断本身是错的；② 统计分词（jieba）切出来的词表**无法保证子串查询的召回**（查「知识库」而文档里是「知识库的设计」，词表里是「知识」「库」「设计」—— 词级 AND 直接漏掉）。现行方案是 **CJK bigram 预切分**，见 ADR-007。
 
 > 为什么不用 FTS5 的 custom tokenizer 接口？因为那要求把 jieba 注册进 SQLite 的 C 层，跨平台编译（尤其 Windows MSVC + wasm 目标）麻烦，且无法在 WASM 版复用。预分词落库是"用存储换简单性"的经典权衡，代价是索引体积 +35%，完全可接受。
 
@@ -436,6 +445,163 @@ export interface ThemeDefinition {
 
 ---
 
+### ADR-007 · 检索：FTS5 双通道 + bigram，不用 jieba（取代 ADR-004 的检索部分）
+
+> **状态**：v0.3（M4）已实施。ADR-004 的「本地存储」结论仍然有效，
+> 但其中**检索方案那一段（双通道 + jieba）已被本 ADR 取代**，
+> 且它陈述的一个技术前提是错的。改检索之前先读这里。
+
+#### Context：ADR-004 写错了一个前提
+
+ADR-004 里这句话是**错的**：
+
+> FTS5 内置的 `unicode61` 分词器对中文是**按字切分**的——搜"知识库"会命中
+> 任何包含"知""识""库"三个字的文档。
+
+实测（SQLite 3.46 / 3.53 均一致）：
+
+```sql
+-- 插入 "知识库的设计"
+SELECT count(*) FROM t WHERE t MATCH '知识库';   -- 0
+SELECT count(*) FROM t WHERE t MATCH '知识库的设计'; -- 1
+```
+
+`unicode61` **不按字切分**，它把一段**连续汉字合成一个 token**。
+`知识库的设计` 整体是一个 token，所以查 `知识库`（精确）命中不了，
+查 `库` 也命中不了（除非那个「库」在原文里被空格或标点隔开）。
+
+这推翻的不是"要做双通道"这个结论，而是**做双通道的理由**：
+
+- ❌ 错理由：「unicode61 按字切，召回 100% 准确率 0」
+- ✅ 对理由：**token 级匹配做不了 CJK 子串匹配**。任何以词/token 为单位的
+  索引（unicode61、jieba、trigram 之外的一切）都要求查询与文档在同一个
+  切分粒度上对齐；而用户搜的是子串，子串天然不对齐。
+
+顺带修正另一条：`Rust的所有权` 在 `unicode61` 下也是**一个** token。
+所以查 `rust`（精确）不中、`rust*`（前缀）中——但 `本地优先Rust` 这种
+「ASCII 在汉字后面」的写法连前缀都不行。这是通道 A 必须做 **ASCII 投影**
+（把非 ASCII 抹成空格）的原因。
+
+#### Decision
+
+三层分工，每层只做一件事：
+
+```
+plan(query)  ──> 通道 A（ASCII 投影，词首前缀）   ┐
+                通道 B（CJK bigram，AND）        ├─> RRF ─> 候选池 ─> NoteLocator ─> 命中行
+                文件名通道（字面子串）            ┘
+```
+
+1. **索引层只选候选，不做判定。** 行号、UTF-16 列号、摘要窗口全部由
+   `ki_vault::NoteLocator` 的字面子串扫描产出。这条分工是整次换芯的支点：
+   18 条既有行为契约自动继续成立（它们是同一份代码在跑），检索精度与旧引擎
+   完全相同，差异只可能来自候选集。
+2. **通道 B 用 bigram，不用 jieba。** 见下。
+3. **两张 FTS 表都是 `content=''`**（contentless）：索引里**不存正文副本**
+   （公理 A1：磁盘才是唯一真相源）。
+
+#### 为什么是 bigram 而不是 jieba
+
+索引层的任务只有一条：**不能漏候选**。bigram 恰好能给出这条保证，
+而且可以证明：
+
+> 若 `Q ⊆ T`（Q 是 T 的连续子串）且 Q 含 ≥2 个汉字，
+> 则 Q 的 bigram 多重集 ⊆ T 的 bigram 多重集。
+
+证明是一行：Q 里每个 bigram 都是 T 里同一个位置的 bigram。多重集而非集合，
+是因为 `哈哈` 在 T 里出现一次、在 Q 里出现两次时需要能"用两次"；
+而 FTS5 的 `AND` 只查有没有，比多重集更宽松，所以这条保证只会更强。
+
+实测：300 篇随机混排文档 + **2971 组**「Q 是 T 的连续子串且含 ≥2 汉字」的
+随机查询，**漏召回 0 组**。
+
+jieba 给不出任何保证：查询切出来的词与文档切出来的词依赖上下文，
+`知识库` 在一处成词、在另一处被切成 `知识` + `库`，于是「明明有这句话却搜不到」。
+它换来的是更好的相关性排序——但排序在我们这里是 RRF 与定位器的事，
+不该拿召回率去换。附带省掉：14MB 内嵌词典、`Jieba::new()` 的启动成本、
+query/doc 分词不一致这一类 bug。
+
+**切分规则**（`crates/ki-search/src/bigram.rs`）：
+
+| 文本 | 通道 B |
+|---|---|
+| `知识库` | `知识 识库` |
+| `Rust的所有权` | `的所 所有 有权 t的` |
+| `知识库Rust` | `知识 识库 库R` |
+| `的` / `🙂🙂` / `foo_bar` | 空 |
+
+- 字符分三类：`Cjk`（Han 各区块 + 假名 + 谚文 + 注音，**不含** CJK 标点与全角形式）、
+  `Word`（`is_alphanumeric() && !is_cjk`，含全角字母数字，**不含** `_`/`-`/emoji）、
+  `Other`（分隔）。
+- 每个 `Cjk` run 发全部重叠 bigram；**跨脚本边界**另发 `prev+run[0]` /
+  `run[last]+next`（`知识库Rust` 里 `库R` 是唯一的跨脚本线索，不发就漏召回）。
+- `Word` run 本身不进通道 B（通道 A 负责）。token 用单空格连接，**保留重复**
+  （bm25 需要词频）。
+
+#### 为什么是 contentless，以及摘要从哪来
+
+`content=''` 的 FTS5 表默认**不支持 DELETE**（报
+`cannot DELETE from contentless fts5 table`），必须带 `contentless_delete=1`
+（SQLite ≥ 3.43）。它与 `columnsize=0` **互斥**，一起写建表直接报错。
+
+contentless 不存原文，因此 `snippet()` / `highlight()` 不可用——**我们本来也不需要**：
+摘要由定位器从磁盘上的正文算出来，那才是唯一真相源。这顺带解决了文档里
+`content=''` 与 `snippet()` 的既有冲突。
+
+#### 为什么不用 refinery
+
+索引库整库可重建（10k 篇约 5 秒）。迁移是给「删了就没了」的数据用的；
+对可重建的库，迁移只会留下一串立刻会被丢弃的迁移文件，并引入一条
+「迁移写错了但没人发现」的新故障路径。
+
+**处置**：任何可疑状态（`quick_check` 不过、schema 版本不符、分词版本不符、
+`vault_root` 不符、三张表行数不一致）一律**整库重建**。
+
+**偿还触发条件**：第一张存不可重建数据的表（历史版本、链接元数据）落地时，
+同时引入 refinery 与从 v1 起的基线迁移——那时重建不再是无损操作。
+
+#### RRF 参数
+
+`score(d) = Σ 1/(k + rank_i(d))`，**k = 60，权重全 1.0**，每通道 top-200，
+候选池 400。文件名通道的候选**全部进池**（`name_hit` 是排序契约第一键，
+被截断挤掉会让「按文件名搜」直接失效）。
+
+不做通道加权：A/B 互斥，N 的重要性由第一排序键保证，加权只增加解释成本。
+
+**但 RRF 目前只决定「谁进池」，不决定最终顺序。** 命中行的顺序仍是
+`name_hit desc → path asc → line asc`，与旧引擎逐字一致——否则前端列表顺序
+会变，而那是没有契约支撑的行为变更。**相关性排序（让最相关的笔记靠前）
+仍然没有做**，它需要新的排序契约与前端文案。
+
+#### 已知收窄与偿还计划
+
+| 收窄 | 表现 | 偿还 |
+|---|---|---|
+| **ASCII 词中子串不保证** | `us` 搜不到正文里的 `Rust`（词首前缀 `ru`/`rus`/`rust` 可以） | 加 FTS5 `trigram` 第三通道，代价是索引体积。用例 `known_divergence_ascii_infix_is_documented` 钉住了当前行为，修好它会变红 |
+| **单字 / 纯 emoji 查询走全扫** | 没有 bigram 也没有 ASCII 词，索引里查不到，只能逐篇字面扫描 | 全扫要读全库（旧引擎是内存里过一遍）。10k 库上明显更慢。可考虑给 CJK 单字加一路 unigram 通道，代价是索引翻倍 |
+| **`total` 可能是下界** | 候选池饱和时 `total` 只统计池内命中 | `truncated` 为真，UI 说「至少 N 条」 |
+| **`size + mtime` 漏检同秒改动** | 同一毫秒内改动且字节数不变 → 判成未变 | 当前编辑篇走 `refresh`（每次搜索前重读），其余靠重新扫描；记在 BACKLOG |
+
+#### Consequences
+
+| 代价 | 缓解 |
+|---|---|
+| 索引体积（每字约 2 个 bigram token） | 只索引 CJK bigram，ASCII 走投影；超预算再考虑去重（会损失词频） |
+| 首次建 10k 库要读全部正文（约 30MB / 3–5s） | 每 256 篇一个事务；建库期间搜索会排队（`busy_timeout=5000`） |
+| 全扫路径要读全库 | 单字/emoji 查询本来就少见；`plan` 把它们明确分流 |
+| 两套引擎共存 | 旧引擎保留一个 release 作回滚路径与对拍参照，之后清理 |
+
+#### 坚决不选
+
+- ❌ **jieba / 任何统计分词** —— 见上，召回率不能拿来换排序。
+- ❌ **FTS5 `trigram`** —— 它能做子串匹配，但索引体积约为原文 3 倍，
+  而 bigram 已经给出了可证明的召回保证。留作 ASCII 词中子串的偿还方案。
+- ❌ **把正文存进 FTS 表** —— 违反 A1，且会把索引库撑到与 Vault 同量级。
+- ❌ **在索引库里存行号/摘要** —— 它们必须由磁盘上的当前版本算出来，
+  否则会与用户看到的正文不一致。
+
+---
+
 ### 1.7 选型边界总表
 
 这张表是本文档的**执行摘要**。任何偏离此表的 PR 需要先改这张表。
@@ -448,8 +614,8 @@ export interface ThemeDefinition {
 | 编辑内核 | CodeMirror 6（唯一主内核） | Monaco、ProseMirror/Tiptap 主内核、Slate、自研 contenteditable |
 | 文档模型 | 纯 Markdown 文本 + Lezer 增量语法树 | 富文本节点树、任何有损 round-trip 方案 |
 | 本地库 | SQLite（rusqlite bundled）+ WAL + FTS5 | 任何 ORM、IndexedDB 主存储、LMDB/RocksDB、JSON 文件元数据 |
-| 迁移 | refinery（编译期内嵌 SQL） | 运行时下载迁移脚本、`diesel_cli` |
-| 中文分词 | jieba-rs 预分词 + FTS5 双通道 + RRF 融合 | 仅用 unicode61（中文召回失准）、Elasticsearch（杀鸡用牛刀） |
+| 迁移 | **索引库整库重建**（派生数据，无迁移）；不可重建的数据落地时才引入 refinery | 给可重建的库写迁移、运行时下载迁移脚本、`diesel_cli` |
+| 中文检索 | **CJK bigram 预切分** + FTS5 双通道 + RRF 融合（ADR-007） | jieba 等统计分词、仅用 unicode61（token 级匹配做不了子串匹配）、Elasticsearch |
 | 前端状态 | Zustand（UI 态）+ TanStack Query（IPC 态）+ CM6 EditorState（文档态） | Redux、MobX、Jotai/Recoil、Context 传高频状态 |
 | 样式 | Tailwind v4 + 三层 CSS 变量 Token | CSS-in-JS、SCSS 变量主题、Ant Design/MUI 主库 |
 | UI 原语 | Radix UI（headless）+ 自研样式 | 任何带强视觉主张的组件库 |
@@ -470,7 +636,7 @@ export interface ThemeDefinition {
 | TypeScript | 5.6+ | 类型收窄与 `satisfies` |
 | CodeMirror | 6.x (`@codemirror/*` 各自最新) | 无版本锁定，语义化发布稳定 |
 | Tailwind CSS | 4.x | CSS-first 配置，`@theme` 直连变量 |
-| SQLite | 3.45+（rusqlite bundled） | `jsonb_*` 与 FTS5 稳定 |
+| SQLite | **3.46**（`rusqlite 0.32` bundled，内置 FTS5） | `contentless_delete=1` 要求 3.43+；再升 rusqlite 会顶掉 MSRV 1.82，见 ADR-007 |
 | Node | 22 LTS | 构建工具链 |
 
 ---
@@ -1470,6 +1636,8 @@ export type PluginCapability =
 
 ### 3.4 SQLite Schema 要点
 
+> **本节是目标形态（M5+ 的标签、链接图、附件），不是当前实现。** M4 落地的只是子集 —— `meta` / `note` / `note_fts` / `note_fts_zh` 四张表，字段名以 `crates/ki-store/src/schema.rs` 为准（`note` 用 `INTEGER PRIMARY KEY` 作 rowid，路径 `UNIQUE`，`status` 区分 `ok` / `skipped`）。下面 `note_fts` / `note_fts_zh` 两段 DDL **已被 ADR-007 取代**，现行是 `body_ascii` + `body_tokens` 两列、`content=''` + `contentless_delete=1`。
+
 ```sql
 -- 笔记元数据（真相在文件，这里是索引）
 CREATE TABLE note (
@@ -1492,6 +1660,8 @@ CREATE INDEX idx_note_updated ON note(updated_at DESC) WHERE is_trashed = 0;
 CREATE INDEX idx_note_path    ON note(path);
 
 -- 全文索引（双通道：原文 + 中文预分词）
+-- ⚠️ 已被 ADR-007 取代（unicode61 不按字切分中文、jieba 预分词做不了子串查询）
+-- 现行 DDL 见 crates/ki-store/src/schema.rs
 CREATE VIRTUAL TABLE note_fts USING fts5(
   title, body, tags, content='', tokenize='unicode61 remove_diacritics 2'
 );
