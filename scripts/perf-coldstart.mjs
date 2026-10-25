@@ -296,20 +296,50 @@ fs.writeFileSync(path.join(VAULT, '日记', 'd.md'), '# D\n\n第四篇。\n')
 fs.writeFileSync(path.join(VAULT, '日记', 'e.md'), '# E\n\n第五篇。\n')
 
 const APP = findApp()
+// 额外的浏览器参数可以外部追加，CI 上要靠它试 `--disable-gpu`：
+// 共享 runner 没有可用显卡，而 Chromium 在拿不到 D3D 时的降级路径
+// 与桌面机不同。
+const EXTRA_ARGS = process.env.PERF_WEBVIEW2_ARGS ?? ''
 const ENV = {
   ...process.env,
-  WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--no-sandbox --remote-debugging-port=${PORT}`,
+  WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:
+    `--no-sandbox --remote-debugging-port=${PORT} ${EXTRA_ARGS}`.trim(),
 }
 
 const launch = () => spawn(APP, [], { detached: true, stdio: 'ignore', env: ENV })
+
+/**
+ * 把调试端口的真实回应打出来，只在失败时调用。
+ *
+ * 「调试端口没开」这句话本身会撒谎：`/json/version` 通而 `/json/list` 是空数组，
+ * 意思是**端口开着、浏览器进程活着，但一个页面 target 都没建起来**——那是
+ * WebView2 建不出 webview，跟端口一点关系没有。两者的修法完全不同，
+ * 所以宁可多打两行也不要在这种地方猜。
+ */
+async function probePort() {
+  const out = []
+  for (const path of ['/json/version', '/json/list']) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${PORT}${path}`)
+      const text = await res.text()
+      out.push(`${path} → ${res.status} ${text.slice(0, 300)}`)
+    } catch (error) {
+      out.push(`${path} → 连不上（${error.message}）`)
+    }
+  }
+  return out.join(' | ')
+}
 
 /** 起一个实例、连上 CDP、等文档就绪。返回 { child, cdp }。 */
 async function boot(timeoutMs = 30000) {
   const child = launch()
   const wsUrl = await waitForPage(Date.now() + timeoutMs)
   if (wsUrl === null) {
-    // 进程死没死是这里唯一有用的诊断：还活着说明是 WebView2 起不来，
-    // 已经退出了说明应用在初始化阶段就崩了（多半是用户数据目录被上一轮占着）。
+    // 进程死没死 + 子孙进程 + 端口原始回应，三样一起才够定位：
+    //   进程没了           → 初始化阶段就崩了（多半是用户数据目录被上一轮占着）
+    //   没有 msedgewebview2 → 运行时缺失或环境创建失败
+    //   有但端口连不上      → 参数没传到 WebView2
+    //   端口通但没有 target → webview 建不出来（无交互桌面 / 无显卡 / 会话 0）
     const alive = (() => {
       try {
         process.kill(child.pid, 0)
@@ -319,11 +349,12 @@ async function boot(timeoutMs = 30000) {
       }
     })()
     const kids = alive ? descendants(child.pid) : ''
+    const port = await probePort()
     killTree(child.pid)
     throw new Error(
       `调试端口没开（进程${
         alive ? `仍在，卡在 WebView2 初始化；子孙进程: ${kids}` : '已退出，初始化阶段就崩了'
-      }）`,
+      }；${port}）`,
     )
   }
   const cdp = await openWs(wsUrl)
