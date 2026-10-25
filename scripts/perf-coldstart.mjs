@@ -14,6 +14,8 @@
 // 用法：
 //   node scripts/perf-coldstart.mjs
 //   PERF_ROUNDS=5 PERF_K2_MS=2000 node scripts/perf-coldstart.mjs   # CI
+//   PERF_CDP_PORT=9222 node scripts/perf-coldstart.mjs               # 钉死调试端口
+//   PERF_WEBVIEW2_ARGS=--disable-gpu node scripts/perf-coldstart.mjs # 追加浏览器参数
 //
 // # 为什么不能只跑 `cargo build --release`
 //
@@ -56,7 +58,35 @@ import { execSync, spawn } from 'node:child_process'
 
 const ROOT = path.resolve(import.meta.dirname, '..')
 const VAULT = path.join(ROOT, '.tmp', 'vault-perf')
-const PORT = 9222
+
+/**
+ * CDP 端口不能写死 9222。
+ *
+ * 实测（CI 日志）：在 GitHub 托管的 Windows runner 上，WebView2 的浏览器进程
+ * 起来了（子孙进程里有 `msedgewebview2.exe`），但 `/json/version` 和 `/json/list`
+ * 全部 `fetch failed`——端口根本没监听。Chromium 绑不上端口时会**静默放弃**
+ * DevTools，不报错、不退出，症状和「WebView2 起不来」一模一样。
+ *
+ * 而这类机器上 WSL2 / Hyper-V 会预留成片的 TCP 端口（`netsh int ipv4 show
+ * excludedportrange protocol=tcp`），9222 完全可能落在里面。所以改成向系统要
+ * 一个当前真的能绑的端口：bind(0) 由内核分配，预留区间里的端口内核不会给。
+ * 用 `PERF_CDP_PORT` 可以钉死，方便复现。
+ */
+async function pickPort() {
+  const fixed = Number(process.env.PERF_CDP_PORT ?? 0)
+  if (fixed > 0) return fixed
+  const { createServer } = await import('node:net')
+  return await new Promise((resolve, reject) => {
+    const srv = createServer()
+    srv.once('error', reject)
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address()
+      srv.close(() => resolve(port))
+    })
+  })
+}
+
+const PORT = await pickPort()
 // 全部可调，CI 用环境变量压轮数以省时间；本地默认 10 轮。
 const ROUNDS = Number(process.env.PERF_ROUNDS ?? 10)
 const COOLDOWN_MS = Number(process.env.PERF_COOLDOWN_MS ?? 2000)
@@ -400,6 +430,7 @@ await waitPortClosed()
 // 给上一轮被杀掉的浏览器进程留出真正退场的时间：用户数据目录的锁是它持有的，
 // 抢在它前面启动新实例会直接失败。
 await sleep(2000)
+console.log(`  CDP 端口 ${PORT}（由内核分配，避开 Hyper-V 预留区间）`)
 {
   const { child, cdp, href } = await bootWithRetry()
   const written = await evaluate(
