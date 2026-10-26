@@ -462,6 +462,51 @@ fn finish(
     }
 }
 
+/// 把一篇笔记**定点**写进索引，不重扫全库。
+///
+/// # 谁需要它
+///
+/// 回收站恢复（`trash_restore`）。文件回到了磁盘，但索引里没有它——而
+/// 增量同步是挂在 `vault_scan` 后面的。若只靠前端「恢复完记得重扫一次」，
+/// 那么任何绕过前端的调用（将来的 `isle` CLI、集成测试）都会得到
+/// 「恢复回来了，但搜不到」：不报错，只是找不到。
+///
+/// # 为什么不是 `invalidate`
+///
+/// `invalidate` 只丢掉进程内的连接；索引库里缺的那一行还在缺。下一次搜索
+/// 重开连接时 `synced_at` 非 0，不会自动补——必须真的写一行进去。
+///
+/// # 边界
+///
+/// - 索引库还没打开，或从没同步过（`synced_at == 0`）：什么都不做。
+///   下一次搜索会自建并全量同步；在这里替它开工只会往一个空库里写一行。
+/// - 读不到（刚又被删了、编码坏了、超过 2MB）：**删掉那一行**。超大文件
+///   下次扫描会以 `skipped` 的身份回来，不值得为它多一条分支。
+/// - 失败由调用方吞掉：恢复已经成功，索引问题不该让用户以为「没恢复」。
+pub fn reindex(root: &Path, rel: &str) -> Result<(), KiError> {
+    let root = canonical_root(root)?;
+    let mut cache = lock();
+    ensure_root(&mut cache, &root);
+
+    let Some(db) = cache.store.as_mut() else {
+        return Ok(());
+    };
+    if db.synced_at()? == 0 {
+        return Ok(());
+    }
+
+    let now = now_ms();
+    match read_note(&root, rel) {
+        Ok(note) => {
+            db.upsert_ok(&indexed_note(&note), now)?;
+        }
+        Err(_) => {
+            db.delete_by_path(rel)?;
+        }
+    }
+    Ok(())
+}
+
 /// 把「当前正在编辑的那一篇」重新索引一次。
 ///
 /// 每次搜索只重读一个文件，换来的是「刚打的字立刻能搜到」。若改成整库重建，

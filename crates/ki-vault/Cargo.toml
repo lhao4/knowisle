@@ -9,6 +9,9 @@ license.workspace = true
 [dependencies]
 ki-core = { workspace = true }
 serde = { workspace = true }
+# 回收站清单（`.knowisle/trash/manifest/*.json`）的唯一用途。
+# 它**不是**第二份数据存储：一条记录只有 origin + deletedAt，正文仍在 Markdown 里。
+serde_json = { workspace = true }
 walkdir = { workspace = true }
 dunce = { workspace = true }
 

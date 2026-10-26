@@ -16,10 +16,12 @@
 pub mod error;
 pub mod node;
 pub mod search;
+pub mod trash;
 
 pub use error::{IoKind, KiError};
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{SearchHit, SearchResult};
+pub use trash::{RestoreResult, TrashEntry};
 
 /// 本应用的元数据目录（Vault 相对路径的第一级）。
 ///

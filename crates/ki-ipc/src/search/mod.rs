@@ -30,7 +30,7 @@ mod cache;
 pub mod legacy;
 pub mod service;
 
-pub use service::{sync_after_scan, SyncReport};
+pub use service::{reindex, sync_after_scan, SyncReport};
 
 use std::path::Path;
 

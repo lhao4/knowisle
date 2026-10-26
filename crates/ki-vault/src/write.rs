@@ -129,17 +129,7 @@ pub fn write_note_checked(
         }
     }
 
-    let parent = target.parent().ok_or_else(|| KiError::PathEscape {
-        path: rel.to_owned(),
-    })?;
-
-    let tmp = parent.join(format!(
-        "{TMP_PREFIX}{}.{}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    commit(&tmp, &target, bytes).map_err(|e| KiError::io(rel, &e))?;
+    atomic_replace(&target, bytes).map_err(|e| KiError::io(rel, &e))?;
 
     // 回执取磁盘真值，不拿入参长度充数——编码或换行被改写时这里会立刻不符。
     let meta = std::fs::metadata(&target).map_err(|e| KiError::io(rel, &e))?;
@@ -150,6 +140,32 @@ pub fn write_note_checked(
         size,
         mtime,
     })
+}
+
+/// 把 `bytes` 原子地替换到 `target`：`tmp → fsync → rename`。
+///
+/// # 为什么抽成 `pub(crate)`
+///
+/// 回收站清单（`crate::trash`）是第二处需要"文件在任何时刻都是完整的旧内容
+/// 或完整的新内容"的地方——它一旦半截，下次启动读不出原路径，用户就回不到
+/// 原来的目录。**不能**让它自己写一份 `fs::write`：那条路径上的坑（tmp 必须
+/// 同目录、Windows 上必须先 drop 再 rename、父目录 fsync 只能 Unix 做）
+/// 每一条都已经在本模块的注释里付过学费，复制一遍就是等着漂移。
+///
+/// 代价是 tmp 名与本模块共用同一个前缀与序号——两个调用点不会撞名，
+/// 因为序号是进程级单调的。
+pub(crate) fn atomic_replace(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径没有父目录")
+    })?;
+
+    let tmp = parent.join(format!(
+        "{TMP_PREFIX}{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    commit(&tmp, target, bytes)
 }
 
 /// 四步落地。任何一步失败都清掉 tmp，绝不留下半成品。

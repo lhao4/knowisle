@@ -9,6 +9,7 @@ import { Outline, type OutlineHandle } from './components/Outline'
 import { QuickOpen } from './components/QuickOpen'
 import { SearchOverlay } from './components/SearchOverlay'
 import { ThemeToggle } from './components/ThemeToggle'
+import { TrashPanel } from './components/TrashPanel'
 import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { flattenVault, type QuickItem } from './lib/quick-open'
@@ -24,12 +25,17 @@ import {
   noteRename,
   noteStatus,
   pickFolder,
+  trashList,
+  trashPurge,
+  trashRestore,
   vaultScan,
   type FileNode,
   type NoteContent,
+  type RestoreResult,
   type SaveState,
   type ScanResult,
   type SearchHit,
+  type TrashEntry,
 } from './api'
 
 /**
@@ -167,6 +173,25 @@ export default function App() {
    */
   const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen)
 
+  /**
+   * 回收站列表。**唯一**的条数来源：侧栏徽标与面板读的是同一份。
+   *
+   * 每次扫描、每次删除/恢复/清空之后重读。不用单独的 `trash_count` 命令：
+   * 那会让"徽标上的数字"与"面板里的行"有两个数据源，而它们迟早会不一致。
+   */
+  const [trash, setTrash] = useState<TrashEntry[]>([])
+  const [trashOpen, setTrashOpen] = useState(false)
+  const [trashLoading, setTrashLoading] = useState(false)
+  /** 正在恢复的条目（`entry`）；`null` 表示空闲。 */
+  const [trashRestoring, setTrashRestoring] = useState<string | null>(null)
+  const [trashPurging, setTrashPurging] = useState(false)
+  /** 面板里的错误行：读不出来 / 恢复失败。 */
+  const [trashError, setTrashError] = useState<string | null>(null)
+  /** 清空的二次确认是否打开。 */
+  const [purgeOpen, setPurgeOpen] = useState(false)
+  /** 面板容器。清空确认关掉之后把焦点还回来，理由见 `TrashPanel` 的注释。 */
+  const trashPanelRef = useRef<HTMLDivElement>(null)
+
   // 写回。`useEffect` 就够了：首帧敏感的是"读"，那件事在初始化器里做完了。
   useEffect(() => {
     try {
@@ -220,16 +245,45 @@ export default function App() {
   const { pref: themePref, cycle: cycleTheme } = useTheme()
 
   /**
-   * 安装一次扫描结果：树进 state，扁平候选表进 ref。
+   * 重读回收站列表。
    *
-   * 两件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
+   * 失败只记进面板的错误行，**不弹全局横幅**：回收站读不出来时用户很可能
+   * 正在编辑，为一条旁路信息打断他不值得。而面板打开时他一定会看见。
+   */
+  const refreshTrash = useCallback(async (root: string) => {
+    setTrashLoading(true)
+    try {
+      setTrash(await trashList(root))
+      setTrashError(null)
+    } catch (err) {
+      setTrashError(describeError(err))
+    } finally {
+      setTrashLoading(false)
+    }
+  }, [])
+
+  /**
+   * 安装一次扫描结果：树进 state，扁平候选表进 ref，回收站条数跟着重读。
+   *
+   * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
    * 会让面板拿着上一个库的路径去 `noteRead`——报错是 PATH_ESCAPE，
    * 而真正的原因在另一个文件里。收成一个函数就没有漏掉的机会。
+   *
+   * 回收站也在这里刷新：删完 / 恢复完 / 清空完都会走一次扫描，而徽标上的
+   * 数字必须与那次磁盘变化同步——否则用户删了一篇，侧栏还写着「回收站 0」。
    */
-  const applyVault = useCallback((result: ScanResult | null) => {
-    setVault(result)
-    quickItems.current = result === null ? [] : flattenVault(result.tree)
-  }, [])
+  const applyVault = useCallback(
+    (result: ScanResult | null) => {
+      setVault(result)
+      quickItems.current = result === null ? [] : flattenVault(result.tree)
+      if (result === null) {
+        setTrash([])
+        return
+      }
+      void refreshTrash(result.root)
+    },
+    [refreshTrash],
+  )
 
   const showFlash = useCallback((text: string) => {
     if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
@@ -659,6 +713,96 @@ export default function App() {
   }, [focusEditor])
 
   /**
+   * 打开回收站：**先开面板**，再读列表。
+   *
+   * 顺序是为了"点了就有反应"：读列表要过一次 IPC，先等它再开面板会有一段
+   * 什么都不发生的空白。面板自己会显示「读取中…」，那是诚实的中间态。
+   */
+  const openTrash = useCallback(() => {
+    if (!vault) return
+    setTrashError(null)
+    setTrashOpen(true)
+    void refreshTrash(vault.root)
+  }, [vault, refreshTrash])
+
+  /** 关闭回收站并把焦点还给编辑器。取消与恢复成功共用这一条路径。 */
+  const closeTrash = useCallback(() => {
+    setTrashOpen(false)
+    setPurgeOpen(false)
+    editorRef.current?.focus()
+  }, [])
+
+  /**
+   * 从回收站恢复一条。
+   *
+   * # 顺序与新建完全一致
+   *
+   * 恢复 → **整库重扫** → 打开。重扫必须在打开之前：树要先有这一项，
+   * `openNote` 之后的高亮才有落点，否则用户会看到"正文换了、侧栏还是旧的"。
+   *
+   * # 先收面板再打开
+   *
+   * 面板是 fixed 全屏遮罩。留着它盖在刚恢复的正文上，用户会以为
+   * "恢复了但没打开"——而正文其实已经在了。
+   *
+   * # 三种结果都要说
+   *
+   * 撞名改名为 `c 2.md`、降级落到库根，都不是错误，但都**改变了落点**。
+   * 只说"已恢复"会让用户在原路径下找不到文件，然后怀疑恢复没生效。
+   */
+  const restoreFromTrash = useCallback(
+    async (entry: string) => {
+      if (!vault) return
+      setTrashRestoring(entry)
+      setTrashError(null)
+      try {
+        const result = await trashRestore(vault.root, entry)
+        applyVault(await vaultScan(vault.root))
+        setRevealPath(result.path)
+        setTrashOpen(false)
+        await openNote(result.path)
+        showFlash(describeRestore(result))
+      } catch (err) {
+        setTrashError(describeError(err))
+      } finally {
+        setTrashRestoring(null)
+      }
+    },
+    [vault, applyVault, openNote, showFlash],
+  )
+
+  /**
+   * 清空回收站。**只由确认框触发**，没有任何"顺手清一下"的入口。
+   *
+   * 失败返回文案交给 `ConfirmDialog` 展示：确认框留在屏幕上，用户能直接重试，
+   * 而面板里的错误行会被确认框盖住。
+   */
+  const purgeTrash = useCallback(async (): Promise<string | null> => {
+    if (!vault) return '还没有打开知识库'
+    setTrashPurging(true)
+    try {
+      await trashPurge(vault.root)
+      await refreshTrash(vault.root)
+      return null
+    } catch (err) {
+      return describeError(err)
+    } finally {
+      setTrashPurging(false)
+    }
+  }, [vault, refreshTrash])
+
+  /**
+   * 关掉清空确认，把焦点还给面板。
+   *
+   * `ConfirmDialog` 卸载后焦点会落到 `<body>`，而 Esc 监听挂在面板容器上——
+   * 那一刻用户按 Esc 关不掉回收站，看起来像卡住了。
+   */
+  const closePurge = useCallback(() => {
+    setPurgeOpen(false)
+    trashPanelRef.current?.focus()
+  }, [])
+
+  /**
    * 菜单项。目录只有「新建」，文件多「重命名」与「删除」。
    *
    * 目录不改名也不删除：那会把一整片笔记从树里搬走（扫描器按路径建树），
@@ -752,7 +896,12 @@ export default function App() {
   const createDir = activeNote === null ? '' : parentDir(activeNote.path)
   /** 屏幕上是否有任意一层浮层 / 菜单。`Mod+N` 据此判断要不要装死。 */
   const overlayOpen =
-    prompt !== null || paletteOpen || searchOpen || menu !== null || deleteTarget !== null
+    prompt !== null ||
+    paletteOpen ||
+    searchOpen ||
+    menu !== null ||
+    deleteTarget !== null ||
+    trashOpen
 
   /**
    * `Cmd/Ctrl+P`。
@@ -784,13 +933,14 @@ export default function App() {
       // WebView 里 `Ctrl+P` 是「打印」，不拦会弹出一个打印对话框。
       e.preventDefault()
       // 搜索浮层开着时不响应：两层浮层叠在一起，Esc 该关谁就没有答案了。
-      if (!hasVault || searchOpen) return
+      // 回收站同理——它是全屏遮罩，浮层开在它后面等于没开。
+      if (!hasVault || searchOpen || trashOpen) return
       setPaletteOpen(true)
     }
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [hasVault, searchOpen])
+  }, [hasVault, searchOpen, trashOpen])
 
   /**
    * `Cmd/Ctrl+Shift+F` 全文搜索。
@@ -810,13 +960,13 @@ export default function App() {
       if (e.key !== 'f' && e.key !== 'F') return
       e.preventDefault()
       // 快速打开开着时不响应，理由同上一条（反方向）。
-      if (!hasVault || paletteOpen) return
+      if (!hasVault || paletteOpen || trashOpen) return
       setSearchOpen(true)
     }
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [hasVault, paletteOpen])
+  }, [hasVault, paletteOpen, trashOpen])
 
   /**
    * `Cmd/Ctrl+N` 新建笔记。
@@ -926,7 +1076,7 @@ export default function App() {
         <div className="brand">
           <span className="brand__mark">◈</span>
           <span className="brand__name">知屿 KnowIsle</span>
-          <span className="brand__tag">M3</span>
+          <span className="brand__tag">M5</span>
         </div>
 
         {/*
@@ -1027,6 +1177,27 @@ export default function App() {
                     这个文件夹里没有 .md 文件。点上面的「新建」写第一篇。
                   </p>
                 )}
+              </div>
+
+              {/*
+                回收站入口。**固定在侧栏底部**，不跟着树滚走：
+                它的用途是"我刚才删错了"，那时用户多半已经滚到别处，
+                而滚走之后他会以为没有这个功能。
+
+                条数只在非零时显示——常驻一个「0」会让它看起来像坏了。
+              */}
+              <div className="sidebar__foot">
+                <button
+                  type="button"
+                  className="trash-link"
+                  onClick={openTrash}
+                  title="查看、恢复或清空已删除的笔记"
+                >
+                  <span>回收站</span>
+                  {trash.length > 0 && (
+                    <span className="trash-link__count">{trash.length}</span>
+                  )}
+                </button>
               </div>
             </>
           ) : (
@@ -1194,8 +1365,8 @@ export default function App() {
 
       {/*
         删除的二次确认。文案必须把三件事说全：移到哪里、**不是**永久删除、
-        但应用里没有恢复入口。少说最后一句，"移到回收站"会被理解成
-        "随时能撤销"——那是我们给不了的承诺。
+        以及**怎么找回来**。少说最后一句，"移到回收站"会被理解成
+        "随时能撤销"——而清空之后它确实撤销不了，两句话都要说。
       */}
       {deleteTarget !== null && (
         <ConfirmDialog
@@ -1209,11 +1380,64 @@ export default function App() {
             <code className="confirm__path">.knowisle/trash/</code>。
           </p>
           <p className="confirm__note">
-            不是永久删除，文件还在磁盘上；但应用里<strong>没有恢复入口</strong>，要找回得自己去文件夹翻。
-          </p>        </ConfirmDialog>
+            不是永久删除：侧栏底部的「回收站」里可以恢复回原目录。清空回收站才会真正删掉文件。
+          </p>
+        </ConfirmDialog>
+      )}
+
+      {/*
+        回收站面板。放在 `.app` 最后、与其它浮层同级：fixed 定位不参与布局，
+        打开时不会让正文重新排版（那会连带触发 CM6 重测量）。
+      */}
+      {trashOpen && (
+        <TrashPanel
+          panelRef={trashPanelRef}
+          entries={trash}
+          loading={trashLoading}
+          restoring={trashRestoring}
+          purging={trashPurging}
+          error={trashError}
+          onRestore={(entry) => void restoreFromTrash(entry)}
+          onPurge={() => setPurgeOpen(true)}
+          onClose={closeTrash}
+        />
+      )}
+
+      {/*
+        清空的二次确认。叠在回收站面板之上（`.confirm-backdrop` 的 z-index 更高），
+        所以这里不需要把面板先关掉——关掉再问会让人以为清空已经开始了。
+      */}
+      {purgeOpen && (
+        <ConfirmDialog
+          title="清空回收站？"
+          confirmLabel="永久删除"
+          onSubmit={purgeTrash}
+          onClose={closePurge}
+        >
+          <p>
+            回收站里的 <span className="confirm__name">{trash.length}</span> 篇笔记会被
+            <strong>永久删除</strong>，磁盘上不再有副本。
+          </p>
+          <p className="confirm__note">
+            这是本应用里唯一无法撤销的操作。只想删掉其中一篇的话，先点「取消」，再逐条恢复。
+          </p>
+        </ConfirmDialog>
       )}
     </div>
   )
+}
+
+/**
+ * 恢复结果的一句话。
+ *
+ * 三种情况必须分开说。合并成「已恢复」是最省事的写法，也是最坏的：撞名时
+ * 文件变成了 `c 2.md`、降级时落在了库根目录——用户在原路径下找不到，
+ * 会认定恢复没生效，然后再点一次（第二次会得到 `c 3.md`）。
+ */
+function describeRestore(result: RestoreResult): string {
+  if (result.degraded) return `已恢复到库根目录：${result.path}（原路径记录缺失）`
+  if (result.renamed) return `已恢复为 ${result.path}（原名已被占用）`
+  return `已恢复到 ${result.path}`
 }
 
 /** 把保存状态翻成一句人话。空串表示还没开始编辑，不显示。 */

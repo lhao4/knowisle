@@ -67,12 +67,14 @@ pub fn to_posix(rel: &Path) -> Option<String> {
 /// 路径**语法**校验：只判断这段字符串有没有可能指向 Vault 内部，不碰文件系统。
 ///
 /// 读写两条路径共用，确保规则只有一份——两份慢慢漂移的校验等于没有校验。
+/// 回收站清单（`crate::trash`）在读记录时也用它做**显示前**的过滤：
+/// 清单是磁盘上的普通文件，里面的 `origin` 可能被改坏。
 ///
 /// 拒绝的东西：
 /// - `NUL` 字节（会让底层 syscall 直接报错，提前拒掉好给出明确错误）
 /// - 绝对路径与带根路径（含 Windows 盘符、UNC、`\\?\` verbatim 前缀）
 /// - 任何非 `Normal` / `CurDir` 的组件，其中 `ParentDir` 就是防目录穿越的第一道闸
-fn validate_rel(rel: &str) -> Result<&Path, KiError> {
+pub(crate) fn validate_rel(rel: &str) -> Result<&Path, KiError> {
     if rel.contains('\0') {
         return Err(KiError::PathEscape {
             path: rel.to_owned(),

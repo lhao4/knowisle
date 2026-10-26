@@ -26,7 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ki_core::KiError;
 
 use crate::naming::normalize_note_name;
-use crate::path::{reject_metadata_path, resolve_for_write, resolve_in_vault};
+use crate::path::{reject_metadata_path, resolve_for_write, resolve_in_vault, to_posix};
+use crate::trash::{record as record_in_manifest, TRASH_DIR};
 
 /// 两步改名用的临时名前缀。
 ///
@@ -36,13 +37,6 @@ const RENAME_TMP_PREFIX: &str = ".knowisle.rename.";
 
 /// 进程内单调序号：同一目录下并发改名（CLI + GUI）不会撞同一个临时名。
 static RENAME_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// 回收目录（Vault 相对路径，POSIX 分隔符）。
-///
-/// 它落在 `.knowisle/` 下面，而 `.knowisle` 在 `scan::IGNORED_DIRS` 里——
-/// 于是删掉的东西**天然**从树、快速打开、全文索引里消失，不需要任何额外过滤。
-/// 这条"放在哪里"的决定比"删完之后还要记得过滤"可靠得多：过滤会漏，位置不会。
-pub const TRASH_DIR: &str = ".knowisle/trash";
 
 /// 同一毫秒内的撞名重试上限。
 ///
@@ -164,11 +158,20 @@ pub fn rename_note(root: &Path, path: &str, raw_name: &str) -> Result<String, Ki
 /// 目标名是 `<unix_ms>-<原名>`：时间戳保证两次删除不会互相覆盖，原名保证
 /// 用户打开 `.knowisle/trash/` 还认得出哪个是哪个。
 ///
-/// # 代价（必须让用户知道）
+/// # 原路径记在哪
 ///
-/// **这不是回收站。** 应用里没有恢复入口，也没有"清空回收站"——文件只是
-/// 躺在磁盘上，要找回得自己去文件夹翻。写这条是因为"移到 trash"很容易被
-/// 理解成"随时能撤销"，而实际不成立。
+/// 文件名里只有原名，`a/b/c.md` 与 `x/c.md` 删掉之后长得一模一样。所以搬完
+/// 之后还要往清单里写一条 `entry → origin`（[`crate::trash`]，ADR-008）。
+///
+/// **顺序是先搬文件、后写清单**，不能反：
+///
+/// - 先搬后写，崩溃只丢"它原来在哪"——文件还在回收站里，能恢复到库根目录。
+/// - 先写后搬，崩溃会留下"清单说有、文件没有"的悬空条目，列表里多一个
+///   点开就报错的假记录。
+///
+/// 清单写失败**不让删除失败**：文件已经安全了，这时报错只会让用户以为
+/// "没删掉"再去删一次，而第二次会报"文件不存在"。降级方向是明确的：
+/// 列表里那一条显示成「原路径未知」。
 ///
 /// # 只删文件
 ///
@@ -184,8 +187,9 @@ pub fn rename_note(root: &Path, path: &str, raw_name: &str) -> Result<String, Ki
 ///
 /// # 崩溃窗口
 ///
-/// 只有一次 `rename`，它是原子的：崩溃后要么文件还在原位（删除没发生），
-/// 要么已经在 trash 里。不刷父目录——Windows 上根本做不到目录 fsync
+/// 文件侧只有一次 `rename`，它是原子的：崩溃后要么文件还在原位（删除没发生），
+/// 要么已经在 trash 里。清单侧是一次 `tmp → fsync → rename`（A5），
+/// 所以它要么不存在、要么完整。不刷父目录——Windows 上根本做不到目录 fsync
 /// （见 `write` 模块），而"删除没生效"是安全方向的失败。
 pub fn delete_note(root: &Path, path: &str) -> Result<String, KiError> {
     // 闸 1：`.knowisle/` 下的东西一律拒绝。必须在 `resolve_in_vault` 之前——
@@ -250,6 +254,19 @@ pub fn delete_note(root: &Path, path: &str) -> Result<String, KiError> {
     })?;
 
     std::fs::rename(&source, trash_real.join(&candidate)).map_err(|err| KiError::io(path, &err))?;
+
+    // 文件已经安全了，才写清单。原路径取**规范化后的相对路径**而不是入参：
+    // 入参可能是 `./notes/a.md` 或大小写不对的写法，而恢复要按磁盘上的真名
+    // 落回去（Windows 上大小写会被 `resolve_in_vault` 纠正，那正是我们要的）。
+    let origin = source
+        .strip_prefix(&canonical_root)
+        .ok()
+        .and_then(to_posix)
+        .unwrap_or_else(|| path.to_owned());
+    if let Err(err) = record_in_manifest(&canonical_root, &candidate, &origin, stamp) {
+        // 不返回错误：删除已经成功，报错会引导用户重试一次注定失败的操作。
+        eprintln!("回收站清单写入失败（文件已在回收站，列表会退化成只显示文件名）：{err}");
+    }
 
     Ok(format!("{TRASH_DIR}/{candidate}"))
 }
@@ -319,7 +336,9 @@ fn unix_ms() -> i64 {
 /// 检查与 rename 之间仍有时间窗：别的进程可以在这个窗口里创建目标。
 /// 本地单用户应用接受这一点——能在这个窗口里动手的人，本来就有 Vault 的
 /// 写权限，直接改笔记更省事。这是**有意识的取舍**，不是遗漏。
-fn move_no_clobber(source: &Path, target: &Path, rel: &str) -> Result<(), KiError> {
+///
+/// 恢复（[`crate::trash::restore`]）共用它：两边都是"搬一个目录项，绝不覆盖"。
+pub(crate) fn move_no_clobber(source: &Path, target: &Path, rel: &str) -> Result<(), KiError> {
     match std::fs::symlink_metadata(target) {
         Err(err) if err.kind() == ErrorKind::NotFound => {
             std::fs::rename(source, target).map_err(|err| KiError::io(rel, &err))

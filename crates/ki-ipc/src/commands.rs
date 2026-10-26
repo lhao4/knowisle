@@ -12,7 +12,11 @@
 
 use std::path::{Path, PathBuf};
 
-use ki_core::{AppInfo, KiError, NoteContent, SaveResult, SaveState, ScanResult, SearchResult};
+use ki_core::{
+    AppInfo, KiError, NoteContent, RestoreResult, SaveResult, SaveState, ScanResult, SearchResult,
+    TrashEntry,
+};
+use ki_vault::trash as trash_ops;
 use ki_vault::{
     create_note, delete_note, read_note, rename_note, scan_vault, write_note, ScanOptions,
 };
@@ -181,6 +185,62 @@ pub async fn note_delete(root: String, path: String) -> Result<String, KiError> 
         Ok(trashed)
     })
     .await
+}
+
+/// 列出回收站，按删除时间倒序。
+///
+/// # 返回值里两个字段的含义不能混
+///
+/// - `name` 是**回收目录里的真名**，恢复时原样传回 `trash_restore`。
+/// - `origin` 是删除前的相对路径；`null` 表示清单缺失/损坏。
+///   **这不是错误**：文件还在，只是不知道它原来在哪。UI 必须显示成
+///   「原路径未知」，不能拿 `name` 去猜一个路径显示给用户。
+///
+/// 列表为空是正常状态（从没删过东西），不返回错误。
+#[tauri::command]
+#[specta::specta]
+pub async fn trash_list(root: String) -> Result<Vec<TrashEntry>, KiError> {
+    run_blocking(move || trash_ops::list(&PathBuf::from(root))).await
+}
+
+/// 把回收站里的一条搬回原目录，返回它最终落在哪里。
+///
+/// # 三种落点（前端按返回值措辞）
+///
+/// | 情况 | `path` | `renamed` | `degraded` |
+/// |---|---|---|---|
+/// | 正常 | 原路径 | false | false |
+/// | 撞名 | `c 2.md`（不覆盖） | true | false |
+/// | 清单缺失 / 原目录没了 | 库根目录下的原名 | 可能 | true |
+///
+/// # 为什么要在这里补索引
+///
+/// 恢复之后文件回到磁盘，但索引里还没有它。前端恢复完会重扫一次（要刷新树），
+/// 可"搜索能找到"这件事不该依赖调用方记得重扫——将来的 `isle` CLI 不会。
+/// 所以这里定点补一行，失败只写 stderr：恢复已经成功，索引问题下次扫描会自愈。
+#[tauri::command]
+#[specta::specta]
+pub async fn trash_restore(root: String, name: String) -> Result<RestoreResult, KiError> {
+    run_blocking(move || {
+        let root = PathBuf::from(root);
+        let restored = trash_ops::restore(&root, &name)?;
+        if let Err(err) = search::reindex(&root, &restored.path) {
+            eprintln!("恢复后的索引更新失败（下次扫描会自愈）：{err}");
+        }
+        Ok(restored)
+    })
+    .await
+}
+
+/// 清空回收站，返回删掉了多少个文件。
+///
+/// 只删文件与清单目录，不递归删用户自己放进来的子目录（那不是我们造的东西）。
+/// 部分文件删不掉时，其余照删，最后返回第一个错误——用户点"清空"的意图是
+/// "能删的都删掉"，不是"遇到第一个错误就停"。
+#[tauri::command]
+#[specta::specta]
+pub async fn trash_purge(root: String) -> Result<u64, KiError> {
+    run_blocking(move || trash_ops::purge(&PathBuf::from(root))).await
 }
 
 /// 提交一次编辑，由 Rust 侧的节流器决定何时落盘。

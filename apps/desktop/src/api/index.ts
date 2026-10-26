@@ -23,11 +23,13 @@ export type {
   KiError,
   NodeKind,
   NoteContent,
+  RestoreResult,
   SaveResult,
   SaveState,
   ScanResult,
   SearchHit,
   SearchResult,
+  TrashEntry,
 } from './bindings'
 
 /** 递归扫描 Vault，返回 POSIX 相对路径的树。 */
@@ -106,17 +108,54 @@ export const noteRename = commands.noteRename
  * 调用前必须先 `noteEdit` + `noteFlush`（当前笔记时），否则 trash 里会是旧版本。
  * 但那**不能替代** Rust 侧的 drain：前端 flush 返回时自动保存的 worker 可能
  * 还没退出。顺序由 `note_delete` 自己在 Rust 侧保证：
- * drain → 搬进 trash → 清空槽位。
+ * drain → 搬进 trash → 写清单 → 清空槽位。
  *
  * 冲突时拒绝删除（`CONFLICT`）：此刻用户还有「覆盖 / 放弃」两个选择，
  * 删掉就只剩一个。
  *
- * # 这不是回收站
+ * # 它现在真的是回收站
  *
- * 应用里没有恢复入口，也没有"清空回收站"。文件还在磁盘上，要找回得自己去
- * 文件夹翻——UI 文案必须说清这一点，不能只说"移到回收站"。
+ * 删除时会记下原路径，`trashList` 能列出来，`trashRestore` 能搬回原目录。
+ * 唯一找不回来的情况是清单损坏——那时仍能恢复，只是落到库根目录
+ * （返回值里 `degraded` 为真，UI 必须说清）。
  */
 export const noteDelete = commands.noteDelete
+
+/**
+ * 列出回收站，按删除时间倒序。
+ *
+ * 每一项带 `entry`（恢复用的磁盘真名）、`name`（展示名）、`origin`
+ * （原路径，可能为 `null`）、`deletedAt`、`size`。
+ *
+ * `origin === null` 是**正常状态**：清单缺失或损坏。UI 必须显示成
+ * 「原路径未知」，不能拿 `name` 拼一个看起来像路径的字符串——那是在骗用户。
+ *
+ * 列表为空不报错（从没删过东西的库就是这样）。
+ */
+export const trashList = commands.trashList
+
+/**
+ * 把回收站里的一条搬回原目录。
+ *
+ * `name` 传列表里的 `entry`（不是展示名）。
+ *
+ * 三种结果，UI 必须分开措辞：
+ * - 正常：`path` 是原路径；
+ * - 撞名：`renamed` 为真，`path` 是 `c 2.md`，已存在的那份一个字节都没动；
+ * - 降级：`degraded` 为真，落到了库根目录（清单缺失，或原目录已被外部删除）。
+ *
+ * 恢复之后索引由命令自己定点补一行，所以**不重扫也能立刻搜到**。
+ * 但树要刷新仍然得重扫（那是另一件事）。
+ */
+export const trashRestore = commands.trashRestore
+
+/**
+ * 清空回收站，返回删掉了多少个文件。
+ *
+ * 不递归删用户自己放进回收目录的子目录（那不是应用造的东西）。
+ * 部分文件删不掉时其余照删，最后返回第一个错误。
+ */
+export const trashPurge = commands.trashPurge
 
 /**
  * 提交一次编辑，由 Rust 侧的节流器决定何时落盘（1.5 秒）。
