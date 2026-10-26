@@ -220,6 +220,58 @@ pub fn resolve_in_vault(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
     Ok(canonical)
 }
 
+/// 只回答「这条路径的**父目录链**可用吗」，不回答「这个名字能不能用」。
+///
+/// # 为什么必须和 `resolve_for_write` 分开
+///
+/// 这两件事被同一个函数干了很久，后果是**判据不可分**：调用方拿到一个
+/// `Err` 时无法知道是"目录没了"还是"名字被一个同名目录占了"。回收站恢复
+/// 需要区分它们——前者该降级到库根，后者该在原目录里改名成 `c 2.md`。
+///
+/// 不拆开就只能去 match 错误文案，而那等于把判据藏在字符串里：改一句
+/// 提示语就会静默改变行为，且没有任何测试会红。
+///
+/// 所以这里的边界是**最后一段之前**：
+///
+/// - 做：语法校验、父目录链逐级拒绝重解析点、父目录必须存在、
+///   规范化后仍在 Vault 内；
+/// - 不做：最终组件的类型（是目录？是软链？已经有人占了？）——那是
+///   [`crate::trash`] 的 `occupied` 与 [`resolve_for_write`] 各自的事。
+///
+/// 返回 `KiError::Io { kind: NotFound }` 表示**父目录不存在**（这是恢复
+/// 唯一会降级的情形）；其余错误都表示"用户需要去处理"，不是"我们替他换个地方"。
+pub(crate) fn ensure_parent_dir_usable(root: &Path, rel: &str) -> Result<(), KiError> {
+    resolve_parent(root, rel).map(|_| ())
+}
+
+/// 父目录链的唯一实现：校验 → 逐级查重解析点 → 规范化父目录 → 越界检查。
+///
+/// 返回**规范化后的父目录**。`ensure_parent_dir_usable` 与 [`resolve_for_write`]
+/// 都走它，所以"什么算父目录可用"只有一份定义。
+fn resolve_parent(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
+    let rel_path = validate_rel(rel)?;
+
+    let canonical_root = dunce::canonicalize(root)
+        .map_err(|e| KiError::io(root.to_string_lossy().into_owned(), &e))?;
+
+    // 只查父目录链：最终组件若是软链，写入会被它带到一个别的地方——那件事
+    // 由 `resolve_for_write` 单独判（见那里的注释），不归"父目录可用"管。
+    let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
+    reject_reparse_points(&canonical_root, parent_rel, rel)?;
+
+    // 父目录必须已存在：写入不会顺手替用户造目录，那属于上层的产品决策。
+    let canonical_parent =
+        dunce::canonicalize(canonical_root.join(parent_rel)).map_err(|e| KiError::io(rel, &e))?;
+
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(KiError::PathEscape {
+            path: rel.to_owned(),
+        });
+    }
+
+    Ok(canonical_parent)
+}
+
 /// 把 Vault 相对路径解析为**可写入**的绝对路径。
 ///
 /// 与 [`resolve_in_vault`] 的两点不同，每一点都对应一个真实的失败场景：
@@ -254,34 +306,21 @@ pub fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, KiError> {
         path: rel.to_owned(),
     })?;
 
-    let canonical_root = dunce::canonicalize(root)
-        .map_err(|e| KiError::io(root.to_string_lossy().into_owned(), &e))?;
-
-    // 逐级拒绝重解析点，覆盖父目录与最终组件。
-    reject_reparse_points(&canonical_root, rel_path, rel)?;
-
-    // 父目录必须已存在：写入不会顺手替用户造目录，那属于上层的产品决策。
-    let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
-    let canonical_parent =
-        dunce::canonicalize(canonical_root.join(parent_rel)).map_err(|e| KiError::io(rel, &e))?;
-
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Err(KiError::PathEscape {
-            path: rel.to_owned(),
-        });
-    }
-
+    // 父目录链：与回收站恢复共用同一份判据（见 `ensure_parent_dir_usable`）。
+    let canonical_parent = resolve_parent(root, rel)?;
     let target = canonical_parent.join(file_name);
 
-    // 目标是目录时提前给出可读错误。重解析点已经在上面的逐级检查里拒掉了，
-    // 这里只剩"普通目录"这一种情况。
-    if let Ok(meta) = std::fs::symlink_metadata(&target) {
-        if meta.file_type().is_dir() {
-            return Err(KiError::NotAFile {
-                path: rel.to_owned(),
-            });
-        }
+    // 最后一段单独判。重解析点先于目录判：一个指向目录的软链用
+    // `symlink_metadata` 看是"软链"而不是"目录"，两种错都该报 `PathEscape`
+    // ——它的危害是"写到别处去了"，比"写到一个目录上"严重。
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(KiError::PathEscape {
+            path: rel.to_owned(),
+        }),
+        Ok(meta) if meta.file_type().is_dir() => Err(KiError::NotAFile {
+            path: rel.to_owned(),
+        }),
+        // 不存在（新建）或读不出来（让随后的写操作报它自己的错）。
+        _ => Ok(target),
     }
-
-    Ok(target)
 }

@@ -19,13 +19,20 @@ interface TrashPanelProps {
   /** 正在清空。 */
   purging: boolean
   /**
-   * 列表级错误：读不出来、恢复失败、清空失败。
+   * 列表级错误：读不出来、恢复失败、清空部分失败。
    *
    * 与"某一条的原路径未知"分开：后者是行内文案，不是错误——文件还在，
    * 只是不知道它原来在哪。
    */
   error: string | null
-  onRestore: (entry: string) => void
+  /**
+   * 恢复一条。传**整条**而不是 `entry` 字段：
+   *
+   * 恢复结果的文案要说"哪个目录没了"，而目录名只能从 `origin` 里取
+   * （`a/b/c.md` → `a/b`）。返回值里没有展示数据，也不该为了一句提示
+   * 去扩 IPC 契约——`origin` 本来就在这份列表里。
+   */
+  onRestore: (entry: TrashEntry) => void
   /** 请求清空。二次确认由上层弹（复用 `ConfirmDialog`），这里只发意图。 */
   onPurge: () => void
   onClose: () => void
@@ -169,7 +176,7 @@ export function TrashPanel({
                 <button
                   type="button"
                   className="btn btn--small"
-                  onClick={() => onRestore(entry.entry)}
+                  onClick={() => onRestore(entry)}
                   disabled={busy}
                 >
                   {restoring === entry.entry ? '恢复中…' : '恢复'}

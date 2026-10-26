@@ -39,11 +39,13 @@ use std::io::ErrorKind;
 use std::path::{Component, Path};
 use std::time::UNIX_EPOCH;
 
-use ki_core::{KiError, RestoreResult, TrashEntry};
+use ki_core::{Fallback, IoKind, KiError, PurgeResult, RestoreResult, TrashEntry};
 use serde::{Deserialize, Serialize};
 
 use crate::fileops::move_no_clobber;
-use crate::path::{reject_metadata_path, resolve_for_write, validate_rel};
+use crate::path::{
+    ensure_parent_dir_usable, reject_metadata_path, resolve_for_write, validate_rel,
+};
 use crate::write::atomic_replace;
 
 /// 回收目录（Vault 相对路径，POSIX 分隔符）。
@@ -124,13 +126,32 @@ pub(crate) fn forget(root: &Path, entry: &str) {
     let _ = std::fs::remove_file(manifest_path(root, entry));
 }
 
-/// 读一条记录。文件不存在、读不出来、JSON 坏了都返回 `None`。
+/// 读一条记录的三种结局。
 ///
-/// 这是**降级路径的入口**：任何一种失败都只意味着"不知道它原来在哪"，
-/// 而不是"这条回收站记录不可用"。用户至少还能把它恢复到库根目录。
-fn read_record(root: &Path, entry: &str) -> Option<Record> {
-    let bytes = std::fs::read(manifest_path(root, entry)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// # 为什么不是 `Option<Record>`
+///
+/// 列表只关心「有没有可信的 origin」，两种坏法对它是一回事；但**恢复**要把
+/// 原因说出去：`RecordMissing`（没有这条记录）与 `RecordCorrupt`（记录在、
+/// 读不出来）对用户是两句话，而旧代码把两者压成了一个 `None`。
+enum RecordState {
+    Ok(Record),
+    /// 清单文件不存在——删除流程在「搬完文件、写清单之前」崩过，或者记录被外部删了。
+    Missing,
+    /// 文件在，但内容不能用：JSON 半截、字段缺失、或者根本读不出来（权限 / 路径被占）。
+    Corrupt,
+}
+
+fn read_record(root: &Path, entry: &str) -> RecordState {
+    match std::fs::read(manifest_path(root, entry)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(record) => RecordState::Ok(record),
+            Err(_) => RecordState::Corrupt,
+        },
+        // 只有 NotFound 才是「没有这条记录」。其它读失败（权限、`trash-manifest`
+        // 被一个同名文件占了）都是「记录不可用」——说成"没有记录"会指错方向。
+        Err(err) if err.kind() == ErrorKind::NotFound => RecordState::Missing,
+        Err(_) => RecordState::Corrupt,
+    }
 }
 
 /// 记录里的原路径是否**可能**指向库内。
@@ -138,7 +159,8 @@ fn read_record(root: &Path, entry: &str) -> Option<Record> {
 /// 复用 [`validate_rel`] 与 [`reject_metadata_path`]，不另写一份判断：
 /// 清单是磁盘上的普通文件，用户（或某个坏掉的同步工具）可以改它。
 /// 一条被改成 `../../.ssh/id_rsa` 的记录不该被显示成"原路径"，
-/// 更不该被拿去恢复——真正的闸在 [`resolve_for_write`]，这里只是**显示前**的过滤。
+/// 更不该被拿去恢复——真正的闸在 [`ensure_parent_dir_usable`] 与
+/// [`resolve_for_write`]，这里只是**显示前**的过滤。
 fn plausible_origin(origin: &str) -> Option<String> {
     if validate_rel(origin).is_err() || reject_metadata_path(origin).is_err() {
         return None;
@@ -183,7 +205,12 @@ pub fn list(root: &Path) -> Result<Vec<TrashEntry>, KiError> {
             continue;
         }
 
-        let record = read_record(root, &name);
+        // 列表只关心「有没有可信的 origin」：记录缺失与记录损坏在这里是
+        // 同一件事（都显示成「原路径未知」）。恢复才需要区分它们。
+        let record = match read_record(root, &name) {
+            RecordState::Ok(record) => Some(record),
+            RecordState::Missing | RecordState::Corrupt => None,
+        };
         let deleted_at = record
             .as_ref()
             .map(|record| record.deleted_at)
@@ -224,19 +251,82 @@ pub fn list(root: &Path) -> Result<Vec<TrashEntry>, KiError> {
 
 /* ───────────────────── 恢复 ───────────────────── */
 
+/// 清单能给这次恢复提供什么。
+///
+/// 两种结局，对应两种完全不同的起点：记录可信（知道它原来在哪），或者不可信
+/// （只能从文件名猜）。把"为什么不可信"一起带出来，前端才能说清是哪一种。
+enum Intent {
+    Origin(String),
+    Guess(Fallback),
+}
+
+/// 读清单，判定这次恢复的**意图**。
+fn intent(root: &Path, entry: &str) -> Intent {
+    match read_record(root, entry) {
+        RecordState::Ok(record) => match plausible_origin(&record.origin) {
+            Some(origin) => Intent::Origin(origin),
+            // 记录在，但里面的路径不可信（被改成 `../../` 之类）。这不是
+            // "没有记录"，是"记录不可用"——两种事实，两句文案。
+            None => Intent::Guess(Fallback::RecordCorrupt),
+        },
+        RecordState::Missing => Intent::Guess(Fallback::RecordMissing),
+        RecordState::Corrupt => Intent::Guess(Fallback::RecordCorrupt),
+    }
+}
+
+/// 降级判据：**只有「父目录不存在」才降级**，其余错误一律冒泡。
+///
+/// # 为什么单独抽成函数
+///
+/// 这是整条恢复路径上唯一一个"把失败翻译成另一种结果"的地方，也是唯一
+/// 能悄悄把用户的文件搬到别处的地方。抽出来之后它可以用**构造出来的错误**
+/// 直接测（不需要真的把目录设成只读），于是这条判据在三个平台上都验得到。
+///
+/// # 为什么不是「任何错误都降级」
+///
+/// 降级是替用户做决定：把文件放到一个他没要求的地方。它只在"原来的位置已经
+/// 不可能回去了"时成立。只读、权限不足、路径上有重解析点都是"现在回不去，
+/// 但改一下就能回去"——用户要的是去改权限，不是被悄悄搬家。
+///
+/// 判据是**结构化**的 `IoKind::NotFound`，不是错误文案：match 字符串等于把
+/// 判据藏进提示语，改一句话就静默改了行为，而且没有任何测试会红。
+fn fallback_for(err: &KiError) -> Option<Fallback> {
+    match err {
+        KiError::Io {
+            kind: IoKind::NotFound,
+            ..
+        } => Some(Fallback::OriginGone),
+        _ => None,
+    }
+}
+
 /// 把回收目录里的 `entry` 搬回原目录，返回它最终落在哪里。
 ///
 /// # 落点决策
 ///
-/// | 情况 | 落到 | `degraded` |
+/// | 磁盘上的事实 | 落到 | `fallback` |
 /// |---|---|---|
-/// | 清单有记录且原目录还在 | 原路径 | false |
-/// | 清单缺失 / 损坏 / 越界 | 库根目录 + 从文件名剥出的原名 | true |
-/// | 原目录已不存在 | 库根目录 + 原名 | true |
+/// | 清单有记录，原目录还在 | 原路径 | `null` |
+/// | 清单有记录，**原目录没了** | 库根 + 剥出的原名 | `originGone` |
+/// | 清单里没有这条记录 | 库根 + 剥出的原名 | `recordMissing` |
+/// | 清单有记录但读不出来 | 库根 + 剥出的原名 | `recordCorrupt` |
+/// | 目标已存在（文件或目录） | 原目录里的 `名字 2.md` | 不变，`renamed` 为真 |
+/// | 父目录只读 / 权限不足 / 路径上有重解析点 | **不搬**，返回 `KiError` | — |
+///
+/// # 为什么只有「原目录不存在」才降级
+///
+/// 降级是**替用户做决定**：把文件放到一个他没要求的地方。它只在一件事上成立
+/// ——原来的位置已经不可能回去了（目录没了）。其余失败都是"现在回不去，但
+/// 改一下就能回去"：
+///
+/// - 父目录只读 / 权限不足 → 用户去改权限，文件还在回收站里等着；
+/// - 原路径上有个同名目录 → **不是失败**，在原目录里改个名就行（`c 2.md`）。
+///
+/// 旧实现用 `resolve_for_write(...).ok()` 把**所有**错误都当成"原目录不可用"，
+/// 于是这两种情况都静默落到了库根：用户以为恢复到了原处，文件其实在别的地方。
 ///
 /// **不代建原目录**：删除只搬文件，目录本来就还在；目录没了说明是外部删的，
-/// 这时悄悄重建一串目录比"落到根目录并明确告知"更容易让用户困惑。
-/// 记在 BACKLOG。
+/// 这时悄悄重建一串目录比"落到根目录并明确告知"更容易让用户困惑（ADR-008）。
 ///
 /// # 撞名
 ///
@@ -261,29 +351,31 @@ pub fn restore(root: &Path, entry: &str) -> Result<RestoreResult, KiError> {
         return Err(KiError::NotAFile { path: rel_source });
     }
 
-    // 1. 想回到哪。清单可信就用它，否则退到库根 + 剥掉时间戳前缀的名字。
-    let known = read_record(&canonical_root, entry).and_then(|record| {
-        let origin = plausible_origin(&record.origin)?;
-        // 原目录可能已经被外部删掉。`resolve_for_write` 会替我们回答
-        // "这条路还能不能落"——不能就降级，而不是报错让用户无从下手。
-        resolve_for_write(&canonical_root, &origin).ok()?;
-        Some(origin)
-    });
-    let degraded = known.is_none();
-    let requested = known.unwrap_or_else(|| strip_stamp(entry));
-
-    // 2. 撞名就换名字，绝不覆盖。判据是磁盘上有没有这个名字（不跟随软链，
-    //    与 `fileops::unique_trash_name` 用同一把尺）。
-    let mut path = requested.clone();
-    if occupied(&canonical_root, &path) {
-        path = unique_target(&path, |candidate| occupied(&canonical_root, candidate)).ok_or_else(
-            || {
-                KiError::Internal(format!(
-                    "目标目录里已有 {TARGET_SEQ_LIMIT} 个同名文件，已放弃恢复：{requested}"
-                ))
+    // 1. 想回到哪（意图），以及落在哪（事实）。两者在降级时分叉。
+    let (requested, base, fallback) = match intent(&canonical_root, entry) {
+        Intent::Origin(origin) => match ensure_parent_dir_usable(&canonical_root, &origin) {
+            // 原目录还在：意图与落点都是它。
+            Ok(()) => (origin.clone(), origin, None),
+            Err(err) => match fallback_for(&err) {
+                Some(reason) => (origin, strip_stamp(entry), Some(reason)),
+                None => return Err(err),
             },
-        )?;
-    }
+        },
+        Intent::Guess(reason) => {
+            let name = strip_stamp(entry);
+            (name.clone(), name, Some(reason))
+        }
+    };
+
+    // 2. 撞名就换名字，绝不覆盖。`renamed` 只由这一步置位——不能拿
+    //    `path != requested` 当判据：`originGone` 下 requested 是意图
+    //    （`a/b/c.md`）、path 是事实（`c.md`），两者天然不同。
+    let (path, renamed) = land(&base, |candidate| occupied(&canonical_root, candidate))
+        .ok_or_else(|| {
+            KiError::Internal(format!(
+                "目标目录里已有 {TARGET_SEQ_LIMIT} 个同名文件，已放弃恢复：{base}"
+            ))
+        })?;
 
     // 3. 搬。`move_no_clobber` 会再挡一次"检查之后目标才出现"的竞态。
     let target = resolve_for_write(&canonical_root, &path)?;
@@ -294,16 +386,19 @@ pub fn restore(root: &Path, entry: &str) -> Result<RestoreResult, KiError> {
     forget(&canonical_root, entry);
 
     Ok(RestoreResult {
-        path: path.clone(),
-        requested: requested.clone(),
-        renamed: path != requested,
-        degraded,
+        path,
+        requested,
+        fallback,
+        renamed,
+        // 索引不归这一层管（`ki-vault` 不认识 SQLite）。`trash_restore`
+        // 补完索引再把这一位翻成真——在那之前，"索引里没有它"是事实。
+        indexed: false,
     })
 }
 
 /* ───────────────────── 清空 ───────────────────── */
 
-/// 清空回收站，返回删掉了多少个文件。
+/// 清空回收站，返回「删掉了几个、还剩几个」。
 ///
 /// # 只删文件
 ///
@@ -311,39 +406,49 @@ pub fn restore(root: &Path, entry: &str) -> Result<RestoreResult, KiError> {
 /// **不递归删**——那不是我们造的东西，也不在"清空回收站"的承诺里。
 /// 跳过比递归安全：递归删错一次的代价是不可逆的。
 ///
-/// # 清单目录要单独清
+/// # 清单按条清，不能整块删
 ///
-/// 它不在回收目录里（见 [`MANIFEST_DIR`]）。漏了这一步，下一次删除会读到
-/// 一堆孤儿记录——虽然读侧会忽略它们，但那是靠一条容错规则兜着，
-/// 不如直接把状态收干净。
+/// 清单是 `trash/` 的兄弟目录（见 [`MANIFEST_DIR`]）。整块 `remove_dir_all`
+/// 会连带删掉**删不掉那几篇**的记录——文件还在回收目录里，原路径却没了，
+/// 列表上那一条当场退化成「原路径未知」。而这一刀刚刚答应用户
+/// 「M 篇删不掉，已留在列表里」：留一个不知道自己原来在哪的条目，等于把
+/// 那句承诺打了个折。
 ///
-/// # 部分失败
+/// 所以只删「对应文件已经不在回收目录里」的记录。判据用
+/// [`still_in_trash`]：**只有确定不存在才删记录**，读不出来（被占用）时
+/// 宁可留着——孤儿记录无害，丢原路径有害。
 ///
-/// 一个文件被别的程序占住时，其余条目照删，最后返回第一个错误。
-/// 这比"遇到第一个错误就停"好：用户点清空的意图是"能删的都删掉"。
-pub fn purge(root: &Path) -> Result<u64, KiError> {
+/// # 部分失败也要把话说完
+///
+/// 一个文件被别的程序占住时，其余条目照删。旧实现返回第一个 `Err` 并**丢掉
+/// `removed`**：前端拿到错误就 return，既不刷新列表也不说删了几个，于是面板
+/// 上还列着已经被删掉的文件——一个面板，两个真相。
+///
+/// 现在它**永远 `Ok`**（除非回收目录本身读不出来——那时一个都没动，是真的
+/// 失败）。删不掉的计入 `failed`，它们仍然躺在回收目录里，刷新后照旧看得见。
+pub fn purge(root: &Path) -> Result<PurgeResult, KiError> {
     let dir = root.join(TRASH_DIR);
     let mut removed = 0u64;
-    let mut first_error: Option<KiError> = None;
+    let mut failed = 0u64;
 
     match std::fs::read_dir(&dir) {
         Ok(entries) => {
             for entry in entries {
-                let Ok(entry) = entry else { continue };
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let path = entry.path();
+                // 连目录项都读不出来：既不能删也不知道是什么。算作"删不掉"
+                // 比静默跳过诚实——后者会让用户以为清空彻底成功了。
+                let Ok(entry) = entry else {
+                    failed += 1;
+                    continue;
+                };
 
-                // 目录不是我们造的，跳过。
+                // 目录不是我们造的，跳过（也不算失败：它本来就不在承诺里）。
                 if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                     continue;
                 }
 
-                match std::fs::remove_file(&path) {
+                match std::fs::remove_file(entry.path()) {
                     Ok(()) => removed += 1,
-                    Err(err) => {
-                        let rel = format!("{TRASH_DIR}/{name}");
-                        first_error.get_or_insert_with(|| KiError::io(rel, &err));
-                    }
+                    Err(_) => failed += 1,
                 }
             }
         }
@@ -353,15 +458,56 @@ pub fn purge(root: &Path) -> Result<u64, KiError> {
         Err(err) => return Err(KiError::io(TRASH_DIR, &err)),
     }
 
-    if manifest_dir(root).is_dir() {
-        if let Err(err) = std::fs::remove_dir_all(manifest_dir(root)) {
-            first_error.get_or_insert_with(|| KiError::io(MANIFEST_DIR, &err));
+    sweep_manifest(root);
+
+    Ok(PurgeResult { removed, failed })
+}
+
+/// 这个条目**确定**已经不在回收目录里了吗？
+///
+/// 只有 `NotFound` 才算"不在"。读不出来（被占用、权限）一律当成"还在"：
+/// 宁可留一条孤儿记录（读侧本来就会忽略），也不要丢掉一份原路径。
+fn still_in_trash(root: &Path, entry: &str) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(root.join(TRASH_DIR).join(entry)),
+        Err(err) if err.kind() == ErrorKind::NotFound
+    )
+}
+
+/// 清掉「文件已经不在」的清单记录；目录空了才把目录删掉。
+///
+/// 失败只写 stderr：清空的主体（抹掉文件）已经完成，剩下的孤儿记录无害。
+fn sweep_manifest(root: &Path) {
+    let dir = manifest_dir(root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+
+    let mut left = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            left += 1;
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(entry_name) = name.strip_suffix(".json") else {
+            // 不是我们的命名：不碰它，也算作"还有东西"，别删目录。
+            left += 1;
+            continue;
+        };
+        if still_in_trash(root, entry_name) {
+            left += 1;
+            continue;
         }
+        let _ = std::fs::remove_file(entry.path());
     }
 
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(removed),
+    // 空目录才删。`remove_dir` 只删空目录，正好；非空是正常状态（还有删不掉的
+    // 条目靠这些记录记住原路径），不报错也不重试。
+    if left == 0 {
+        if let Err(err) = std::fs::remove_dir(&dir) {
+            eprintln!("回收站清单目录清理失败（残留的孤儿记录无害，下次清空会再试）：{err}");
+        }
     }
 }
 
@@ -460,6 +606,26 @@ fn unique_target(path: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
     None
 }
 
+/// 决定最终落在哪，以及**是否真的改了名**。
+///
+/// # 为什么把这两件事绑在一起返回
+///
+/// `renamed` 的判据只有一个：`unique_target` 有没有被调用过。把它写成
+/// `path != requested` 是错的——`originGone` 下 `requested` 是意图
+/// （`a/b/c.md`）、`path` 是事实（`c.md`），两者天然不同，那样写会把
+/// "降级到库根"说成"撞名改名"。
+///
+/// 绑成一个函数之后，调用方拿不到 `path` 与 `renamed` 的不一致组合：
+/// 要么没改名（原样返回），要么改了名（`true`）。
+///
+/// 返回 `None` 表示候选全被占满（见 [`TARGET_SEQ_LIMIT`]）。
+fn land(base: &str, taken: impl Fn(&str) -> bool) -> Option<(String, bool)> {
+    if !taken(base) {
+        return Some((base.to_owned(), false));
+    }
+    unique_target(base, taken).map(|path| (path, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +651,36 @@ mod tests {
     #[test]
     fn an_always_taken_target_gives_up_instead_of_spinning() {
         assert!(unique_target("c.md", |_| true).is_none());
+        assert!(land("c.md", |_| true).is_none());
+    }
+
+    /// `renamed` 的判据是「`unique_target` 有没有被调用过」，不是
+    /// `path != requested`。
+    ///
+    /// # 这条用例钉住的是什么
+    ///
+    /// 降级落到库根时，`requested`（意图）是 `a/b/c.md`、`path`（事实）是
+    /// `c.md`——两者不同，但**没有改名**。若有人把判据改回
+    /// `path != requested`，`OriginGone` 就会被报成「撞名改名」，用户会以为
+    /// 根目录里有一份同名文件跟他抢名字。
+    ///
+    /// 真实恢复里造这个组合要三步（删笔记 → 删目录 → 恢复），所以这里用
+    /// 注入 `taken` 的纯函数把它钉死：`land` 的第二个返回值就是 `renamed`。
+    #[test]
+    fn a_fallback_landing_is_not_a_rename() {
+        // 没撞名：原样落，没改名。
+        assert_eq!(land("c.md", |_| false), Some(("c.md".to_owned(), false)));
+        // 撞名：换名字，`renamed` 为真。
+        assert_eq!(
+            land("c.md", |candidate| candidate == "c.md"),
+            Some(("c 2.md".to_owned(), true))
+        );
+        // 落点是库根的名字（降级后的 base）时，改名也只发生在那个目录里。
+        assert_eq!(
+            land("c.md", |candidate| candidate == "c.md"
+                || candidate == "c 2.md"),
+            Some(("c 3.md".to_owned(), true))
+        );
     }
 
     /// 多段扩展名：`a.tar.md` → `a.tar 2.md`，最后一段才是扫描器认的。
@@ -527,6 +723,48 @@ mod tests {
                 "{bad} 应当是 PathEscape，实际 {err:?}"
             );
         }
+    }
+
+    /// 降级判据：**只有「父目录不存在」才降级**，其余错误一律冒泡。
+    ///
+    /// # 这条用例为什么用构造出来的错误
+    ///
+    /// 真实的"只读 / 权限不足 / 路径上有链接"在三个平台上造法各不相同，
+    /// 而 Windows 上能造出共享冲突、Unix 上能造出 EACCES 的写法互不通用。
+    /// 判据本身是纯函数，直接喂错误码就能钉死；端到端行为由
+    /// `tests/trash.rs` 的三条集成用例覆盖（Unix 两条 + 链接一条）。
+    ///
+    /// # 变异验证
+    ///
+    /// 把 `fallback_for` 改成「任何错误都返回 `OriginGone`」，这条会红：
+    /// 后三个断言会拿到 `Some(OriginGone)` 而不是 `None`。
+    #[test]
+    fn only_a_missing_directory_degrades() {
+        let io = |kind: ErrorKind| KiError::io("a/b", &std::io::Error::from(kind));
+
+        // 目录真的没了：这是唯一该降级的情况。
+        assert_eq!(
+            fallback_for(&io(ErrorKind::NotFound)),
+            Some(Fallback::OriginGone)
+        );
+        // 只读 / 权限不足：用户去改权限，不是我们替他搬家。
+        assert_eq!(fallback_for(&io(ErrorKind::PermissionDenied)), None);
+        // 被占用（Windows 的共享冲突）：等一下再试，不是换个地方放。
+        assert_eq!(fallback_for(&io(ErrorKind::WouldBlock)), None);
+        // 路径上有重解析点：写路径的边界，恢复不能绕过它。
+        assert_eq!(
+            fallback_for(&KiError::PathEscape {
+                path: "a/b".to_owned()
+            }),
+            None
+        );
+        // 父目录的位置被一个同名文件占了：不是"目录没了"，改个名就能回去。
+        assert_eq!(
+            fallback_for(&KiError::NotAFile {
+                path: "a/b".to_owned()
+            }),
+            None
+        );
     }
 
     /// 一条记录在整次写入过程中的**任何一个瞬间**都必须是完整的 JSON。

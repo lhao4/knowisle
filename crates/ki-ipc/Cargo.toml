@@ -27,3 +27,7 @@ specta = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 只给 `tests/trash.rs` 用：要把索引库弄成"能打开、但写不进去"的状态，
+# 只能绕过应用自己的连接直接改库（删掉 `meta` 表）。版本与 `ki-store` 同一个
+# 工作区依赖，`bundled` 特性由它统一开启，不会装出第二份 SQLite。
+rusqlite = { workspace = true }

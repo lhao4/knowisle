@@ -19,10 +19,12 @@ export { commands }
 
 export type {
   AppInfo,
+  Fallback,
   FileNode,
   KiError,
   NodeKind,
   NoteContent,
+  PurgeResult,
   RestoreResult,
   SaveResult,
   SaveState,
@@ -117,7 +119,7 @@ export const noteRename = commands.noteRename
  *
  * 删除时会记下原路径，`trashList` 能列出来，`trashRestore` 能搬回原目录。
  * 唯一找不回来的情况是清单损坏——那时仍能恢复，只是落到库根目录
- * （返回值里 `degraded` 为真，UI 必须说清）。
+ * （返回值里 `fallback` 会说明是三种原因里的哪一种，UI 必须分开措辞）。
  */
 export const noteDelete = commands.noteDelete
 
@@ -139,10 +141,18 @@ export const trashList = commands.trashList
  *
  * `name` 传列表里的 `entry`（不是展示名）。
  *
- * 三种结果，UI 必须分开措辞：
- * - 正常：`path` 是原路径；
- * - 撞名：`renamed` 为真，`path` 是 `c 2.md`，已存在的那份一个字节都没动；
- * - 降级：`degraded` 为真，落到了库根目录（清单缺失，或原目录已被外部删除）。
+ * # 三个字段各说一件事，别只看其中一个
+ *
+ * - `path` / `requested`：**事实** / **意图**。降级时两者分叉
+ *   （`requested` 是 `a/b/c.md`，`path` 是 `c.md`），所以
+ *   `path !== requested` **不代表**改了名。
+ * - `fallback`：为什么没回原处。`null` = 原路回去了；
+ *   `'recordMissing'` / `'recordCorrupt'` / `'originGone'` 是三种不同的下一步，
+ *   措辞必须不同（见 `App.describeRestore`）。
+ * - `renamed`：有没有**真的**撞名改名。与 `fallback` **正交**：
+ *   `originGone` 落到库根时，根目录也可能已有同名文件。
+ * - `indexed`：索引里有没有这一行。`false` 不是失败——文件已经在正确位置，
+ *   判成失败只会诱导用户重试（重试会得到 `c 2.md`）。
  *
  * 恢复之后索引由命令自己定点补一行，所以**不重扫也能立刻搜到**。
  * 但树要刷新仍然得重扫（那是另一件事）。
@@ -150,10 +160,14 @@ export const trashList = commands.trashList
 export const trashRestore = commands.trashRestore
 
 /**
- * 清空回收站，返回删掉了多少个文件。
+ * 清空回收站，返回「删掉了几个、还剩几个」。
  *
  * 不递归删用户自己放进回收目录的子目录（那不是应用造的东西）。
- * 部分文件删不掉时其余照删，最后返回第一个错误。
+ *
+ * **永远成功**（除非回收目录本身读不出来）：部分文件删不掉时其余照删，
+ * `failed` 计数，它们仍然躺在回收目录里。前端必须刷新列表并把
+ * 「已永久删除 N 篇，M 篇删不掉」说出去——旧实现返回错误，于是面板上
+ * 还列着已经被删掉的文件，一个面板两个真相。
  */
 export const trashPurge = commands.trashPurge
 

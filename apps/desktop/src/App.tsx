@@ -745,23 +745,27 @@ export default function App() {
    * 面板是 fixed 全屏遮罩。留着它盖在刚恢复的正文上，用户会以为
    * "恢复了但没打开"——而正文其实已经在了。
    *
-   * # 三种结果都要说
+   * # 为什么整条 `TrashEntry` 都传下去
    *
-   * 撞名改名为 `c 2.md`、降级落到库根，都不是错误，但都**改变了落点**。
-   * 只说"已恢复"会让用户在原路径下找不到文件，然后怀疑恢复没生效。
+   * 文案要说"哪个目录没了"，而目录名来自 `entry.origin`（`a/b/c.md` → `a/b`）。
+   * 返回值里只有事实（`path` / `requested`），没有展示数据——扩契约去塞一个
+   * `origin` 等于让 Rust 再算一遍前端手里已经有的东西。
+   *
+   * 传的必须是**恢复前**那一份：`applyVault` 会触发列表重读，但那是异步的，
+   * 而且恢复之后这条已经不在列表里了。
    */
   const restoreFromTrash = useCallback(
-    async (entry: string) => {
+    async (entry: TrashEntry) => {
       if (!vault) return
-      setTrashRestoring(entry)
+      setTrashRestoring(entry.entry)
       setTrashError(null)
       try {
-        const result = await trashRestore(vault.root, entry)
+        const result = await trashRestore(vault.root, entry.entry)
         applyVault(await vaultScan(vault.root))
         setRevealPath(result.path)
         setTrashOpen(false)
         await openNote(result.path)
-        showFlash(describeRestore(result))
+        showFlash(describeRestore(result, entry))
       } catch (err) {
         setTrashError(describeError(err))
       } finally {
@@ -774,15 +778,28 @@ export default function App() {
   /**
    * 清空回收站。**只由确认框触发**，没有任何"顺手清一下"的入口。
    *
-   * 失败返回文案交给 `ConfirmDialog` 展示：确认框留在屏幕上，用户能直接重试，
-   * 而面板里的错误行会被确认框盖住。
+   * # 部分失败也关确认框
+   *
+   * `trash_purge` 永远返回结果而不是错误：删不掉的留在回收目录里，列表刷新
+   * 后还看得见。所以这里返回 `null`（关框），把「删了 N 篇、M 篇删不掉」
+   * 写进面板的错误行——那行本来就是"整次操作的结果"，而确认框会把它盖住。
+   *
+   * 提示必须写在 `refreshTrash` **之后**：刷新成功会把错误行清空。
+   *
+   * 真正的 `Err` 只有一种（回收目录读不出来），那时一个都没动，
+   * 让确认框留在屏幕上给用户重试是对的。
    */
   const purgeTrash = useCallback(async (): Promise<string | null> => {
     if (!vault) return '还没有打开知识库'
     setTrashPurging(true)
     try {
-      await trashPurge(vault.root)
+      const result = await trashPurge(vault.root)
       await refreshTrash(vault.root)
+      if (result.failed > 0) {
+        setTrashError(
+          `已永久删除 ${result.removed} 篇，${result.failed} 篇删不掉（可能被占用），已留在列表里`,
+        )
+      }
       return null
     } catch (err) {
       return describeError(err)
@@ -1430,14 +1447,55 @@ export default function App() {
 /**
  * 恢复结果的一句话。
  *
- * 三种情况必须分开说。合并成「已恢复」是最省事的写法，也是最坏的：撞名时
- * 文件变成了 `c 2.md`、降级时落在了库根目录——用户在原路径下找不到，
- * 会认定恢复没生效，然后再点一次（第二次会得到 `c 3.md`）。
+ * # 三件事互相独立，必须能同时说
+ *
+ * ① 为什么没回原处（`fallback`）；② 有没有撞名改名（`renamed`）；
+ * ③ 索引更新了没有（`indexed`）。任何两件都能同时发生——`originGone` 落到
+ * 库根时，根目录也可能已经有一份同名文件，而那正是最需要说清的时刻：
+ * 只说"原目录没了"，用户会以为 `d 2.md` 是别人建的。
+ *
+ * 所以撞名与索引都是**后缀**，不是分支。早期版本用 `if (degraded) return …`
+ * 提前返回，把 `renamed` 整个吞掉了。
  */
-function describeRestore(result: RestoreResult): string {
-  if (result.degraded) return `已恢复到库根目录：${result.path}（原路径记录缺失）`
-  if (result.renamed) return `已恢复为 ${result.path}（原名已被占用）`
-  return `已恢复到 ${result.path}`
+function describeRestore(result: RestoreResult, entry: TrashEntry): string {
+  // 撞名的措辞要看撞在哪：没降级时撞的是原目录里的名字，降级时撞的是库根里的。
+  // 两种都叫"原名已被占用"会让降级那一支听起来像是原处有文件跟他抢名字。
+  let renamedNote = ''
+  if (result.renamed) {
+    renamedNote = result.fallback === null ? '（原名已被占用）' : '，且根目录已有同名文件'
+  }
+  const indexNote = result.indexed ? '' : '；索引未更新，重启应用会重建'
+  return `${describeLanding(result, entry)}${renamedNote}${indexNote}`
+}
+
+/**
+ * 落点那一句：回原处了、还是降级了、降级到哪。
+ *
+ * # 为什么拆成独立函数
+ *
+ * `switch` 的每个分支都 `return`，穷尽性断言才能自然写在末尾。
+ * **不写 `default`**：`const _exhaustive: never = result.fallback` 是给编译器
+ * 的断言——`Fallback` 将来多一种取值时，这一行会**编译不过**，而不是默默
+ * 落进一个"未知情况"的分支。`default` 会让它永远编译得过，那正是这个断言
+ * 存在的反面。
+ */
+function describeLanding(result: RestoreResult, entry: TrashEntry): string {
+  switch (result.fallback) {
+    case null:
+      return `已恢复${result.renamed ? '为' : '到'} ${result.path}`
+    case 'recordMissing':
+      return `已恢复到库根 ${result.path}：没有这条记录`
+    case 'recordCorrupt':
+      return `已恢复到库根 ${result.path}：清单记录损坏`
+    case 'originGone': {
+      // 目录名来自列表数据（`origin` 的父目录）。`originGone` 意味着记录是好的，
+      // 所以正常情况下它一定有值；类型上仍是 `null`，兜一句不含路径的话。
+      const dir = entry.origin === null ? '' : parentDir(entry.origin)
+      return `已恢复到库根 ${result.path}：${dir === '' ? '原目录' : `原目录 ${dir}`} 已不存在`
+    }
+  }
+  const _exhaustive: never = result.fallback
+  return _exhaustive
 }
 
 /** 把保存状态翻成一句人话。空串表示还没开始编辑，不显示。 */

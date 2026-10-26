@@ -10,12 +10,24 @@
 //! 一次真实的失败，而它们的**共同点**是：文件仍然回得来，只是落点变了。
 //! 如果哪一天某个改动让"清单坏了"变成"文件没了"，这里会先红。
 //!
+//! 但降级的原因必须分开报：**没有记录**（`recordMissing`）、**记录坏了**
+//! （`recordCorrupt`）、**原目录没了**（`originGone`）是三个不同的下一步。
+//! 压成一个布尔时，第三种会被说成"原路径记录缺失"——记录没丢，是目录没了。
+//!
+//! # 不降级的那些失败也必须有用例
+//!
+//! 只读父目录、父目录链不可进入、路径上有链接，都不该把文件悄悄搬到库根。
+//! 这三条是「降级判据收窄」的守卫：判据一旦放宽回"任何错误都降级"，
+//! 它们会先红（见 ADR-008 的变异验证）。
+//!
 //! # 原子性怎么验
 //!
 //! `kill -9` **证明不了**原子写：进程死了，页缓存还在，`fs::write` 写下去
 //! 的字节一样会在重启后读到。真正的判据是「读者永远看不到半个文件」——
 //! 见 [`manifest_records_are_never_observed_half_written`]，那是把
 //! `atomic_replace` 换成 `fs::write` 之后唯一会变红的用例。
+
+mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -24,7 +36,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ki_core::KiError;
+use common::{skip_unless, try_link_dir};
+use ki_core::{Fallback, KiError};
+// 只在 Unix 的权限用例里用到：Windows 上那两条是 `#[cfg(unix)]`。
+#[cfg(unix)]
+use ki_core::IoKind;
 use ki_vault::{
     delete_note, read_note, trash_list, trash_purge, trash_restore, MANIFEST_DIR, TRASH_DIR,
 };
@@ -127,7 +143,7 @@ fn every_delete_appends_its_own_manifest_record() {
 fn listing_a_vault_that_never_deleted_anything_is_empty() {
     let vault = vault();
     assert!(trash_list(vault.path()).unwrap().is_empty());
-    assert_eq!(trash_purge(vault.path()).unwrap(), 0);
+    assert_eq!(trash_purge(vault.path()).unwrap().removed, 0);
     assert!(
         !vault.path().join(".knowisle").exists(),
         "只读操作不该凭空造出 .knowisle"
@@ -152,7 +168,11 @@ fn restore_returns_the_note_to_its_original_directory() {
     assert_eq!(result.path, "a/b/c.md");
     assert_eq!(result.requested, "a/b/c.md");
     assert!(!result.renamed);
-    assert!(!result.degraded);
+    assert_eq!(result.fallback, None, "原目录还在，不该有任何降级");
+    assert!(
+        !result.indexed,
+        "ki-vault 不索引：返回时它必须是 false，由命令层补完索引再置真"
+    );
     assert_eq!(
         fs::read_to_string(vault.path().join("a/b/c.md")).unwrap(),
         "# 标题\n正文一行\n"
@@ -223,10 +243,13 @@ fn consecutive_collisions_keep_counting_up() {
 
 /* ───────────────────── 降级路径 ───────────────────── */
 
-/// 验收 5：清单写坏 → 列表只显示文件名，恢复落到库根目录并标记降级。
+/// 验收 2：清单写坏 → 列表只显示文件名，恢复落到库根目录并报 `recordCorrupt`。
 ///
 /// "写坏"用的是最真实的一种：文件在，但内容不是合法 JSON（同步工具截断、
 /// 磁盘坏块、用户手改）。整条记录作废，但**文件本身仍然可用**。
+///
+/// 这里的断言重点是 `RecordCorrupt` **不是** `RecordMissing`：记录就在那儿，
+/// 只是读不出来。两种事实对用户是两句话（"没有这条记录" vs "记录损坏"）。
 #[test]
 fn a_corrupt_manifest_degrades_to_the_file_name_only() {
     let vault = vault();
@@ -247,21 +270,26 @@ fn a_corrupt_manifest_degrades_to_the_file_name_only() {
     assert!(listed[0].deleted_at > 0);
 
     let result = trash_restore(vault.path(), &listed[0].entry).unwrap();
-    assert!(result.degraded);
+    assert_eq!(result.fallback, Some(Fallback::RecordCorrupt));
     assert_eq!(result.path, "c.md", "降级后落在库根目录");
+    assert_eq!(result.requested, "c.md", "记录不可用时，意图只能从文件名猜");
+    assert!(!result.renamed, "落到库根不是改名：根目录里没有同名文件");
     assert_eq!(
         fs::read_to_string(vault.path().join("c.md")).unwrap(),
         "内容"
     );
 }
 
-/// 清单里的原路径被改成越界路径：**不显示、不执行**，按降级处理。
+/// 清单里的原路径被改成越界路径：**不显示、不执行**，按"记录不可用"处理。
 ///
 /// 清单是磁盘上的普通文件，任何人都能改它。`../../.ssh/id_rsa` 若被当成
 /// 原路径显示出来，用户会以为自己的笔记原本在那儿；若被拿去恢复，
 /// 就是一次跨库搬运。
+///
+/// 它**不是** `recordMissing`：记录文件好好地在那儿，坏的是里面的内容。
+/// 说成"没有这条记录"会让用户去找一个明明存在的文件。
 #[test]
-fn a_tampered_origin_is_treated_as_missing() {
+fn a_tampered_origin_is_treated_as_an_unusable_record() {
     let vault = vault();
     fs::write(vault.path().join("c.md"), "内容").unwrap();
     delete_note(vault.path(), "c.md").unwrap();
@@ -280,7 +308,7 @@ fn a_tampered_origin_is_treated_as_missing() {
     assert!(listed[0].origin.is_none(), "越界路径不能被显示成原路径");
 
     let result = trash_restore(vault.path(), &listed[0].entry).unwrap();
-    assert!(result.degraded);
+    assert_eq!(result.fallback, Some(Fallback::RecordCorrupt));
     assert_eq!(result.path, "c.md");
 }
 
@@ -305,9 +333,19 @@ fn a_delete_succeeds_even_when_the_manifest_cannot_be_written() {
     let listed = trash_list(vault.path()).unwrap();
     assert_eq!(listed.len(), 1);
     assert!(listed[0].origin.is_none(), "没有清单就只能显示文件名");
-    assert_eq!(
-        trash_restore(vault.path(), &listed[0].entry).unwrap().path,
-        "a.md"
+    let restored = trash_restore(vault.path(), &listed[0].entry).unwrap();
+    assert_eq!(restored.path, "a.md");
+    // 清单**目录**被一个同名文件占了：记录读不出来。具体归到哪一种取决于
+    // 操作系统的错误码（Windows 报 ERROR_PATH_NOT_FOUND → `recordMissing`，
+    // Unix 报 ENOTDIR → `recordCorrupt`），**但绝不能是 `originGone`**：
+    // 那会说"原目录没了"，而原目录就在那儿。
+    assert!(
+        matches!(
+            restored.fallback,
+            Some(Fallback::RecordMissing | Fallback::RecordCorrupt)
+        ),
+        "实际 {:?}",
+        restored.fallback
     );
 }
 
@@ -315,6 +353,8 @@ fn a_delete_succeeds_even_when_the_manifest_cannot_be_written() {
 ///
 /// 这正是删除的两个步骤之间那个窗口。造法就是删掉记录文件本身——
 /// 与"崩溃时记录还没落盘"在磁盘上是同一个状态。
+///
+/// 它是 `recordMissing` 的**唯一**正例：记录文件真的不在。
 #[test]
 fn an_entry_without_a_record_is_still_listed_and_restorable() {
     let vault = vault();
@@ -334,15 +374,23 @@ fn an_entry_without_a_record_is_still_listed_and_restorable() {
     assert!(listed[0].origin.is_none());
 
     let result = trash_restore(vault.path(), &listed[0].entry).unwrap();
-    assert!(result.degraded);
+    assert_eq!(result.fallback, Some(Fallback::RecordMissing));
     assert_eq!(result.path, "c.md", "从文件名里剥出原名，落在库根");
+    assert_eq!(result.requested, "c.md", "没有记录时，意图只能从文件名猜");
+    assert!(!result.renamed);
     assert!(vault.path().join("c.md").is_file());
 }
 
-/// 原目录在外部被删掉了 → 不重建目录，落到库根并标记降级。
+/// 原目录在外部被删掉了 → 不重建目录，落到库根并报 `originGone`。
 ///
 /// "悄悄重建一串目录"比"落到根目录并明确告知"更容易让用户困惑：
 /// 他会以为那个目录一直都在。
+///
+/// # 这条用例钉住 `requested` / `path` 的分工
+///
+/// `requested` 是**意图**：`gone/c.md`——他当时就是从那儿删的，记录没丢。
+/// `path` 是**事实**：`c.md`。两者不同，但**不是改名**（`renamed` 必须为假）。
+/// 用 `path != requested` 当改名判据的实现会在这里红。
 #[test]
 fn restore_falls_back_to_the_root_when_the_original_directory_is_gone() {
     let vault = vault();
@@ -353,8 +401,10 @@ fn restore_falls_back_to_the_root_when_the_original_directory_is_gone() {
 
     let result = trash_restore(vault.path(), &trash_entries(&vault)[0]).unwrap();
 
-    assert!(result.degraded);
+    assert_eq!(result.fallback, Some(Fallback::OriginGone));
     assert_eq!(result.path, "c.md");
+    assert_eq!(result.requested, "gone/c.md", "意图仍然是原路径：记录没丢");
+    assert!(!result.renamed, "落到库根不是改名：根目录里没有同名文件");
     assert!(
         !vault.path().join("gone").exists(),
         "不代建原目录：那是外部删除，不是我们的决定"
@@ -362,6 +412,191 @@ fn restore_falls_back_to_the_root_when_the_original_directory_is_gone() {
     assert_eq!(
         fs::read_to_string(vault.path().join("c.md")).unwrap(),
         "内容"
+    );
+}
+
+/// 原路径上有一个**同名目录** → 不是降级，在原目录里改名成 `c 2.md`。
+///
+/// 这是"降级判据收窄"最容易被写错的一条：旧实现用
+/// `resolve_for_write(...).ok()` 判"原目录可不可用"，而那个函数**顺带**检查
+/// 了最终组件是不是目录（`NotAFile`）。于是"名字被占"被误判成"原目录没了"，
+/// 文件被悄悄搬到库根——用户在原目录里永远找不到它。
+///
+/// 判据拆开之后：父目录可用（`ensure_parent_dir_usable`），名字被占
+/// （`occupied` + `unique_target`）→ 改名，`fallback` 为 `null`。
+#[test]
+fn a_directory_at_the_original_path_is_not_a_reason_to_fall_back() {
+    let vault = vault();
+    fs::create_dir_all(vault.path().join("a/b")).unwrap();
+    fs::write(vault.path().join("a/b/c.md"), "内容").unwrap();
+    delete_note(vault.path(), "a/b/c.md").unwrap();
+
+    // 原路径上放一个同名**目录**。`occupied` 用的是 `symlink_metadata`，
+    // 目录同样算"这个名字有人占"。
+    fs::create_dir_all(vault.path().join("a/b/c.md")).unwrap();
+
+    let result = trash_restore(vault.path(), &trash_entries(&vault)[0]).unwrap();
+
+    assert_eq!(result.fallback, None, "原目录好好的，没有任何降级");
+    assert!(result.renamed, "撞名必须报告 renamed");
+    assert_eq!(result.requested, "a/b/c.md");
+    assert_eq!(result.path, "a/b/c 2.md");
+    assert!(
+        !vault.path().join("c.md").exists(),
+        "绝不许落到库根：用户要的是原目录里的另一个名字"
+    );
+    assert_eq!(
+        fs::read_to_string(vault.path().join("a/b/c 2.md")).unwrap(),
+        "内容"
+    );
+    assert!(
+        vault.path().join("a/b/c.md").is_dir(),
+        "占住名字的那个目录一个字节都不许动"
+    );
+}
+
+/* ───────────────────── 不降级的失败：必须冒泡 ───────────────────── */
+
+/// 改权限（Unix）。测试跑完必须改回来，否则 `TempDir` 连自己都删不掉。
+#[cfg(unix)]
+fn chmod(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// 验收 5：原目录**只读** → 命令报 `IO`，文件留在回收站，**不落库根**。
+///
+/// # 为什么必须设父目录 555，而不是把文件设成只读
+///
+/// Unix 上 `rename` 覆盖一个只读**文件**是完全合法的——权限判在目录上。
+/// 把文件设成 444 再断言"恢复失败"会得到一个永远绿的假用例。
+///
+/// # 这条用例守的是什么
+///
+/// 用户点恢复，是因为他以为文件会回到原处。只读时我们搬不动，此时**报错**
+/// 比"悄悄放到库根"好：前者他知道去改权限，后者他会在原目录里找一个
+/// 根本不存在的文件。条目留在回收站里，改完权限再点一次就行。
+#[cfg(unix)]
+#[test]
+fn restore_reports_io_when_the_original_directory_is_read_only() {
+    let vault = vault();
+    fs::create_dir_all(vault.path().join("a/b")).unwrap();
+    fs::write(vault.path().join("a/b/c.md"), "内容").unwrap();
+    delete_note(vault.path(), "a/b/c.md").unwrap();
+
+    chmod(&vault.path().join("a/b"), 0o555);
+    let entry = trash_entries(&vault)[0].clone();
+    let result = trash_restore(vault.path(), &entry);
+    // 先恢复权限再断言：`assert!` 失败会 panic，而 TempDir 清不掉 555 的目录。
+    chmod(&vault.path().join("a/b"), 0o755);
+
+    let err = result.expect_err("只读目录里搬不进文件，必须报错");
+    match err {
+        KiError::Io { kind, .. } => {
+            assert_eq!(kind, IoKind::PermissionDenied, "实际 {kind:?}")
+        }
+        other => panic!("应当是 IO/PermissionDenied，实际 {other:?}"),
+    }
+    assert_eq!(
+        trash_entries(&vault),
+        vec![entry],
+        "失败时条目必须还在回收站"
+    );
+    assert!(
+        !vault.path().join("c.md").exists(),
+        "绝不许把搬不动的东西悄悄放到库根"
+    );
+}
+
+/// 父目录链**不可进入**（`chmod 000`）→ 报 `IO`，不降级。
+///
+/// # 为什么这条比 555 那条更关键
+///
+/// 555 的失败发生在 `rename` 那一刻（`ensure_parent_dir_usable` 只做
+/// `canonicalize`，读权限够用），所以它**验不出降级判据**——旧实现与
+/// "任何错误都降级"的变异实现在这条上都是绿的。
+///
+/// `chmod 000` 让 `canonicalize(<root>/a/b)` 直接 `EACCES`（解析 `b` 需要
+/// `a` 的可进入位），于是错误**发生在判据那一步**：只有 `NotFound` 才降级的
+/// 实现会把它冒泡出去，而"任何错误都降级"的实现会把文件搬到库根。
+///
+/// 跳过条件：以 root 运行时权限位不生效，这条用例什么都证明不了。
+#[cfg(unix)]
+#[test]
+fn restore_never_falls_back_when_the_original_path_is_unreachable() {
+    let vault = vault();
+    fs::create_dir_all(vault.path().join("a/b")).unwrap();
+    fs::write(vault.path().join("a/b/c.md"), "内容").unwrap();
+    delete_note(vault.path(), "a/b/c.md").unwrap();
+
+    chmod(&vault.path().join("a"), 0o000);
+    // root 下 000 也读得进去：用例会变成"恢复成功"，而那不是实现的问题。
+    let enforced = fs::metadata(vault.path().join("a/b")).is_err();
+    if !enforced {
+        chmod(&vault.path().join("a"), 0o755);
+        eprintln!("跳过：当前用户不受权限位约束（多半是 root），这条用例证明不了降级判据");
+        return;
+    }
+
+    let entry = trash_entries(&vault)[0].clone();
+    let result = trash_restore(vault.path(), &entry);
+    chmod(&vault.path().join("a"), 0o755);
+
+    let err = result.expect_err("路径不可进入时必须报错，不能替用户换个地方");
+    match err {
+        KiError::Io { kind, .. } => {
+            assert_eq!(kind, IoKind::PermissionDenied, "实际 {kind:?}")
+        }
+        other => panic!("应当是 IO/PermissionDenied，实际 {other:?}"),
+    }
+    assert_eq!(
+        trash_entries(&vault),
+        vec![entry],
+        "失败时条目必须还在回收站"
+    );
+    assert!(
+        !vault.path().join("c.md").exists(),
+        "绝不许把文件悄悄搬到库根"
+    );
+}
+
+/// 原路径的父目录变成了一个**链接** → 报 `PATH_ESCAPE`，不降级。
+///
+/// 扫描器不进入重解析点，写路径也一律拒绝（`path` 模块的模块文档）。
+/// 恢复走的是同一条边界：既然"那个目录"现在指向别处，把它当成原目录用
+/// 就等于绕过所有既有闸门。宁可报错让用户自己看一眼，也不搬。
+///
+/// 这条在 Windows 上也能跑（junction 不需要管理员权限），是"只有
+/// `NotFound` 才降级"在 Windows 上唯一的可执行判据——Unix 那两条靠权限位。
+#[test]
+fn restore_refuses_a_path_that_now_goes_through_a_link() {
+    let vault = vault();
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(vault.path().join("a/b")).unwrap();
+    fs::write(vault.path().join("a/b/c.md"), "内容").unwrap();
+    delete_note(vault.path(), "a/b/c.md").unwrap();
+    fs::remove_dir_all(vault.path().join("a/b")).unwrap();
+
+    skip_unless!(
+        try_link_dir(&vault.path().join("a/b"), outside.path()),
+        "目录链接"
+    );
+
+    let entry = trash_entries(&vault)[0].clone();
+    let err = trash_restore(vault.path(), &entry)
+        .expect_err("原目录变成链接时必须报错，不能替用户换个地方");
+    assert!(
+        matches!(err, KiError::PathEscape { .. }),
+        "应当是 PATH_ESCAPE，实际 {err:?}"
+    );
+    assert_eq!(
+        trash_entries(&vault),
+        vec![entry],
+        "失败时条目必须还在回收站"
+    );
+    assert!(
+        !vault.path().join("c.md").exists(),
+        "绝不许把文件悄悄搬到库根"
     );
 }
 
@@ -428,8 +663,9 @@ fn purge_skips_directories_it_did_not_create() {
 
     assert_eq!(trash_list(vault.path()).unwrap().len(), 1, "目录不算条目");
 
-    let removed = trash_purge(vault.path()).unwrap();
-    assert_eq!(removed, 1, "只数删掉的文件，不数清单目录");
+    let result = trash_purge(vault.path()).unwrap();
+    assert_eq!(result.removed, 1, "只数删掉的文件，不数清单目录");
+    assert_eq!(result.failed, 0, "跳过的目录不是失败：它本来就不在承诺里");
     assert!(vault.path().join(TRASH_DIR).join("mine/keep.txt").is_file());
     assert!(trash_list(vault.path()).unwrap().is_empty());
 }
@@ -445,9 +681,10 @@ fn purge_empties_the_trash_and_the_manifest() {
         delete_note(vault.path(), name).unwrap();
     }
 
-    let removed = trash_purge(vault.path()).unwrap();
+    let result = trash_purge(vault.path()).unwrap();
 
-    assert_eq!(removed, 3);
+    assert_eq!(result.removed, 3);
+    assert_eq!(result.failed, 0);
     assert!(trash_entries(&vault).is_empty(), "回收目录必须空");
     assert!(
         !vault.path().join(MANIFEST_DIR).exists(),
@@ -461,6 +698,97 @@ fn purge_empties_the_trash_and_the_manifest() {
         trash_list(vault.path()).unwrap()[0].origin.as_deref(),
         Some("d.md")
     );
+}
+
+/// 验收 7（部分）：一篇删不掉 → **不返回错误**，其余照删，计数如实。
+///
+/// Windows 用独占句柄占住一个文件（`share_mode(0)`），删它必然共享冲突。
+/// 这条钉住的是"部分失败仍然返回 Ok"：旧实现返回第一个 `Err` 并丢掉
+/// `removed`，前端拿到错误就 return，面板上于是还列着已经被删掉的文件。
+#[cfg(windows)]
+#[test]
+fn purge_counts_the_file_it_cannot_delete() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let vault = vault();
+    for name in ["a.md", "b.md", "c.md"] {
+        fs::write(vault.path().join(name), name).unwrap();
+        delete_note(vault.path(), name).unwrap();
+    }
+    let held = trash_entries(&vault)
+        .into_iter()
+        .find(|name| name.ends_with("-b.md"))
+        .expect("回收目录里应当有 b.md");
+
+    // share_mode(0)：不给别人任何共享权限，`remove_file` 会拿到共享冲突。
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(vault.path().join(TRASH_DIR).join(&held))
+        .expect("打开待占用文件");
+
+    let result = trash_purge(vault.path()).expect("删不掉不能返回错误");
+    assert_eq!(result.removed, 2, "其余两篇必须照删");
+    assert_eq!(result.failed, 1);
+    assert_eq!(
+        trash_entries(&vault),
+        vec![held.clone()],
+        "删不掉的那篇仍在回收目录里，列表刷新后还要看得见"
+    );
+
+    // 清空时清单**按条清**，不能整块删。整块 `remove_dir_all` 会连带删掉
+    // 这一篇的记录：文件还在回收目录里，原路径却没了，列表上那一条当场
+    // 退化成「原路径未知」——刚说完"删不掉的已留在列表里"，就把它的原路径
+    // 扔了。断言"记录还在"比断言"目录还在"更直接。
+    assert_eq!(
+        trash_list(vault.path()).unwrap()[0].origin.as_deref(),
+        Some("b.md"),
+        "删不掉的那篇必须保住原路径，否则刷新后它会变成「原路径未知」"
+    );
+    assert!(
+        vault
+            .path()
+            .join(MANIFEST_DIR)
+            .join(format!("{held}.json"))
+            .is_file(),
+        "它的清单记录必须还在磁盘上"
+    );
+
+    drop(handle);
+
+    // 占住它的句柄放掉之后，再清一次能彻底清干净——按条清的判据是
+    // 「文件还在不在」，文件没了记录就该走，清单目录也该跟着消失。
+    let again = trash_purge(vault.path()).expect("第二次清空");
+    assert_eq!((again.removed, again.failed), (1, 0));
+    assert!(
+        !vault.path().join(MANIFEST_DIR).exists(),
+        "全清干净之后清单目录不能留下空壳"
+    );
+}
+
+/// 验收 7（另一支）：整个回收目录只读 → 全部删不掉，但仍然 `Ok`。
+///
+/// Unix 上没法用"独占句柄"占住文件（`unlink` 不管有没有人开着），
+/// 所以用只读父目录让 `unlink` 失败。断言的是计数与"不报错"，
+/// 而不是"删掉了 N-1 篇"——那一条由 Windows 的用例覆盖。
+#[cfg(unix)]
+#[test]
+fn purge_reports_files_it_cannot_delete_instead_of_erroring() {
+    let vault = vault();
+    for name in ["a.md", "b.md", "c.md"] {
+        fs::write(vault.path().join(name), name).unwrap();
+        delete_note(vault.path(), name).unwrap();
+    }
+
+    let trash_dir = vault.path().join(TRASH_DIR);
+    chmod(&trash_dir, 0o555);
+    let result = trash_purge(vault.path());
+    chmod(&trash_dir, 0o755);
+
+    let result = result.expect("删不掉不能返回错误");
+    assert_eq!(result.removed, 0);
+    assert_eq!(result.failed, 3);
+    assert_eq!(trash_entries(&vault).len(), 3, "一篇都没少");
 }
 
 /* ───────────────────── 崩溃（kill -9） ───────────────────── */

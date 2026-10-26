@@ -1,11 +1,13 @@
 //! 回收站三个命令的端到端行为。
 //!
 //! 这里验的不是磁盘细节（那在 `ki-vault/tests/trash.rs`），而是**命令层把
-//! 四件事接对了没有**：
+//! 五件事接对了没有**：
 //!
 //! 1. 删除 → 列表 → 恢复 的路径往返；
 //! 2. 恢复之后**不重扫也能搜到**（`trash_restore` 自己补了索引）；
-//! 3. 撞名不覆盖、清空、以及条目被外部删掉时的错误码。
+//! 3. 撞名不覆盖、清空、以及条目被外部删掉时的错误码；
+//! 4. 索引补不进去时，命令**仍然成功**，只把 `indexed = false` 带出去；
+//! 5. 清空的部分失败用 `removed` / `failed` 表达，而不是返回错误。
 //!
 //! # 为什么必须串行
 //!
@@ -89,7 +91,8 @@ fn trash_commands_round_trip_and_make_the_note_searchable_again() {
     assert_eq!(restored.path, "a/b/c.md");
     assert_eq!(restored.requested, "a/b/c.md");
     assert!(!restored.renamed);
-    assert!(!restored.degraded);
+    assert_eq!(restored.fallback, None, "原目录还在，不该有任何降级");
+    assert!(restored.indexed, "索引库好好的，恢复必须把这一行补进去");
 
     // 关键：**没有**再 scan 一次。
     let hits = search(&root, "回收站探针").hits;
@@ -153,13 +156,63 @@ fn purging_empties_the_trash_and_the_list() {
 
     let removed = block_on(trash_purge(root.clone())).expect("清空失败");
 
-    assert_eq!(removed, 2);
+    assert_eq!(removed.removed, 2);
+    assert_eq!(removed.failed, 0);
     assert!(block_on(trash_list(root.clone())).unwrap().is_empty());
     let left: Vec<String> = fs::read_dir(vault.path().join(".knowisle/trash"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(left.is_empty(), "回收目录必须空，实际 {left:?}");
+}
+
+/* ───────────────────── 索引补不进去 ───────────────────── */
+
+/// 索引库坏了 → 恢复**仍然成功**，只把 `indexed = false` 带出去。
+///
+/// # 为什么"把索引库设成只读"造不出这个状态
+///
+/// 索引连接在 `vault_scan` 时就已经打开了，之后 `chmod` 只影响**新**句柄——
+/// 已打开的那个照样写得进去（Windows 上连文件属性都不看）。要让 `reindex`
+/// 真的失败，得让它在**执行 SQL 时**报错。这里直接把 `meta` 表删掉：
+/// `reindex` 的第一步 `synced_at()` 就会失败，而索引库本身仍然是"能打开、
+/// 能查询"的——这正是真实事故（库被别的进程占着、页结构损坏）的形态。
+///
+/// # 判成失败是错的
+///
+/// 文件已经在正确的位置了。判成 `Err` 会诱导用户重试，而重试会得到
+/// `c 2.md`——一次索引故障变成两份笔记。前端该说的是「索引未更新，
+/// 重启应用会重建」（索引库可整库重建，ADR-004，所以那句话是真的）。
+#[test]
+fn a_restore_that_cannot_update_the_index_still_succeeds() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let body = "索引注入探针：正文\n";
+    fs::write(vault.path().join("a.md"), body).unwrap();
+    scan(&root);
+
+    let db = vault.path().join(".knowisle/index.sqlite");
+    let conn = rusqlite::Connection::open(&db).expect("打开索引库");
+    conn.execute_batch("DROP TABLE meta").expect("删掉 meta 表");
+    drop(conn);
+
+    let trashed = block_on(note_delete(root.clone(), "a.md".to_owned())).expect("删除失败");
+    let name = trashed.rsplit('/').next().unwrap().to_owned();
+    let restored = block_on(trash_restore(root.clone(), name)).expect("索引坏了不该让恢复失败");
+
+    assert_eq!(restored.path, "a.md");
+    assert_eq!(restored.fallback, None);
+    assert!(!restored.indexed, "索引没更新，必须如实报告");
+    assert_eq!(
+        fs::read_to_string(vault.path().join("a.md")).unwrap(),
+        body,
+        "文件必须真的回到了原处"
+    );
+    assert!(
+        block_on(trash_list(root)).unwrap().is_empty(),
+        "条目必须已经离开回收站"
+    );
 }
 
 /* ───────────────────── 外部删除 ───────────────────── */

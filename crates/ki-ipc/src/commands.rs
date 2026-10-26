@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use ki_core::{
-    AppInfo, KiError, NoteContent, RestoreResult, SaveResult, SaveState, ScanResult, SearchResult,
-    TrashEntry,
+    AppInfo, KiError, NoteContent, PurgeResult, RestoreResult, SaveResult, SaveState, ScanResult,
+    SearchResult, TrashEntry,
 };
 use ki_vault::trash as trash_ops;
 use ki_vault::{
@@ -205,41 +205,53 @@ pub async fn trash_list(root: String) -> Result<Vec<TrashEntry>, KiError> {
 
 /// 把回收站里的一条搬回原目录，返回它最终落在哪里。
 ///
-/// # 三种落点（前端按返回值措辞）
+/// # 返回值里三个字段各说一件事（前端按它们措辞）
 ///
-/// | 情况 | `path` | `renamed` | `degraded` |
-/// |---|---|---|---|
-/// | 正常 | 原路径 | false | false |
-/// | 撞名 | `c 2.md`（不覆盖） | true | false |
-/// | 清单缺失 / 原目录没了 | 库根目录下的原名 | 可能 | true |
+/// | 字段 | 说什么 |
+/// |---|---|
+/// | `path` / `requested` | 事实 / 意图。降级时两者分叉（`c.md` vs `a/b/c.md`） |
+/// | `fallback` | 为什么没回原处：`recordMissing` / `recordCorrupt` / `originGone` |
+/// | `renamed` | 有没有**真的**撞名改名（与 `fallback` 正交，可同时发生） |
+/// | `indexed` | 索引里有没有这一行 |
 ///
 /// # 为什么要在这里补索引
 ///
 /// 恢复之后文件回到磁盘，但索引里还没有它。前端恢复完会重扫一次（要刷新树），
 /// 可"搜索能找到"这件事不该依赖调用方记得重扫——将来的 `isle` CLI 不会。
-/// 所以这里定点补一行，失败只写 stderr：恢复已经成功，索引问题下次扫描会自愈。
+/// 所以这里定点补一行。
+///
+/// **补索引失败不改命令的成功语义**：文件已经在正确的位置了，判成失败会诱导
+/// 用户重试（而重试会得到 `c 2.md`）。只把事实带出去：`indexed = false`，
+/// 由前端说「索引未更新，重启应用会重建」。索引库可整库重建（ADR-004），
+/// 所以那句话是真的。
 #[tauri::command]
 #[specta::specta]
 pub async fn trash_restore(root: String, name: String) -> Result<RestoreResult, KiError> {
     run_blocking(move || {
         let root = PathBuf::from(root);
-        let restored = trash_ops::restore(&root, &name)?;
-        if let Err(err) = search::reindex(&root, &restored.path) {
-            eprintln!("恢复后的索引更新失败（下次扫描会自愈）：{err}");
+        let mut restored = trash_ops::restore(&root, &name)?;
+        match search::reindex(&root, &restored.path) {
+            Ok(()) => restored.indexed = true,
+            Err(err) => eprintln!("恢复后的索引更新失败（重启应用会重建）：{err}"),
         }
         Ok(restored)
     })
     .await
 }
 
-/// 清空回收站，返回删掉了多少个文件。
+/// 清空回收站，返回「删掉了几个、还剩几个」。
 ///
-/// 只删文件与清单目录，不递归删用户自己放进来的子目录（那不是我们造的东西）。
-/// 部分文件删不掉时，其余照删，最后返回第一个错误——用户点"清空"的意图是
-/// "能删的都删掉"，不是"遇到第一个错误就停"。
+/// 只删文件与**对应的清单记录**，不递归删用户自己放进来的子目录（那不是
+/// 我们造的东西）。删不掉那几篇的记录会留着——文件还在回收目录里，原路径
+/// 不能丢，否则列表上那一条会退化成「原路径未知」。
+/// 部分文件删不掉时，其余照删，`failed` 计数——**不返回错误**。用户点"清空"
+/// 的意图是"能删的都删掉"，而报错会让前端既不刷新列表也不说删了几个，
+/// 面板上于是还列着已经被删掉的文件。
+///
+/// 唯一会 `Err` 的情况是回收目录本身读不出来：那时一个都没动，是真的失败。
 #[tauri::command]
 #[specta::specta]
-pub async fn trash_purge(root: String) -> Result<u64, KiError> {
+pub async fn trash_purge(root: String) -> Result<PurgeResult, KiError> {
     run_blocking(move || trash_ops::purge(&PathBuf::from(root))).await
 }
 
