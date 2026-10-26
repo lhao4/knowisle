@@ -15,6 +15,8 @@
     "bindings": "pnpm --filter @knowisle/desktop bindings:generate",
     "bindings:check": "pnpm --filter @knowisle/desktop bindings:check",
     "check": "cargo check --workspace",
-    "test": "cargo test --workspace"
+    "test": "pnpm --filter @knowisle/desktop test && cargo test --workspace",
+    "test:web": "pnpm --filter @knowisle/desktop test",
+    "test:rust": "cargo test --workspace"
   }
 }
