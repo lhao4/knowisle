@@ -1,11 +1,24 @@
 //! 扫描之后的增量同步：diff → 读盘 → 分批写库。
 //!
-//! # 为什么同步挂在 `vault_scan` 后面
+//! # 两个入口，一个内核
 //!
-//! 没有文件监听（B-09）时，唯一的"磁盘变了"信号就是用户主动扫描。
-//! 挂在扫描后面意味着：**索引的新鲜度与树的新鲜度是同一个东西**——
-//! 用户看到树更新了，索引也就更新了。若另起一个定时器，两者会各自漂移，
-//! 而漂移是不可见的（搜不到刚建的文件，没有任何提示）。
+//! | 入口 | 谁用 | 返回时机 |
+//! |---|---|---|
+//! | [`sync_after_scan`] | 基准、集成测试 | 索引建完才返回 |
+//! | [`spawn_after_scan`] | `vault_scan`（生产路径） | 立刻返回，索引在后台建 |
+//!
+//! 内核是同一个 `sync`，所以两条路的写入结果**逐字节相同**——这是
+//! 「语义零变化」的来源，也是基准能继续当判据的原因。
+//!
+//! # 为什么生产路径改成后台
+//!
+//! 同步挂在 `vault_scan` 后面时，树要等索引建完才出来：10k 库首次打开是
+//! 「转圈 9.9 秒（缓存热）到 97.9 秒（缓存冷）」。用户点「选择文件夹」要的是
+//! 那棵树，索引只是搜索的派生数据。
+//!
+//! 代价是「搜索时索引可能不全」。这件事**必须可见**（[`IndexState`]）——
+//! 没有可见性的后台索引等于一个静默的不一致：搜不到刚扫描进来的文件，
+//! 而界面上没有任何东西说明"还在建"。那正是 B-09 的坑。
 //!
 //! # 判据是 `size + mtime`，不是内容哈希
 //!
@@ -21,18 +34,20 @@
 //! # 分批写入
 //!
 //! 每 256 篇一个事务。首次建 10k 篇的库时，一个大事务会让 WAL 长到全库大小；
-//! 分批的语义代价只是"崩溃时可能只写进前 N 批"，而那种中间态会被下次打开
-//! 时的行数体检发现并重建——不影响正确性。
+//! 分批的语义代价只是"崩溃时可能只写进前 N 批"，而那种中间态会被下次扫描
+//! 用 `size + mtime` 补齐——不影响正确性（`tests/background_index.rs` 有
+//! 一条用例钉住它）。
 //!
 //! # IO 预算
 //!
 //! 0 变化的一次同步 = 0 字节正文 + 1 次 `SELECT` + 1 次 `commit`（+10–20ms）。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::PoisonError;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ki_core::{KiError, ScanResult, SearchHit, SearchResult};
+use ki_core::{IndexState, KiError, ScanResult, SearchHit, SearchResult};
 use ki_search::{fuse, plan, project, token_stream, Mode, Plan};
 use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
@@ -42,7 +57,10 @@ use ki_vault::{
     NoteLocator, ResolvedVault, ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
 };
 
-use super::cache::{canonical_root, ensure_root, lock};
+use super::cache::{
+    add_index_ms, bump_generation, canonical_root, ensure_root, generation, lock, publish,
+    state_for,
+};
 
 /// 每批多少篇提交一次。
 ///
@@ -71,14 +89,26 @@ pub struct SyncReport {
     pub opened: Option<OpenOutcome>,
 }
 
-/// 扫描之后把索引对齐到磁盘。
+/// 扫描之后把索引对齐到磁盘，**同步**跑完。
 ///
 /// 调用方必须**吞掉**这个错误：用户点「选择文件夹」要的是树，
 /// 索引维护失败不该让树出不来。失败时搜索会退化成"搜不到新内容"，
 /// 而那是可自愈的（下次扫描重试）。
+///
+/// # 它为什么还留着
+///
+/// 命令层已经改调 [`spawn_after_scan`]（树先出来）。这个函数保留同步语义，
+/// 因为还有两个消费者需要「建完才返回」这个确定时点：
+///
+/// - 基准（`tests/index_bench.rs`）：耗时必须能被重复测量；
+/// - 集成测试：不依赖线程调度就能断言索引内容。
+///
+/// **不要**把它们改成异步——那会让「建库耗时」变成一个测不准的量。
 pub fn sync_after_scan(root: &Path, scan: &ScanResult) -> Result<SyncReport, KiError> {
     let started = Instant::now();
     let root = canonical_root(root)?;
+    let files = sorted_files(scan);
+
     let mut cache = lock();
     ensure_root(&mut cache, &root);
 
@@ -90,19 +120,250 @@ pub fn sync_after_scan(root: &Path, scan: &ScanResult) -> Result<SyncReport, KiE
         None
     };
 
+    // 先记代际：同步跑到一半时用户可能又点了一次「选择文件夹」。那时代际
+    // 已经变了，这里**不许**把 Ready 发布到新一代头上。
+    let generation = generation();
     let now = now_ms();
-    let stats = {
+    let (stats, aborted) = {
         let db = cache.store.as_mut().expect("上面刚保证过 store 非空");
-        let stats = sync(db, &root, scan, now)?;
-        db.set_synced_at(now)?;
-        stats
+        let (stats, aborted) = sync(db, &root, &files, scan.truncated, now, None)?.into_parts();
+        if !aborted {
+            db.set_synced_at(now)?;
+        }
+        (stats, aborted)
     };
 
     // 累计而不是覆盖：一次 `vault_scan` 之后可能还有几次 `refresh`，
     // 它们都属于"本次搜索之前最近一次索引维护"。
     cache.pending_index_ms += started.elapsed().as_millis() as u64;
+    drop(cache);
+
+    if !aborted {
+        publish(&root, generation, IndexState::Ready);
+    }
 
     Ok(SyncReport { stats, opened })
+}
+
+/// 扫描之后把索引对齐到磁盘，**后台**跑：树先返回，索引慢慢建。
+///
+/// # 三条必须同时成立的约束（少一个就是 B-09 的坑）
+///
+/// 1. **树先出来**：本函数立刻返回，扫描结果已经被命令层拿走；
+/// 2. **不全必须可见**：返回前就把状态置成 [`IndexState::Building`]，
+///    之后每次 `vault_search` 都带着它回来，前端据此说"结果可能不全"；
+/// 3. **切库立刻失效**：代际 +1，旧线程在下一批写库之前发现自己是旧的，
+///    退出并释放连接（见 `cache::GENERATION`）。
+///
+/// # 为什么线程自己开连接
+///
+/// 见 `cache` 模块头：持 `CACHE` 跑 100 秒会把「首屏阻塞」换成「搜索阻塞」。
+/// 代价是 `IndexDb::open` 的体检做两次（GUI 一次、后台一次）——10k 库上是
+/// 几十毫秒，换的是整段建库期间搜索都不排队。**接受它**，别为省这一次
+/// 去改 `IndexDb`。
+///
+/// # 失败不往上抛
+///
+/// 没有人接：树已经返回了。失败置 [`IndexState::Failed`]（用户看得见），
+/// 索引本身仍可读——只是不全。下次扫描会重试。
+pub fn spawn_after_scan(root: &Path, scan: &ScanResult) {
+    let generation = bump_generation();
+
+    let root = match canonical_root(root) {
+        Ok(root) => root,
+        Err(err) => {
+            // 连库根都规范化不了，说明扫描本身已经失败了（调用方会先报错）。
+            // 这里没有可发布状态的地方——不猜一个 root 出来。
+            eprintln!("后台建索引未启动（库根不可用）：{err}");
+            return;
+        }
+    };
+
+    let files = sorted_files(scan);
+    let truncated = scan.truncated;
+
+    // **必须在 `spawn` 之前**：`vault_scan` 返回之后紧接着的任何一次搜索都要
+    // 看见「正在建」，否则它会走 `search` 里的自愈路径，变成第二个建索引的人。
+    //
+    // `total` 先按篇数报，线程拿到库里的旧状态后会立刻改成
+    // 「未变 + 要写 + 要删」的准确值。
+    publish(
+        &root,
+        generation,
+        IndexState::Building {
+            done: 0,
+            total: files.len(),
+        },
+    );
+
+    let thread_root = root.clone();
+    let spawned = std::thread::Builder::new()
+        .name("ki-index".to_string())
+        .spawn(move || run_background(thread_root, generation, files, truncated));
+
+    if let Err(err) = spawned {
+        // 只有资源耗尽才会走到这里。搜索仍会在 `synced_at == 0` 时自愈，
+        // 所以这不是死路——但要让用户看见"索引没在跑"。
+        eprintln!("无法启动索引线程：{err}");
+        publish(
+            &root,
+            generation,
+            IndexState::Failed {
+                message: format!("无法启动索引线程：{err}"),
+            },
+        );
+    }
+}
+
+/// 后台任务的主体。所有失败都变成可见状态，不往上抛（没有人接）。
+fn run_background(root: PathBuf, generation: u64, files: Vec<FileRef>, truncated: bool) {
+    let started = Instant::now();
+    match background_sync(&root, generation, &files, truncated) {
+        Ok(()) => {
+            // 回填「最近一次索引维护耗时」：后台建库也是索引维护，不记的话
+            // `SearchResult::index_ms` 在生产路径上永远是 0。
+            add_index_ms(started.elapsed().as_millis() as u64);
+            publish(&root, generation, IndexState::Ready);
+        }
+        // 代际已变：新的一次扫描接管了。**什么都不说**——状态属于新一代，
+        // 这里写任何一个值都会覆盖掉正在建的那个库的进度。
+        Err(None) => {}
+        Err(Some(err)) => {
+            eprintln!("后台建索引失败（树已返回，搜索会少结果）：{err}");
+            publish(
+                &root,
+                generation,
+                IndexState::Failed {
+                    message: err.to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// 后台同步。`Err(None)` 表示「被新一代取代」，不是失败。
+fn background_sync(
+    root: &Path,
+    generation: u64,
+    files: &[FileRef],
+    truncated: bool,
+) -> Result<(), Option<KiError>> {
+    let (mut db, _outcome) = IndexDb::open(root).map_err(Some)?;
+    // 体检可能要几百毫秒，这期间用户完全可能已经切库。
+    if super::cache::generation() != generation {
+        return Err(None);
+    }
+
+    let now = now_ms();
+    let beacon = Beacon {
+        root,
+        generation,
+        done: 0,
+        total: files.len(),
+    };
+    match sync(&mut db, root, files, truncated, now, Some(beacon)).map_err(Some)? {
+        SyncOutcome::Aborted(_) => Err(None),
+        SyncOutcome::Done(_) => {
+            // 最后一道代际检查：`sync` 的检查与这里之间还有一段（写 `synced_at`
+            // 本身）。被取代时不写——否则新库会看到一个"已同步"的时间戳。
+            if super::cache::generation() != generation {
+                return Err(None);
+            }
+            db.set_synced_at(now).map_err(Some)?;
+            Ok(())
+        }
+    }
+}
+
+/// 一次同步的两种结束方式。
+///
+/// 分开而不是返回 `bool`：`Aborted` 的**处置**和 `Done` 完全不同——
+/// 不写 `synced_at`、不发布就绪、不把部分结果当成完整结果。
+enum SyncOutcome {
+    Done(SyncStats),
+    /// 代际变了（或者测试钩子叫停）：已经提交的批次留在库里，剩下的不写了。
+    Aborted(SyncStats),
+}
+
+impl SyncOutcome {
+    /// `(stats, 是否中途停下)`。
+    fn into_parts(self) -> (SyncStats, bool) {
+        match self {
+            SyncOutcome::Done(stats) => (stats, false),
+            SyncOutcome::Aborted(stats) => (stats, true),
+        }
+    }
+}
+
+/// 一次后台同步的进度信标。
+///
+/// 它同时承担两件事：**代际检查**（每批写库之前）与**进度发布**（每批之后）。
+/// 两者都只碰 `cache` 里的一个原子量与一把几微秒的锁——绝不碰 `CACHE`。
+struct Beacon<'a> {
+    root: &'a Path,
+    generation: u64,
+    done: usize,
+    total: usize,
+}
+
+impl Beacon<'_> {
+    /// 我这一代还是当前的吗。
+    fn superseded(&self) -> bool {
+        generation() != self.generation
+    }
+
+    fn publish(&self) {
+        publish(
+            self.root,
+            self.generation,
+            IndexState::Building {
+                done: self.done,
+                total: self.total,
+            },
+        );
+    }
+
+    fn advance(&mut self, processed: usize) {
+        self.done += processed;
+        self.publish();
+    }
+}
+
+/// 测试钩子。
+///
+/// **无条件编译**（与 `autosave::reset_for_test` 同理）：集成测试链接的是
+/// 普通 lib，看不到只在 `#[cfg(test)]` 下存在的符号。
+///
+/// 它存在的唯一理由是「建到一半」这个状态需要**确定**的中点。靠夹具规模去
+/// 卡时间窗在 Linux 上会假绿（1000 篇建库只有几十毫秒），在慢机器上会假红。
+#[doc(hidden)]
+pub mod hooks {
+    use std::sync::Mutex;
+
+    /// 每批写库之后做什么：参数是**已提交的批数**（从 1 开始），
+    /// 返回 `false` 表示「现在停下」，效果等同于一次崩溃（`synced_at` 不写）。
+    pub type AfterBatch = Box<dyn FnMut(usize) -> bool + Send>;
+
+    /// 已安装的钩子。`None` 是生产环境的常态。
+    pub static AFTER_BATCH: Mutex<Option<AfterBatch>> = Mutex::new(None);
+}
+
+/// 调一次测试钩子。生产环境没有钩子，只多一次空锁（每次同步几十次）。
+fn after_batch(batches: usize) -> Option<bool> {
+    let mut hook = hooks::AFTER_BATCH
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    hook.as_mut().map(|hook| hook(batches))
+}
+
+/// 扫描树 → 同步要的扁平文件表，按路径排序。
+///
+/// 扫描器的顺序是「目录优先 + 名字不区分大小写」；同步只要一个确定性顺序，
+/// 这样两批之间的分界在同样的输入下总是一样的（便于复现问题）。
+fn sorted_files(scan: &ScanResult) -> Vec<FileRef> {
+    let mut files = flatten_files(&scan.tree);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
 /// 一次同步要做的一件事。
@@ -120,7 +381,14 @@ enum Prepared {
     Remove(String),
 }
 
-fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<SyncStats, KiError> {
+fn sync(
+    db: &mut IndexDb,
+    root: &Path,
+    files: &[FileRef],
+    truncated: bool,
+    now: i64,
+    mut beacon: Option<Beacon<'_>>,
+) -> Result<SyncOutcome, KiError> {
     let started = Instant::now();
     let mut stats = SyncStats::default();
 
@@ -132,16 +400,11 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
     // 详见 `ki_vault::ResolvedVault` 的「缓存只能是单批次的」。
     let vault = ResolvedVault::open(root)?;
 
-    let mut files = flatten_files(&scan.tree);
-    // 扫描器的顺序是「目录优先 + 名字不区分大小写」；同步只要一个确定性顺序，
-    // 这样两批之间的分界在同样的输入下总是一样的（便于复现问题）。
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-
     let state = db.load_state()?;
     let known: HashMap<&str, &NoteState> = state.iter().map(|s| (s.path.as_str(), s)).collect();
 
     let mut jobs: Vec<Job> = Vec::new();
-    for file in &files {
+    for file in files {
         match known.get(file.path.as_str()) {
             // `size` 与 `mtime` 都没变 → 不读内容。**跳过的也不重试**：
             // 一个 3MB 的文件在它被改小之前，重试只是白白读 3MB。
@@ -152,10 +415,10 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
         }
     }
 
-    // `scan.truncated` 时**绝不删**：扫描在文件数上限处截断，缺失的路径
+    // `truncated` 时**绝不删**：扫描在文件数上限处截断，缺失的路径
     // 只代表"没扫到"，不代表"文件没了"。拿截断结果做删除会把上限之后的
     // 全部笔记从索引里抹掉——而且下一次搜索会静默地少掉一大批结果。
-    if !scan.truncated {
+    if !truncated {
         let live: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
         for prev in &state {
             if !live.contains(prev.path.as_str()) {
@@ -164,9 +427,30 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
         }
     }
 
+    if let Some(beacon) = beacon.as_mut() {
+        // 到这里才知道准确的工作量：未变的篇数 + 要写/要删的条数。
+        // `spawn_after_scan` 之前报的是"篇数"，两者只差被删掉的那几篇。
+        beacon.done = stats.unchanged;
+        beacon.total = stats.unchanged + jobs.len();
+        beacon.publish();
+    }
+
+    let mut batches = 0usize;
     for chunk in jobs.chunks(BATCH_SIZE) {
+        // 代际检查放在 `prepare` **之前**：读盘是这一段里最贵的动作
+        // （10k 库单批约 250ms），过期了就不该再读。
+        if beacon.as_ref().is_some_and(Beacon::superseded) {
+            return Ok(SyncOutcome::Aborted(stats));
+        }
+
         // 阶段一：读盘与分词（事务外）。这里是最慢的一段，不能占着写锁。
         let prepared = prepare(chunk, &vault, &known, &mut stats)?;
+
+        // 再对一次：`prepare` 期间用户可能已经切库，否则这一批会写进一个
+        // 已经不想要的库。
+        if beacon.as_ref().is_some_and(Beacon::superseded) {
+            return Ok(SyncOutcome::Aborted(stats));
+        }
 
         // 阶段二：写库（一个事务）。任何一条失败都整批回滚。
         db.batch(|batch| {
@@ -192,10 +476,18 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
             }
             Ok(())
         })?;
+
+        batches += 1;
+        if let Some(beacon) = beacon.as_mut() {
+            beacon.advance(chunk.len());
+        }
+        if after_batch(batches) == Some(false) {
+            return Ok(SyncOutcome::Aborted(stats));
+        }
     }
 
     stats.elapsed_ms = started.elapsed().as_millis() as u64;
-    Ok(stats)
+    Ok(SyncOutcome::Done(stats))
 }
 
 /// 把一批任务变成"只等写库"的形态。
@@ -310,6 +602,13 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
     let mut cache = lock();
     ensure_root(&mut cache, &root);
 
+    // 索引状态与本次读的快照取在同一时点。
+    //
+    // 顺序很重要：**先读状态，再查库**。反过来的话，后台在查询期间刚好写完，
+    // 我们会拿着"用旧快照算出的部分结果"配一个 `Ready`——那是在骗人。
+    // 现在这个顺序只可能反过来偏保守（说"在建"而其实已建完），无害。
+    let mut index_state = state_for(&root);
+
     let mut open_ms = 0u64;
     if cache.store.is_none() {
         let started = Instant::now();
@@ -334,11 +633,20 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
     // 代价：只有**全新索引库**会走这条路（`synced_at` 为 0）。真实使用里
     // 打开库一定先 `vault_scan`，所以这是给直接调用 IPC 与测试准备的保险。
     if db.synced_at()? == 0 {
+        let heal_generation = generation();
         let started = Instant::now();
         let scan = scan_vault(&root, &ScanOptions::default())?;
+        let files = sorted_files(&scan);
         let now = now_ms();
-        sync(db, &root, &scan, now)?;
-        db.set_synced_at(now)?;
+        let (_, aborted) = sync(db, &root, &files, scan.truncated, now, None)?.into_parts();
+        if aborted {
+            // 跑到一半被新一代取代：状态归新一代管，这里不写。
+            index_state = state_for(&root);
+        } else {
+            db.set_synced_at(now)?;
+            publish(&root, heal_generation, IndexState::Ready);
+            index_state = IndexState::Ready;
+        }
         open_ms += started.elapsed().as_millis() as u64;
     }
 
@@ -368,6 +676,7 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
 
     result.index_ms = pending_ms + open_ms;
     result.builds = builds;
+    result.index_state = index_state;
     Ok(result)
 }
 
@@ -470,6 +779,8 @@ fn finish(
         skipped_files: counts.skipped,
         index_ms: 0,
         builds: 0,
+        // 由调用方覆盖：`finish` 看不到缓存，也不该为了一个诊断字段把锁传进来。
+        index_state: IndexState::Idle,
     }
 }
 
@@ -489,8 +800,14 @@ fn finish(
 ///
 /// # 边界
 ///
-/// - 索引库还没打开，或从没同步过（`synced_at == 0`）：什么都不做。
-///   下一次搜索会自建并全量同步；在这里替它开工只会往一个空库里写一行。
+/// - 进程里还没有连接（比如刚扫描完，索引在后台建）：**自己开一个**。
+///   不能"没有连接就什么都不做"——那会让恢复完的笔记永远缺一行，
+///   而调用方拿到的是 `Ok`。
+/// - 索引还没同步过（`synced_at == 0`）：**照样写这一行**。旧版本在这里
+///   直接返回（理由是"下一次搜索会全量自建"），但后台建索引正在跑时那句话
+///   不成立：它的扫描结果里没有这篇（文件那时还在回收站），它也不会再扫一次。
+///   写进去是安全的——行结构与 `sync` 写的完全一样，之后的全量同步看到
+///   size/mtime 相同就判「未变」。
 /// - 读不到（刚又被删了、编码坏了、超过 2MB）：**删掉那一行**。超大文件
 ///   下次扫描会以 `skipped` 的身份回来，不值得为它多一条分支。
 /// - 失败由调用方吞掉：恢复已经成功，索引问题不该让用户以为「没恢复」。
@@ -499,12 +816,17 @@ pub fn reindex(root: &Path, rel: &str) -> Result<(), KiError> {
     let mut cache = lock();
     ensure_root(&mut cache, &root);
 
-    let Some(db) = cache.store.as_mut() else {
-        return Ok(());
-    };
-    if db.synced_at()? == 0 {
-        return Ok(());
+    // 连接没有就自己开一个。
+    //
+    // `vault_scan` 改成后台建索引之后，它**不再**顺手把连接放进缓存
+    // （后台任务用的是它自己的连接）。这里若沿用"没有连接就什么都不做"，
+    // 恢复完的笔记会永远缺一行，而调用方拿到的是 `Ok`——静默的少结果，
+    // 正是 `reindex` 存在的理由。
+    if cache.store.is_none() {
+        let (db, _) = IndexDb::open(&root)?;
+        cache.store = Some(db);
     }
+    let db = cache.store.as_mut().expect("上面刚保证过 store 非空");
 
     let now = now_ms();
     match read_note(&root, rel) {

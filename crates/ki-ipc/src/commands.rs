@@ -29,14 +29,29 @@ use crate::{autosave, search};
 ///
 /// 1. **丢掉内存索引缓存**：用户点「选择文件夹」就是在要求"重新看一眼磁盘"，
 ///    留着旧索引会让"外部改动重新扫描后才可见"这句话变成谎言。
-/// 2. **把索引库对齐到磁盘**（`search::sync_after_scan`）：判据是 `size + mtime`，
-///    一次没有任何变化的扫描读 0 字节正文。
+/// 2. **把索引库对齐到磁盘，但不等它**（`search::spawn_after_scan`）：
+///    判据仍是 `size + mtime`，一次没有任何变化的扫描读 0 字节正文。
 ///
-/// # 为什么同步失败不让扫描失败
+/// # 为什么索引改到后台
 ///
-/// 用户点的是「选择文件夹」，要的是树。索引维护失败时最坏结果是"搜不到新内容"，
-/// 而那会在下一次扫描时自愈；让整次扫描报错则是"库都打不开了"。
-/// 失败只写 stderr——用户真去搜索时，`KiError::Index` 会把具体路径带出来。
+/// 10k 篇首次建库要 10 秒（缓存热）到 108 秒（缓存冷，本机实测）。用户点的是
+/// 「选择文件夹」，要的是那棵树；让他等索引建完，等于把「打开库」变成
+/// 「等两分钟」。索引是搜索的派生数据，可以晚一点到。
+///
+/// # 代价：搜索可能不全，所以它**可见**
+///
+/// 本命令返回之前就把索引状态置成 `building`，之后每次 `vault_search` 都带着
+/// `indexState` 回来（`building { done, total }` / `ready` / `failed`）。
+/// 前端据此显示「索引正在建立（N/M），以下结果可能不全」。
+///
+/// 没有这个可见性，后台索引就是一个静默的不一致：搜不到刚扫描进来的文件，
+/// 而界面上没有任何东西说明"还在建"。
+///
+/// # 失败不报错
+///
+/// 树已经返回了，索引维护失败最多让搜索少几条，下次扫描会重试。失败只写
+/// stderr 并反映在 `indexState` 的 `failed` 上——用户真去搜索时，
+/// `KiError::Index` 会把具体路径带出来。
 #[tauri::command]
 #[specta::specta]
 pub async fn vault_scan(root: String) -> Result<ScanResult, KiError> {
@@ -44,9 +59,7 @@ pub async fn vault_scan(root: String) -> Result<ScanResult, KiError> {
         let root = PathBuf::from(root);
         search::invalidate(&root);
         let scan = scan_vault(&root, &ScanOptions::default())?;
-        if let Err(err) = search::sync_after_scan(&root, &scan) {
-            eprintln!("索引同步失败（不影响本次扫描）：{err}");
-        }
+        search::spawn_after_scan(&root, &scan);
         Ok(scan)
     })
     .await

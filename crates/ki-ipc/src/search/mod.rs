@@ -30,7 +30,7 @@ mod cache;
 pub mod legacy;
 pub mod service;
 
-pub use service::{reindex, sync_after_scan, SyncReport};
+pub use service::{reindex, spawn_after_scan, sync_after_scan, SyncReport};
 
 use std::path::Path;
 
@@ -78,5 +78,20 @@ pub fn query(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchRe
     match ENGINE {
         Engine::Memory => legacy::query(root, query, refresh),
         Engine::Fts => service::search(root, query, refresh),
+    }
+}
+
+/// 进程级的索引状态。**只给测试用。**
+///
+/// 生产路径不单独查它：状态跟着每次 `vault_search` 返回（理由见
+/// [`ki_core::IndexState`]）——单独查一次等于让前端去拼两个时间点。
+///
+/// 这里暴露它，是因为「切库之后旧任务不再宣称在建」这个瞬间没有搜索可以搭车，
+/// 而它恰恰是切库用例唯一能直接观察的事实。
+#[doc(hidden)]
+pub fn index_state_for_test(root: &Path) -> ki_core::IndexState {
+    match dunce::canonicalize(root) {
+        Ok(root) => cache::state_for(&root),
+        Err(_) => ki_core::IndexState::Idle,
     }
 }
