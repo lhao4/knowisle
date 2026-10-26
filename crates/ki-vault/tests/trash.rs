@@ -647,19 +647,49 @@ fn an_entry_deleted_outside_the_app_disappears_and_restore_fails_cleanly() {
 ///
 /// IPC 是公开边界。放行 `../x.md` 就能把库外的文件搬进库，或把回收目录里的
 /// 文件搬到库外——两者都不需要任何权限提升。
+///
+/// # 反斜杠为什么按平台分支
+///
+/// `\` **只在 Windows 上是分隔符**。Unix 上它是普通字符，`a\b.md` 就是回收
+/// 目录里一个合法文件名——`trash_list` 会把它列出来，恢复入口必须能收回去，
+/// 否则那个条目永远恢复不出来。
+///
+/// 这条和 `check_entry` 的单测是同一个坑的两处：上一刀把它们都写成了跨平台
+/// 的 bad 列表，Windows 全绿、Linux/macOS 红。
 #[test]
 fn restore_refuses_entry_names_that_escape_the_trash_directory() {
     let vault = vault();
     fs::create_dir_all(vault.path().join(TRASH_DIR)).unwrap();
     fs::write(vault.path().join(TRASH_DIR).join("x.md"), "x").unwrap();
 
-    for bad in ["../x.md", "..", ".", "a/b.md", "a\\b.md", "/x.md"] {
+    for bad in ["../x.md", "..", ".", "a/b.md", "/x.md"] {
         let err = trash_restore(vault.path(), bad).expect_err(bad);
         assert!(
             matches!(err, KiError::PathEscape { .. }),
             "{bad} 应当是 PathEscape，实际 {err:?}"
         );
     }
+
+    // Windows：`\` 是分隔符，`a\b.md` 会指向 `trash/a/b.md`，必须拒。
+    #[cfg(windows)]
+    {
+        let err = trash_restore(vault.path(), "a\\b.md").expect_err("反斜杠在 Windows 上是分隔符");
+        assert!(
+            matches!(err, KiError::PathEscape { .. }),
+            "应当是 PathEscape，实际 {err:?}"
+        );
+    }
+
+    // Unix：放行到 IO 层（回收目录里没有这个条目），而不是 PathEscape。
+    #[cfg(unix)]
+    {
+        let err = trash_restore(vault.path(), "a\\b.md").expect_err("回收目录里没有这个条目");
+        assert!(
+            matches!(err, KiError::Io { .. }),
+            "Unix 上反斜杠不是分隔符，应当放行到 IO 层，实际 {err:?}"
+        );
+    }
+
     assert!(
         vault.path().join(TRASH_DIR).join("x.md").is_file(),
         "被拒绝的请求不该动任何文件"
