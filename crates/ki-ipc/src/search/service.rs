@@ -633,21 +633,29 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
     // 代价：只有**全新索引库**会走这条路（`synced_at` 为 0）。真实使用里
     // 打开库一定先 `vault_scan`，所以这是给直接调用 IPC 与测试准备的保险。
     if db.synced_at()? == 0 {
-        let heal_generation = generation();
-        let started = Instant::now();
-        let scan = scan_vault(&root, &ScanOptions::default())?;
-        let files = sorted_files(&scan);
-        let now = now_ms();
-        let (_, aborted) = sync(db, &root, &files, scan.truncated, now, None)?.into_parts();
-        if aborted {
-            // 跑到一半被新一代取代：状态归新一代管，这里不写。
-            index_state = state_for(&root);
+        if matches!(index_state, IndexState::Building { .. }) {
+            // **让路**：后台任务正在建同一个库。两个线程同时写，轻则重复读
+            // 一遍全库，重则互相等锁。这里直接返回部分结果 + `Building`——
+            // 那正是本次改动要的语义：不全，但可见。
+            //
+            // 这也是「自愈路径不能变成第二个建索引的人」那条约束的全部实现。
         } else {
-            db.set_synced_at(now)?;
-            publish(&root, heal_generation, IndexState::Ready);
-            index_state = IndexState::Ready;
+            let heal_generation = generation();
+            let started = Instant::now();
+            let scan = scan_vault(&root, &ScanOptions::default())?;
+            let files = sorted_files(&scan);
+            let now = now_ms();
+            let (_, aborted) = sync(db, &root, &files, scan.truncated, now, None)?.into_parts();
+            if aborted {
+                // 跑到一半被新一代取代：状态归新一代管，这里不写。
+                index_state = state_for(&root);
+            } else {
+                db.set_synced_at(now)?;
+                publish(&root, heal_generation, IndexState::Ready);
+                index_state = IndexState::Ready;
+            }
+            open_ms += started.elapsed().as_millis() as u64;
         }
-        open_ms += started.elapsed().as_millis() as u64;
     }
 
     if let Some(path) = refresh {

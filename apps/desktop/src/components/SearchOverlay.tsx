@@ -87,6 +87,14 @@ export function SearchOverlay({
   const result = answer !== null && answer.needle === needle ? answer.data : null
   const error = failure !== null && failure.needle === needle ? failure.message : null
   const hits = result?.hits ?? []
+  /**
+   * 索引状态。**只跟着结果走**，不轮询。
+   *
+   * `vault_scan` 只等树，索引在后台建；这时搜到的结果可能不全。状态是
+   * `SearchResult` 的一部分（不是另一次 IPC），所以它和这批命中来自同一次读——
+   * 不会出现「状态说在建、结果已经全了」这种要前端自己判断的情况。
+   */
+  const indexing = result?.indexState ?? null
   const index = hits.length === 0 ? -1 : Math.min(active, hits.length - 1)
   /**
    * 「还在搜」是**推出来的**，不是一个 state。
@@ -223,6 +231,19 @@ export function SearchOverlay({
           }}
         />
 
+        {indexing !== null && indexing.state === 'building' && (
+          // 这一行是「后台索引」的可见性契约：没有它，搜不到刚扫描进来的文件
+          // 就是一句无从解释的空白。放在列表**上方**，因为它修饰的是整批结果。
+          <p className="search__indexing" role="status">
+            索引正在建立（{indexing.done}/{indexing.total}），以下结果可能不全
+          </p>
+        )}
+        {indexing !== null && indexing.state === 'failed' && (
+          <p className="search__indexing is-failed" role="status">
+            索引建立失败，以下结果可能不全：{indexing.message}
+          </p>
+        )}
+
         {error !== null ? (
           <p className="search__empty">{error}</p>
         ) : hits.length === 0 ? (
@@ -231,7 +252,9 @@ export function SearchOverlay({
               ? '输入关键词，匹配的是原文子串（不区分 ASCII 大小写）。'
               : busy
                 ? '搜索中…'
-                : '没有匹配的行'}
+                : indexing?.state === 'building'
+                  ? '索引还在建立，暂时没有匹配的行'
+                  : '没有匹配的行'}
           </p>
         ) : (
           <ul

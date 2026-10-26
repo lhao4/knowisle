@@ -1122,6 +1122,28 @@ body {
   color: inherit;
 }
 
+/*
+ * 「索引正在建立」这一行。
+ *
+ * 它必须**在结果列表上方**且始终可见：这句话解释的是「为什么结果可能少了」，
+ * 藏进 footer 或被列表挤走就等于没说。`flex: 0 0 auto` 保证列表再长也不压它。
+ */
+.search__indexing {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-warn-soft);
+  color: var(--ki-warn);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.search__indexing.is-failed {
+  background: var(--ki-bg-danger-soft);
+  color: var(--ki-danger);
+}
+
 .search__empty {
   margin: 0;
   padding: 24px 16px;
