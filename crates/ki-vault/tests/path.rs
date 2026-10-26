@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use common::{skip_unless, try_link_dir, try_link_file};
-use ki_vault::{resolve_for_write, resolve_in_vault};
+use ki_vault::{resolve_for_write, resolve_in_vault, ResolvedVault};
 use tempfile::TempDir;
 
 /* ───────────────────── 读路径：逃逸必须被拒绝 ───────────────────── */
@@ -112,6 +112,60 @@ fn symlink_loop_fails_without_panic() {
     // 环不该 panic，也不该返回库外路径；具体是 IO 错误即可
     let result = resolve_in_vault(vault.path(), "a/to_b/to_a/to_b/x.md");
     assert!(result.is_err(), "软链环必须失败，实际 {result:?}");
+}
+
+/* ───────────────── 批量读取：句柄的缓存键与库根规范化 ───────────────── */
+
+/// 缓存键必须是**规范化后的父目录相对路径**，不是调用方传来的原始字符串。
+///
+/// 判据不用「内部命中次数」（那是实现细节），而是拿「父目录在批次中途变成
+/// junction」去观测：
+///
+/// - 键规范化过 → `./a` 命中 `a` 那一格 → 沿用第一次的结论 → 放行；
+/// - 键用原始串 → 未命中 → 重跑第一道闸 → `PathEscape`。
+///
+/// 这条同时钉住了「缓存只在单批次内有效」这个语义：批次内的变化看不见，
+/// 是换速度的代价，不是 bug（见 `ResolvedVault` 的「缓存只能是单批次的」）。
+#[test]
+fn parent_cache_key_is_normalized() {
+    let vault = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(vault.path().join("a")).unwrap();
+    fs::write(vault.path().join("a").join("b.md"), "B").unwrap();
+
+    let handle = ResolvedVault::open(vault.path()).unwrap();
+    handle.resolve("a/b.md").expect("首次解析应成功");
+
+    // 把 `a` 换成指向库外的 junction：第一道闸若重跑就会拒绝。
+    fs::remove_dir_all(vault.path().join("a")).unwrap();
+    skip_unless!(
+        try_link_dir(&vault.path().join("a"), outside.path()),
+        "目录链接"
+    );
+
+    handle
+        .resolve("./a/b.md")
+        .expect("`./a` 与 `a` 是同一个父目录，必须命中同一格缓存");
+}
+
+/// 库根必须**规范化一次**：带 `..` 的写法与真实路径是同一个库。
+///
+/// 不规范化的话 `self.root` 里留着 `..`，而父目录是 `canonicalize` 过的
+/// （没有 `..`），`starts_with` 的**组件比较**会失败。症状不是「路径找不到」，
+/// 而是**所有笔记都 `PathEscape`**——那是最难往回追的一类错误。
+#[test]
+fn dotted_root_is_normalized_once() {
+    let base = TempDir::new().unwrap();
+    let vault = base.path().join("vault");
+    fs::create_dir_all(vault.join("a")).unwrap();
+    fs::write(vault.join("a").join("b.md"), "B").unwrap();
+
+    let dotted = vault.join("..").join("vault");
+    let handle = ResolvedVault::open(&dotted).unwrap();
+    let resolved = handle
+        .resolve("a/b.md")
+        .expect("带 `..` 的库根必须仍能解析");
+    assert_eq!(fs::read_to_string(resolved).unwrap(), "B");
 }
 
 /* ───────────────────── 写路径：最终组件不得是重解析点 ───────────────────── */
