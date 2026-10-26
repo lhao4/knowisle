@@ -140,7 +140,7 @@ describe('toggleMark · 未包裹', () => {
 describe('toggleMark · 反向选区', () => {
   it('反向选择：anchor 在右时结果方向不变', () => {
     const edit = toggleMark('abc', 3, 0, 'bold')!
-    expect(edit.selection).toEqual({ anchor: 5, head: 3 })
+    expect(edit.selection).toEqual({ anchor: 5, head: 2 })
     expect(apply('abc', edit.changes)).toBe('**abc**')
   })
 
