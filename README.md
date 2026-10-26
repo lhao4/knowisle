@@ -46,7 +46,7 @@
 | 编辑器 | CodeMirror 6（唯一主编辑内核） |
 | 存储 | SQLite + rusqlite（bundled），手写 Repository，不用 ORM；索引库是派生数据，**无迁移、整库重建** |
 | 检索 | FTS5 双通道（ASCII 投影 + CJK bigram 预切分）+ RRF 融合，定位仍由字面子串扫描产出（ADR-007） |
-| 样式 | Tailwind v4 + 三层 CSS 变量 token |
+| 样式 | 手写 CSS + 三层 CSS 变量 token（**Tailwind v4 已定方案但未接入**，见 ADR-006 的实施状态） |
 | IPC 契约 | tauri-specta 生成 `bindings.ts` 并入库，CI 校验漂移 |
 
 架构决策的完整依据见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，它是本项目的唯一真相源；改动架构前先写 ADR，再改文档。
