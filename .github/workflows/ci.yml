@@ -44,6 +44,9 @@ jobs:
 
       - run: pnpm --filter @knowisle/desktop typecheck
       - run: pnpm --filter @knowisle/desktop lint
+      # 纯逻辑用例（marks / quick-open / outline / errors）。1 秒内跑完，
+      # 覆盖的是端到端只能抽样的那部分——星号奇偶性、子序列打分、文档偏移。
+      - run: pnpm --filter @knowisle/desktop test
       - run: pnpm --filter @knowisle/desktop build
 
   rust:

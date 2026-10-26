@@ -1358,6 +1358,7 @@ M6 第一刀把 10k 库的建库成本从 18.4 s 压到 9.9 s（缓存热），�
 | Git 实现 | `git2`（libgit2），设备分支 + 三方合并 | `gitoxide`（merge 支持不全，暂缓）、shell 调用 `git` 二进制（跨平台与错误处理差） |
 | 插件运行时 | L0 React.lazy / L1 Extism(WASM) / L2 Sidecar | 任意执行未签名 JS 插件、`eval`、主进程内 `require` |
 | 测试 | Vitest + Playwright + `cargo test` + 三平台 CI 视觉回归 | 只测 happy path、只在单平台 CI |
+| 前端测试 | **Vitest（`environment: 'node'`），只覆盖四个纯逻辑模块**：`lib/marks.ts`、`lib/quick-open.ts`、`lib/outline.ts`、`api/errors.ts` | jsdom、React Testing Library、组件单测、覆盖率阈值、用 `as any` 换过 tsc |
 | 包管理 | pnpm workspace + Cargo workspace | npm/yarn（monorepo 性能差）、单一巨型 crate |
 
 ### 1.8 版本矩阵（基线）
