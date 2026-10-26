@@ -43,16 +43,27 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use ki_core::ScanResult;
-use ki_ipc::search::{invalidate, sync_after_scan};
+use ki_core::{IndexState, ScanResult};
+use ki_ipc::search::{index_state_for_test, invalidate, sync_after_scan};
 use ki_vault::{flatten_files, scan_vault, ScanOptions};
 
 /// 夹具篇数。与 ADR-007 / BACKLOG B-27 的实测口径一致。
 const FILES: usize = 10_000;
 /// 父目录数。见文件头的「50 个父目录是刻意的」。
 const DIRS: usize = 50;
+
+/// 两个 ignore 用例共用同一份夹具，而 `cargo test -- --ignored` 会**并行**跑它们。
+/// 没有这把锁的话，`ten_thousand_notes_index_build` 的 `build_fixture` 会把
+/// 正在被 `per_file_cost_breakdown` 读的目录删掉——实测报 `NotFound`，
+/// 看起来像实现坏了。
+static FIXTURE: Mutex<()> = Mutex::new(());
+
+fn fixture_lock() -> MutexGuard<'static, ()> {
+    FIXTURE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn fixture_root() -> PathBuf {
     std::env::temp_dir().join("knowisle-index-bench")
@@ -96,6 +107,11 @@ fn reset_index(root: &Path) {
     if meta.exists() {
         fs::remove_dir_all(&meta).expect("删掉上一轮的索引库");
     }
+}
+
+/// `#[tauri::command]` 的 async 版本返回 Future，测试里自己驱动它。
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tauri::async_runtime::block_on(future)
 }
 
 /// 一次「建库」：扫描（计时外）+ 同步（计时内）。
@@ -172,6 +188,7 @@ fn median(samples: &[Duration]) -> f64 {
 #[test]
 #[ignore = "10k 夹具 + 6 次全量建库要几分钟，显式跑：cargo test -p ki-ipc --release --test index_bench -- --ignored --nocapture"]
 fn ten_thousand_notes_index_build() {
+    let _fixture = fixture_lock();
     let root = fixture_root();
     build_fixture(&root);
 
@@ -234,6 +251,7 @@ fn ten_thousand_notes_index_build() {
 #[test]
 #[ignore = "分项探针，显式跑：cargo test -p ki-ipc --release --test index_bench -- breakdown --ignored --nocapture"]
 fn per_file_cost_breakdown() {
+    let _fixture = fixture_lock();
     let root = fixture_root();
     if !root.exists() {
         build_fixture(&root);
@@ -374,4 +392,139 @@ fn per_file_cost_breakdown() {
             started.elapsed().as_secs_f64() * 1e6 / paths.len() as f64
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 验收：树先出来（B-27 第 ② 步）
+// ---------------------------------------------------------------------------
+
+/// 「先出树」这条用例的夹具：1,000 篇。
+///
+/// 不用 10k：判据是**顺序**（树先返回、索引后建完），不是耗时。10k 会让这条
+/// 每次 `cargo test` 都跑的用例多花两分钟，而它对顺序一无所知。
+const SMALL_FILES: usize = 1_000;
+
+fn small_fixture_root() -> PathBuf {
+    std::env::temp_dir().join("knowisle-index-early")
+}
+
+fn build_small_fixture(root: &Path) {
+    if root.exists() {
+        fs::remove_dir_all(root).expect("清掉上一轮的夹具");
+    }
+    fs::create_dir_all(root).unwrap();
+    for index in 0..SMALL_FILES {
+        fs::write(root.join(format!("n{index:05}.md")), note_body(index)).unwrap();
+    }
+}
+
+/// `vault_scan` 必须**先出树**，索引在后台建。
+///
+/// 三条判据，任何一条不成立都说明「先出树」没做到：
+///
+/// 1. 返回时索引状态还是 `Building`——这是「树没有等索引」的直接证据；
+/// 2. 树本身是完整的（1,000 篇，不多不少）；
+/// 3. 索引最终自己建完（`Ready` + 1,000 篇可搜），不是「后台任务根本没跑」。
+///
+/// 第 1 条不是时间断言：它读的是状态，而状态在 `spawn` **之前**就被置位。
+/// 唯一能让它假红的情况是"1,000 篇在几微秒内建完"，那在任何磁盘上都不成立。
+#[test]
+fn vault_scan_returns_before_the_index_is_ready() {
+    let root = small_fixture_root();
+    build_small_fixture(&root);
+    reset_index(&root);
+
+    let root_string = root.to_string_lossy().into_owned();
+    let started = Instant::now();
+    let scan = block_on(ki_ipc::vault_scan(root_string.clone())).expect("vault_scan");
+    let scan_ms = started.elapsed();
+
+    assert_eq!(scan.total_files, SMALL_FILES, "树必须完整");
+    assert!(
+        scan_ms < Duration::from_millis(500),
+        "1k 夹具的树不该要 {scan_ms:?}（扫描本身是毫秒级）"
+    );
+
+    let at_return = index_state_for_test(&root);
+    assert!(
+        matches!(at_return, IndexState::Building { .. }),
+        "vault_scan 返回时索引应当还在建，实际 {at_return:?}"
+    );
+
+    // 等后台建完。
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while index_state_for_test(&root) != IndexState::Ready {
+        assert!(Instant::now() < deadline, "索引没能在 120 秒内就绪");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ready_ms = started.elapsed();
+    assert!(ready_ms > scan_ms, "索引就绪不可能早于树返回");
+
+    // 就绪之后：状态是 Ready，且搜索看到的是全量索引。
+    let result = block_on(ki_ipc::vault_search(
+        root_string,
+        "笔记 001".to_owned(),
+        None,
+    ))
+    .expect("搜索");
+    assert_eq!(result.index_state, IndexState::Ready);
+    assert_eq!(result.indexed_files, SMALL_FILES);
+    assert!(result.total > 0, "就绪之后必须能搜到");
+
+    println!("树 {scan_ms:?} / 索引就绪 {ready_ms:?}（{SMALL_FILES} 篇）");
+}
+
+/// 10k 库上「树可见」与「索引就绪」两个时点。
+///
+/// 与 `ten_thousand_notes_index_build` 的区别：那条量的是**同步**同步的耗时
+/// （`sync_after_scan`），这条量的是**生产路径**——`vault_scan` 命令本身。
+/// 本刀改的就是这个命令的返回时机，所以判据必须落在它身上。
+///
+/// ```sh
+/// cargo test -p ki-ipc --release --test index_bench tree_visible -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "10k 夹具 + 一次全量建库，显式跑（见文件头）"]
+fn tree_visible_and_index_ready_on_ten_thousand() {
+    let _fixture = fixture_lock();
+    let root = fixture_root();
+    if !root.exists() {
+        build_fixture(&root);
+    }
+    reset_index(&root);
+
+    let root_string = root.to_string_lossy().into_owned();
+    let started = Instant::now();
+    let scan = block_on(ki_ipc::vault_scan(root_string)).expect("vault_scan");
+    let tree_ms = started.elapsed();
+    assert_eq!(scan.total_files, FILES);
+    assert_eq!(
+        fingerprint(&scan),
+        0x826b_2334_0d1e_1e45,
+        "树指纹必须与基线一致"
+    );
+    assert!(
+        tree_ms < Duration::from_millis(500),
+        "10k 库的树不该要 {tree_ms:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while index_state_for_test(&root) != IndexState::Ready {
+        assert!(Instant::now() < deadline, "索引没能在 300 秒内就绪");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ready_ms = started.elapsed();
+
+    let (db, _) = ki_store::IndexDb::open(&root).expect("打开索引库");
+    let counts = db.counts().expect("读计数");
+
+    println!(
+        "树可见 {:.0}ms / 索引就绪 {:.0}ms（{} 篇，索引 {} 篇 / 跳过 {}）",
+        tree_ms.as_secs_f64() * 1000.0,
+        ready_ms.as_secs_f64() * 1000.0,
+        FILES,
+        counts.ok,
+        counts.skipped
+    );
+    assert_eq!(counts.ok, FILES, "后台建库必须建全");
 }

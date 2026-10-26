@@ -16,8 +16,10 @@
 
 use std::fs;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use ki_core::{IoKind, KiError, TrashEntry};
+use ki_core::{IndexState, IoKind, KiError, TrashEntry};
+use ki_ipc::search::index_state_for_test;
 use ki_ipc::{
     autosave, note_delete, note_read, trash_list, trash_purge, trash_restore, vault_scan,
     vault_search,
@@ -54,8 +56,21 @@ fn root_of(vault: &TempDir) -> String {
     vault.path().to_string_lossy().into_owned()
 }
 
+/// 扫描，并**等索引就绪**。
+///
+/// `vault_scan` 只等树：索引在后台建，返回时**索引库可能还不存在**。
+/// 这些用例紧接着就要碰索引（`reindex` 要求 `synced_at != 0`，其中一个还要
+/// 直接打开 `index.sqlite` 删表），所以必须等到 `Ready`。
+///
+/// 别把它改回"扫完就往下走"：那样测的是"索引还没建时的行为"，
+/// 而那是另一件事（`tests/background_index.rs` 专门测它）。
 fn scan(root: &str) {
     block_on(vault_scan(root.to_owned())).expect("扫描失败");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while index_state_for_test(std::path::Path::new(root)) != IndexState::Ready {
+        assert!(Instant::now() < deadline, "索引没能在 60 秒内就绪：{root}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn search(root: &str, query: &str) -> ki_core::SearchResult {
