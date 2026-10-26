@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ki_core::{KiError, SearchHit, SearchResult};
+use ki_core::{IndexState, KiError, SearchHit, SearchResult};
 
 use crate::scan::{read_note, scan_vault, ScanOptions};
 
@@ -315,9 +315,11 @@ impl SearchIndex {
             truncated,
             indexed_files: self.files.len(),
             skipped_files: self.skipped,
-            // 下面两个字段由缓存层填：索引自己不知道"这次是不是刚建的"。
+            // 下面三个字段由缓存层填：索引自己不知道"这次是不是刚建的"，
+            // 也不知道后台有没有在跑。
             index_ms: 0,
             builds: 0,
+            index_state: IndexState::Idle,
         }
     }
 

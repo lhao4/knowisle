@@ -21,6 +21,7 @@ export type {
   AppInfo,
   Fallback,
   FileNode,
+  IndexState,
   KiError,
   NodeKind,
   NoteContent,
@@ -36,7 +37,16 @@ export type {
   TrashPage,
 } from './bindings'
 
-/** 递归扫描 Vault，返回 POSIX 相对路径的树。 */
+/**
+ * 递归扫描 Vault，返回 POSIX 相对路径的树。
+ *
+ * **不等索引**：返回时索引还在后台建（10k 库首次打开要 10 秒到两分钟）。
+ * 之后每次 {@link vaultSearch} 都带 `indexState` 回来，界面据此说
+ * 「索引正在建立（N/M），以下结果可能不全」。
+ *
+ * 不要用 `setInterval` 去轮询状态：状态跟着搜索走就够了，用户没在搜的时候
+ * 界面不需要为它转圈。
+ */
 export const vaultScan = commands.vaultScan
 
 /**
@@ -62,8 +72,12 @@ export const vaultScan = commands.vaultScan
  *
  * # 索引从哪来
  *
- * `vaultScan` 之后增量同步（判据 `size + mtime`，没变化就读 0 字节）。
- * 索引库从没同步过时，搜索会自己先扫一遍，所以单独调它也不会静默返回空。
+ * `vaultScan` 之后增量同步（判据 `size + mtime`，没变化就读 0 字节），
+ * **在后台跑**。索引库从没同步过时，搜索会自己先扫一遍，所以单独调它
+ * 也不会静默返回空——但如果后台正在建，它会让路，返回部分结果 + `building`。
+ *
+ * `indexState` 是结果的一部分，不是另一份要自己拼时间点的数据：
+ * 两次 IPC 之间后台可能刚好写完一批。看到 `building` 就说「结果可能不全」。
  */
 export const vaultSearch = commands.vaultSearch
 
