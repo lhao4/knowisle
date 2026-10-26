@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use ki_core::{
     AppInfo, KiError, NoteContent, PurgeResult, RestoreResult, SaveResult, SaveState, ScanResult,
-    SearchResult, TrashEntry,
+    SearchResult, TrashCursor, TrashPage,
 };
 use ki_vault::trash as trash_ops;
 use ki_vault::{
@@ -187,20 +187,34 @@ pub async fn note_delete(root: String, path: String) -> Result<String, KiError> 
     .await
 }
 
-/// 列出回收站，按删除时间倒序。
+/// 列出回收站的一页，按删除时间倒序。
 ///
-/// # 返回值里两个字段的含义不能混
+/// # 三个字段的含义不能混
 ///
-/// - `name` 是**回收目录里的真名**，恢复时原样传回 `trash_restore`。
-/// - `origin` 是删除前的相对路径；`null` 表示清单缺失/损坏。
-///   **这不是错误**：文件还在，只是不知道它原来在哪。UI 必须显示成
-///   「原路径未知」，不能拿 `name` 去猜一个路径显示给用户。
+/// - `entries` 是**这一页**；`total` 是**一共有多少条**。加载两页之后
+///   `entries.length` 是 400，而 `total` 可能是 10000——两个问题，两个答案。
+/// - `next` 是**事实**：`null` 表示游标后面确实没有别的条目了。前端必须
+///   原样传回下一次调用，不要拿 `entries.length < limit` 自己推。
+/// - `entry` 是**回收目录里的真名**，恢复时原样传回 `trash_restore`；
+///   `origin` 是删除前的相对路径，`null` 表示清单缺失/损坏。**这不是错误**：
+///   文件还在，只是不知道它原来在哪。UI 必须显示成「原路径未知」。
+///
+/// # 参数
+///
+/// - `cursor` 首页传 `null`，之后传上一页的 `next`。keyset 而不是 offset：
+///   中间恢复一条不会让后面的行移位。
+/// - `limit` 服务端钳制（`0 → 200`、`> 500 → 500`）。前端传什么都越不过它，
+///   否则一次调用就能读 10 万条清单，分页等于没做。
 ///
 /// 列表为空是正常状态（从没删过东西），不返回错误。
 #[tauri::command]
 #[specta::specta]
-pub async fn trash_list(root: String) -> Result<Vec<TrashEntry>, KiError> {
-    run_blocking(move || trash_ops::list(&PathBuf::from(root))).await
+pub async fn trash_list(
+    root: String,
+    cursor: Option<TrashCursor>,
+    limit: u32,
+) -> Result<TrashPage, KiError> {
+    run_blocking(move || trash_ops::page(&PathBuf::from(root), cursor.as_ref(), limit)).await
 }
 
 /// 把回收站里的一条搬回原目录，返回它最终落在哪里。

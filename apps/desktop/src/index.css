@@ -1348,6 +1348,42 @@ body {
   text-align: center;
 }
 
+/*
+ * 恢复成功的回执。
+ *
+ * 与 `.trash__error` 同一位置、不同色系：面板是模态的，顶栏的 flash 会被
+ * 它盖住，所以"恢复了哪一条"必须说在面板里。用 accent 系（与"选中"同一组
+ * token）而不是警示色——恢复成功不是异常。项目没有 success 色 token，
+ * 也不该为一行提示新造一个：accent 在这里表达的正是"这是一条正面的结果"。
+ */
+.trash__notice {
+  margin: 0;
+  padding: 10px 16px;
+  background: var(--ki-bg-active);
+  color: var(--ki-text-on-active);
+  font-size: 12px;
+}
+
+/*
+ * 分页条。固定在列表下面、页脚上面：它随面板一起可见，不跟着列表滚走。
+ * 否则用户滚到第 200 行时看不到"共 N 条"，会以为列表到底了。
+ */
+.trash__pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  border-top: 1px solid var(--ki-border-subtle);
+}
+
+.trash__progress {
+  color: var(--ki-text-muted);
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+}
+
 .trash__footer {
   display: flex;
   align-items: center;

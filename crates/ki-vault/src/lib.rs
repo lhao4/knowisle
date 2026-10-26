@@ -39,6 +39,7 @@ pub use search::{
     MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
 };
 pub use trash::{
-    list as trash_list, purge as trash_purge, restore as trash_restore, MANIFEST_DIR, TRASH_DIR,
+    page as trash_page, purge as trash_purge, restore as trash_restore, DEFAULT_PAGE_LIMIT,
+    MANIFEST_DIR, MAX_PAGE_LIMIT, TRASH_DIR,
 };
 pub use write::{write_note, write_note_checked};

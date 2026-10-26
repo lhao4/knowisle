@@ -34,12 +34,19 @@
 //!
 //! 代价是 1000 条删除会有 1000 个小文件。回收站不是数据库：一次 `read_dir`
 //! 加 1000 次小文件读在本机是毫秒级，而它每天最多发生几次。
+//!
+//! 但**读侧不能按这个成本结构写**：10k 条的库上「枚举 + 逐条读清单」实测
+//! 7.2 秒（release / 本机 NVMe，ADR-008），而面板是从侧栏底部点开的，用户
+//! 对卡三秒毫无预期。所以列表是**分页**的（[`page`]）：排序键取自文件名
+//! 前缀（不碰清单），一次调用最多读一页的清单。
 
 use std::io::ErrorKind;
 use std::path::{Component, Path};
 use std::time::UNIX_EPOCH;
 
-use ki_core::{Fallback, IoKind, KiError, PurgeResult, RestoreResult, TrashEntry};
+use ki_core::{
+    Fallback, IoKind, KiError, PurgeResult, RestoreResult, TrashCursor, TrashEntry, TrashPage,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::fileops::move_no_clobber;
@@ -168,46 +175,174 @@ fn plausible_origin(origin: &str) -> Option<String> {
     Some(origin.to_owned())
 }
 
-/* ───────────────────── 列表 ───────────────────── */
+/* ───────────────────── 列表（分页） ───────────────────── */
 
-/// 列出回收站，按删除时间倒序（最新在前）。
+/// 一页默认多少条。前端不传或传 0 时用它。
+pub const DEFAULT_PAGE_LIMIT: u32 = 200;
+
+/// 一页最多多少条。前端传什么都越不过它。
+///
+/// 它是**服务端的上界**，不是产品参数：IPC 是公开边界，`trash_list(root,
+/// null, 100000)` 若被放行，一次调用就会读 10 万个清单文件——分页等于没做。
+/// 500 的依据是面板的可见高度（约 15 行）乘一个够用的滚动余量。
+pub const MAX_PAGE_LIMIT: u32 = 500;
+
+/// 排序与游标过滤的中间结构：只要名字与排序键，**不碰磁盘**。
+#[derive(Debug, Clone)]
+struct Candidate {
+    entry: String,
+    /// 排序键：文件名前缀里的 unix 毫秒；没有前缀就是 `0`（排最后）。
+    stamp: i64,
+}
+
+fn candidate(entry: String) -> Candidate {
+    let stamp = stamp_of(&entry).unwrap_or(0);
+    Candidate { entry, stamp }
+}
+
+/// 在倒序里，`candidate` 是否严格排在 `cursor` 之后。
+///
+/// 倒序（最新在前）意味着「之后」= 键**严格小于**游标。相等的那一条就是
+/// 游标自己，不能重复返回——这正是 tiebreaker 必须参与比较的原因。
+fn is_after(candidate: &Candidate, cursor: &TrashCursor) -> bool {
+    (candidate.stamp, candidate.entry.as_str()) < (cursor.deleted_at, cursor.entry.as_str())
+}
+
+/// 排序 → 游标过滤 → 多取一条。**纯函数**，`candidates` 由调用方注入。
+///
+/// # 为什么排序键是文件名前缀，而不是清单里的 `deletedAt`
+///
+/// `delete_note` 里 `stamp = unix_ms()` **同时**用于文件名
+/// （`fileops.rs` 的 `unique_trash_name`）与清单 `deletedAt`（`record`），
+/// 所以「按文件名前缀排序」与「按清单 `deletedAt` 排序」是**同一件事**，
+/// 不是近似。这不是巧合，是那条赋值保证的。
+///
+/// 反过来做（先读清单再排序）会让分页不成立：为了排出第一页，得把 10k 条
+/// 清单全读一遍，而那正是这一刀要消灭的 7 秒。**排序键必须不依赖 IO。**
+///
+/// 代价是清单被手改成别的 `deletedAt` 时，排序仍按文件名（显示值仍取清单）。
+/// 这是**有意的**：宁可让一个被手改过的条目排在与它显示的时间不一致的位置，
+/// 也不要为了它把整页的排序拖回 O(全量 IO)。
+///
+/// # `limit + 1`：`next` 是事实，不是估算
+///
+/// 多取的那一条**只**用来决定有没有下一页，绝不进结果。用
+/// `selected.len() < limit` 判断会错两次：目录被跳过、条目在两次调用之间
+/// 被恢复，都会让长度小于 `limit` 而其实还有下一页。
+///
+/// `limit` 必须 ≥ 1（由 [`clamp_limit`] 保证）。
+fn select(
+    candidates: Vec<Candidate>,
+    cursor: Option<&TrashCursor>,
+    limit: usize,
+) -> (Vec<Candidate>, Option<TrashCursor>) {
+    let mut sorted = candidates;
+    // 倒序 + 条目名倒序。`stamp` 必须按 **i64 数值**比较：字典序里
+    // `999-…` 大于 `1000-…`，而那会把新删的排到旧删的后面。
+    sorted.sort_by(|a, b| b.stamp.cmp(&a.stamp).then_with(|| b.entry.cmp(&a.entry)));
+
+    let mut rest: Vec<Candidate> = match cursor {
+        None => sorted,
+        Some(cursor) => sorted
+            .into_iter()
+            .filter(|candidate| is_after(candidate, cursor))
+            .collect(),
+    };
+
+    let has_more = rest.len() > limit;
+    rest.truncate(limit);
+    let next = if has_more {
+        rest.last().map(|last| TrashCursor {
+            deleted_at: last.stamp,
+            entry: last.entry.clone(),
+        })
+    } else {
+        None
+    };
+    (rest, next)
+}
+
+/// `0 → 200`、`> 500 → 500`。服务端钳制，前端传什么都不能让一次调用读 10k 条清单。
+fn clamp_limit(limit: u32) -> usize {
+    match limit {
+        0 => DEFAULT_PAGE_LIMIT as usize,
+        n if n > MAX_PAGE_LIMIT => MAX_PAGE_LIMIT as usize,
+        n => n as usize,
+    }
+}
+
+/// 列出一页回收站，按删除时间倒序（最新在前）。
+///
+/// # 成本结构
+///
+/// 一次 `read_dir`（为了 `total` 与排序）+ **当前页那 ≤ limit 条**的
+/// `symlink_metadata` 与清单读。排序发生在读清单**之前**，所以页的大小
+/// 决定了 IO 量——这正是 10k 条从 7.24 秒降到 120 毫秒的原因（ADR-008 实测）。
+///
+/// 「是不是文件」用 `DirEntry::file_type()`：Windows 上它来自目录枚举本身，
+/// 不额外 syscall。`metadata()` 只对当前页做——`size` 与 `mtime` 都只服务
+/// 展示（`mtime` 仅在没有时间戳前缀时兜底），没理由为看不见的行付这笔钱。
 ///
 /// # 顺序与判据
 ///
 /// - **一条回收站记录 = 回收目录里的一个普通文件**。清单只提供附加信息，
 ///   不参与"有没有这一条"的判定。
+/// - 排序键是文件名前缀（见 [`select`]）；没有前缀的条目（用户手工放进
+///   回收目录的）按 `0` 处理，排在最后，仍然能列出、仍然能恢复。
 /// - `deleted_at` 三级回退：清单 → 文件名前缀 → 文件 mtime。三级都失败才用 0。
-///   所以它恒有值，前端不必为 `null` 写分支。
 /// - `origin` 为 `None` 是**正常状态**，不是错误：清单缺失、损坏、或记录被
 ///   改成了越界路径都会落到这里。UI 必须把它显示成「原路径未知」。
 ///
 /// # 单个条目失败不连坐
 ///
 /// 读不出元数据的条目直接跳过（与扫描器同一条策略）：一个被占用的文件
-/// 不该让整个回收站打不开。
-pub fn list(root: &Path) -> Result<Vec<TrashEntry>, KiError> {
+/// 不该让整个回收站打不开。它仍计入 `total`——`total` 是一次 `read_dir`
+/// 的快照，下次刷新会自动对齐。
+pub fn page(root: &Path, cursor: Option<&TrashCursor>, limit: u32) -> Result<TrashPage, KiError> {
+    let limit = clamp_limit(limit);
     let dir = root.join(TRASH_DIR);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
+    let listing = match std::fs::read_dir(&dir) {
+        Ok(listing) => listing,
         // 没有回收目录 = 回收站是空的。这不是错误：从没删过东西的库就是这样。
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(TrashPage {
+                entries: Vec::new(),
+                total: 0,
+                next: None,
+            })
+        }
         Err(err) => return Err(KiError::io(TRASH_DIR, &err)),
     };
 
-    let mut out = Vec::new();
-    for entry in entries {
+    let mut candidates = Vec::new();
+    for entry in listing {
         let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = entry.metadata() else { continue };
         // 目录与软链不是"被删掉的笔记"。回收目录是平的，出现目录只可能是
         // 用户自己放进去的，把它列出来再让人"恢复"会搬出一个目录树。
-        if !meta.is_file() {
+        // `file_type()` 读不出来时同样跳过：连是不是文件都不知道，不能算进 total。
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
             continue;
         }
+        candidates.push(candidate(entry.file_name().to_string_lossy().into_owned()));
+    }
+
+    let total = candidates.len() as u64;
+    let (selected, next) = select(candidates, cursor, limit);
+
+    let mut entries = Vec::with_capacity(selected.len());
+    for candidate in selected {
+        // 只有这一页的条目才碰 IO。枚举之后被外部删掉的，跳过。
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(&candidate.entry)) else {
+            continue;
+        };
 
         // 列表只关心「有没有可信的 origin」：记录缺失与记录损坏在这里是
         // 同一件事（都显示成「原路径未知」）。恢复才需要区分它们。
-        let record = match read_record(root, &name) {
+        let record = match read_record(root, &candidate.entry) {
             RecordState::Ok(record) => Some(record),
             RecordState::Missing | RecordState::Corrupt => None,
         };
@@ -215,7 +350,7 @@ pub fn list(root: &Path) -> Result<Vec<TrashEntry>, KiError> {
             .as_ref()
             .map(|record| record.deleted_at)
             .filter(|stamp| *stamp > 0)
-            .or_else(|| stamp_of(&name))
+            .or_else(|| stamp_of(&candidate.entry))
             .unwrap_or_else(|| mtime_ms(&meta));
         let origin = record.and_then(|record| plausible_origin(&record.origin));
 
@@ -227,10 +362,10 @@ pub fn list(root: &Path) -> Result<Vec<TrashEntry>, KiError> {
             .and_then(|origin| origin.rsplit('/').next())
             .filter(|name| !name.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| strip_stamp(&name));
+            .unwrap_or_else(|| strip_stamp(&candidate.entry));
 
-        out.push(TrashEntry {
-            entry: name,
+        entries.push(TrashEntry {
+            entry: candidate.entry,
             name: display,
             origin,
             deleted_at,
@@ -238,15 +373,11 @@ pub fn list(root: &Path) -> Result<Vec<TrashEntry>, KiError> {
         });
     }
 
-    // 倒序 + 条目名倒序：同一毫秒的两条也要有确定顺序，否则列表会在两次
-    // 刷新之间无理由地换位置。条目名里的时间戳前缀让"同毫秒"天然有序
-    // （展示名不行：两个目录下的同名文件展示名完全一样）。
-    out.sort_by(|a, b| {
-        b.deleted_at
-            .cmp(&a.deleted_at)
-            .then_with(|| b.entry.cmp(&a.entry))
-    });
-    Ok(out)
+    Ok(TrashPage {
+        entries,
+        total,
+        next,
+    })
 }
 
 /* ───────────────────── 恢复 ───────────────────── */
@@ -708,6 +839,148 @@ mod tests {
         assert_eq!(stamp_of("a-1700.md"), None);
         assert_eq!(stamp_of("0-a.md"), None);
         assert_eq!(stamp_of("no-stamp"), None);
+    }
+
+    /* ───────────── 分页：排序与游标（纯函数） ───────────── */
+
+    /// 把一组名字排成「一次调用该返回的那一页」。
+    fn page_of(names: &[&str], cursor: Option<&TrashCursor>, limit: usize) -> Vec<String> {
+        let candidates = names
+            .iter()
+            .map(|name| candidate((*name).to_owned()))
+            .collect();
+        let (selected, _) = select(candidates, cursor, limit);
+        selected.into_iter().map(|item| item.entry).collect()
+    }
+
+    /// 一路用 `next` 翻到底，返回按顺序拼起来的条目名。
+    fn walk(names: &[&str], limit: usize) -> Vec<String> {
+        let mut all = Vec::new();
+        let mut cursor: Option<TrashCursor> = None;
+        for _ in 0..=names.len() {
+            let candidates: Vec<Candidate> =
+                names.iter().map(|n| candidate((*n).to_owned())).collect();
+            let (selected, next) = select(candidates, cursor.as_ref(), limit);
+            all.extend(selected.into_iter().map(|item| item.entry));
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return all,
+            }
+        }
+        panic!("翻页没有收敛：游标一直在返回 Some");
+    }
+
+    /// 排序键必须按 **i64 数值**比较，不是字符串。
+    ///
+    /// # 这条用例钉住的是什么
+    ///
+    /// 文件名前缀是十进制数字，而字典序里 `"999"` > `"1000"`。把
+    /// `sort_by(|a, b| b.entry.cmp(&a.entry))` 当成排序实现（文件名整体比较）
+    /// 会把 999ms 的旧条目排到 1000ms 的新条目前面。真实时间戳都是 13 位，
+    /// 平时看不出差别——只有跨位数（或人为造的短前缀）才会红，所以必须
+    /// 显式造这两条。
+    ///
+    /// 变异：把 `select` 里的 `b.stamp.cmp(&a.stamp)` 换成
+    /// `b.entry.cmp(&a.entry)`，这条会红。
+    #[test]
+    fn the_sort_key_is_the_numeric_prefix_not_the_string() {
+        let ordered = page_of(&["999-old.md", "1000-new.md"], None, 10);
+        assert_eq!(ordered, vec!["1000-new.md", "999-old.md"]);
+    }
+
+    /// 同一毫秒的两条：tiebreaker 是 `entry`，跨页各出现一次。
+    ///
+    /// 页大小 1 时，边界正好落在两条同毫秒条目之间。没有 tiebreaker（只用
+    /// `stamp` 比较）的实现会在第二页把另一条一起排除（`>` 判据）或重复
+    /// 返回同一条（`>=` 判据）。
+    #[test]
+    fn same_millisecond_entries_cross_a_page_boundary_once() {
+        let names = [
+            "1700000000000-a.md",
+            "1700000000000-b.md",
+            "1700000000001-c.md",
+        ];
+        assert_eq!(walk(&names, 1), vec![names[2], names[1], names[0]]);
+    }
+
+    /// 展示名相同、真名不同：游标必须认 `entry`。
+    ///
+    /// `a/c.md` 与 `b/c.md` 的展示名都是 `c.md`。若游标用展示名，两条会
+    /// 互相覆盖，翻页直接漏掉一条。
+    #[test]
+    fn the_cursor_uses_the_entry_name_not_the_display_name() {
+        let names = ["1700000000000-a-c.md", "1700000000000-b-c.md"];
+        assert_eq!(walk(&names, 1).len(), 2);
+        assert_eq!(walk(&names, 1), vec![names[1], names[0]]);
+    }
+
+    /// 没有时间戳前缀的条目（用户手工放进回收目录）：按 0 排最后，仍列出。
+    #[test]
+    fn entries_without_a_stamp_sort_last_but_are_still_listed() {
+        let names = ["hand-placed.md", "1700000000000-real.md"];
+        assert_eq!(page_of(&names, None, 10), vec![names[1], names[0]]);
+        // 翻页也翻得到它：不能被"排序键为 0"吞掉。
+        assert_eq!(walk(&names, 1), vec![names[1], names[0]]);
+    }
+
+    /// 翻页不重不漏：集合相等，且去重后条数不变。
+    #[test]
+    fn walking_every_page_yields_each_entry_exactly_once() {
+        let names: Vec<String> = (0..97)
+            .map(|index| format!("{}-n{index:03}.md", 1_700_000_000_000i64 + index))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let walked = walk(&refs, 7);
+        assert_eq!(walked.len(), names.len(), "翻页漏条或重复");
+
+        let mut unique = walked.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "翻页返回了重复条目");
+
+        // 顺序也必须是全序的倒序：一趟翻页拼起来 == 一次全量排序。
+        let mut expected = names.clone();
+        expected.reverse();
+        assert_eq!(walked, expected);
+    }
+
+    /// `next` 是事实：正好 `limit` 条时它必须是 `null`。
+    ///
+    /// 这条挡住「拿 `entries.len() == limit` 当还有下一页」的写法——那会让
+    /// 前端多请求一次空页，然后按钮永远停在「加载更多」。
+    #[test]
+    fn next_is_null_when_the_last_page_is_exactly_full() {
+        let names: Vec<String> = (0..6)
+            .map(|index| format!("{}-n{index}.md", 1_700_000_000_000i64 + index))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let candidates = || {
+            refs.iter()
+                .map(|name| candidate((*name).to_owned()))
+                .collect::<Vec<_>>()
+        };
+
+        let (selected, next) = select(candidates(), None, 6);
+        assert_eq!(selected.len(), 6);
+        assert!(next.is_none(), "正好一页时不该有下一页");
+
+        let (selected, next) = select(candidates(), None, 5);
+        assert_eq!(selected.len(), 5);
+        let next = next.expect("还有一条没读，必须有下一页");
+        assert_eq!(next.entry, selected[4].entry, "游标指向本页最后一条");
+        assert_eq!(next.deleted_at, selected[4].stamp);
+    }
+
+    /// `limit` 服务端钳制：前端传什么都不能让一次调用读 10k 条清单。
+    #[test]
+    fn the_limit_is_clamped_by_the_server() {
+        assert_eq!(clamp_limit(0), DEFAULT_PAGE_LIMIT as usize);
+        assert_eq!(clamp_limit(1), 1);
+        assert_eq!(clamp_limit(200), 200);
+        assert_eq!(clamp_limit(MAX_PAGE_LIMIT), MAX_PAGE_LIMIT as usize);
+        assert_eq!(clamp_limit(MAX_PAGE_LIMIT + 1), MAX_PAGE_LIMIT as usize);
+        assert_eq!(clamp_limit(u32::MAX), MAX_PAGE_LIMIT as usize);
     }
 
     /// 路径闸：单个文件名通过，其余一律 `PathEscape`。

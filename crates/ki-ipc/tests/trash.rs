@@ -17,7 +17,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use ki_core::{IoKind, KiError};
+use ki_core::{IoKind, KiError, TrashEntry};
 use ki_ipc::{
     autosave, note_delete, note_read, trash_list, trash_purge, trash_restore, vault_scan,
     vault_search,
@@ -26,6 +26,20 @@ use tempfile::TempDir;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tauri::async_runtime::block_on(future)
+}
+
+/// 翻完所有页（这些用例的条目都是个位数）。
+fn trash_all(root: &str) -> Vec<TrashEntry> {
+    let mut all = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = block_on(trash_list(root.to_owned(), cursor, 200)).expect("列表失败");
+        all.extend(page.entries);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return all,
+        }
+    }
 }
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -80,7 +94,7 @@ fn trash_commands_round_trip_and_make_the_note_searchable_again() {
         "删除之后不该还能搜到"
     );
 
-    let listed = block_on(trash_list(root.clone())).expect("列表失败");
+    let listed = trash_all(&root);
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].origin.as_deref(), Some("a/b/c.md"));
     assert_eq!(listed[0].entry, trashed.rsplit('/').next().unwrap());
@@ -102,10 +116,7 @@ fn trash_commands_round_trip_and_make_the_note_searchable_again() {
     let note = block_on(note_read(root.clone(), "a/b/c.md".to_owned())).expect("读回失败");
     assert_eq!(note.content, body);
 
-    assert!(
-        block_on(trash_list(root)).unwrap().is_empty(),
-        "恢复之后列表必须空"
-    );
+    assert!(trash_all(&root).is_empty(), "恢复之后列表必须空");
 }
 
 /* ───────────────────── 撞名 ───────────────────── */
@@ -122,7 +133,7 @@ fn restoring_onto_an_existing_name_keeps_both_copies() {
     block_on(note_delete(root.clone(), "c.md".to_owned())).expect("删除失败");
     fs::write(vault.path().join("c.md"), "新写的那份").unwrap();
 
-    let listed = block_on(trash_list(root.clone())).expect("列表失败");
+    let listed = trash_all(&root);
     let restored =
         block_on(trash_restore(root.clone(), listed[0].entry.clone())).expect("恢复失败");
 
@@ -152,18 +163,57 @@ fn purging_empties_the_trash_and_the_list() {
         scan(&root);
         block_on(note_delete(root.clone(), name.to_owned())).expect("删除失败");
     }
-    assert_eq!(block_on(trash_list(root.clone())).unwrap().len(), 2);
+    assert_eq!(trash_all(&root).len(), 2);
 
     let removed = block_on(trash_purge(root.clone())).expect("清空失败");
 
     assert_eq!(removed.removed, 2);
     assert_eq!(removed.failed, 0);
-    assert!(block_on(trash_list(root.clone())).unwrap().is_empty());
+    assert!(trash_all(&root).is_empty());
     let left: Vec<String> = fs::read_dir(vault.path().join(".knowisle/trash"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(left.is_empty(), "回收目录必须空，实际 {left:?}");
+}
+
+/* ───────────────────── 分页之后清空 ───────────────────── */
+
+/// 验收 7：分页之后 `trash_purge` **仍然是全量**，不是当前页。
+///
+/// # 这条守的是什么
+///
+/// 「列表分页了」很容易顺手把清空也写成"删当前页"，而用户点「清空」的
+/// 意图是"把回收站清干净"。分页是**读**侧的成本优化，不该改变**写**侧的
+/// 语义：`purge` 扫目录，与 `limit` / `cursor` 毫无关系。
+#[test]
+fn purging_deletes_every_entry_not_just_the_loaded_page() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    for index in 0..12 {
+        let name = format!("n{index:02}.md");
+        fs::write(vault.path().join(&name), name.clone()).unwrap();
+    }
+    scan(&root);
+    for index in 0..12 {
+        let name = format!("n{index:02}.md");
+        block_on(note_delete(root.clone(), name)).expect("删除失败");
+    }
+
+    let first = block_on(trash_list(root.clone(), None, 5)).expect("列表失败");
+    assert_eq!(first.entries.len(), 5, "一页只有 5 条");
+    assert_eq!(first.total, 12, "total 是 12，不是 5");
+    assert!(first.next.is_some());
+
+    let removed = block_on(trash_purge(root.clone())).expect("清空失败");
+    assert_eq!(removed.removed, 12, "清空是全量，不是当前页");
+    assert_eq!(removed.failed, 0);
+
+    let after = block_on(trash_list(root, None, 5)).expect("列表失败");
+    assert_eq!(after.total, 0);
+    assert!(after.entries.is_empty());
+    assert!(after.next.is_none());
 }
 
 /* ───────────────────── 索引补不进去 ───────────────────── */
@@ -209,10 +259,7 @@ fn a_restore_that_cannot_update_the_index_still_succeeds() {
         body,
         "文件必须真的回到了原处"
     );
-    assert!(
-        block_on(trash_list(root)).unwrap().is_empty(),
-        "条目必须已经离开回收站"
-    );
+    assert!(trash_all(&root).is_empty(), "条目必须已经离开回收站");
 }
 
 /* ───────────────────── 外部删除 ───────────────────── */
@@ -233,7 +280,7 @@ fn restoring_a_vanished_entry_reports_not_found() {
     let name = trashed.rsplit('/').next().unwrap().to_owned();
     fs::remove_file(vault.path().join(&trashed)).unwrap();
 
-    assert!(block_on(trash_list(root.clone())).unwrap().is_empty());
+    assert!(trash_all(&root).is_empty());
 
     let err = block_on(trash_restore(root, name)).expect_err("文件没了，恢复必须失败");
     match err {

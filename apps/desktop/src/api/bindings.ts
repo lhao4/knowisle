@@ -119,18 +119,28 @@ export const commands = {
 	 */
 	noteDelete: (root: string, path: string) => __TAURI_INVOKE<string>("note_delete", { root, path }),
 	/**
-	 *  列出回收站，按删除时间倒序。
+	 *  列出回收站的一页，按删除时间倒序。
 	 * 
-	 *  # 返回值里两个字段的含义不能混
+	 *  # 三个字段的含义不能混
 	 * 
-	 *  - `name` 是**回收目录里的真名**，恢复时原样传回 `trash_restore`。
-	 *  - `origin` 是删除前的相对路径；`null` 表示清单缺失/损坏。
-	 *    **这不是错误**：文件还在，只是不知道它原来在哪。UI 必须显示成
-	 *    「原路径未知」，不能拿 `name` 去猜一个路径显示给用户。
+	 *  - `entries` 是**这一页**；`total` 是**一共有多少条**。加载两页之后
+	 *    `entries.length` 是 400，而 `total` 可能是 10000——两个问题，两个答案。
+	 *  - `next` 是**事实**：`null` 表示游标后面确实没有别的条目了。前端必须
+	 *    原样传回下一次调用，不要拿 `entries.length < limit` 自己推。
+	 *  - `entry` 是**回收目录里的真名**，恢复时原样传回 `trash_restore`；
+	 *    `origin` 是删除前的相对路径，`null` 表示清单缺失/损坏。**这不是错误**：
+	 *    文件还在，只是不知道它原来在哪。UI 必须显示成「原路径未知」。
+	 * 
+	 *  # 参数
+	 * 
+	 *  - `cursor` 首页传 `null`，之后传上一页的 `next`。keyset 而不是 offset：
+	 *    中间恢复一条不会让后面的行移位。
+	 *  - `limit` 服务端钳制（`0 → 200`、`> 500 → 500`）。前端传什么都越不过它，
+	 *    否则一次调用就能读 10 万条清单，分页等于没做。
 	 * 
 	 *  列表为空是正常状态（从没删过东西），不返回错误。
 	 */
-	trashList: (root: string) => __TAURI_INVOKE<TrashEntry[]>("trash_list", { root }),
+	trashList: (root: string, cursor: TrashCursor | null, limit: number) => __TAURI_INVOKE<TrashPage>("trash_list", { root, cursor, limit }),
 	/**
 	 *  把回收站里的一条搬回原目录，返回它最终落在哪里。
 	 * 
@@ -685,6 +695,39 @@ export type SearchResult = {
 	builds: number,
 };
 
+/**
+ *  keyset 分页的游标：`(deleted_at, entry)` 的字典序。
+ * 
+ *  # 为什么不是 offset
+ * 
+ *  offset 分页在第 5 页恢复一条之后会把**所有**条目往前挪一位，用户再翻页
+ *  就会看到一条重复的、并漏掉一条。keyset 不会：游标指向的是「上次读到的
+ *  那个键」，之后的行不会因为前面少了一条而移位。
+ * 
+ *  # 两个字段都不能省
+ * 
+ *  `deleted_at` 单独用会在「同一毫秒删了两条」时漏掉一条——两条落在页边界
+ *  上时，第二页的 `>` 判据把同毫秒的另一条一起排除了。tiebreaker 是
+ *  **`entry`（磁盘上的真名）而不是 `name`（展示名）**：`a/c.md` 与 `b/c.md`
+ *  的展示名完全一样，拿它当游标会重复或丢条。
+ * 
+ *  # 这里的 `deleted_at` 是**排序键**，不是展示值
+ * 
+ *  排序键取自文件名前缀（`<unix_ms>-<原名>`），而 [`TrashEntry::deleted_at`]
+ *  的第一级来源是清单。两者在正常删除流程里恒等（同一个 `stamp` 同时写进
+ *  文件名与清单），但清单被手改成别的值时，排序**仍然按文件名**——那是
+ *  有意的：排序键必须不依赖 IO，否则分页就不成立（详见 ADR-008）。
+ */
+export type TrashCursor = {
+	/**
+	 *  排序键：条目名里的 unix 毫秒前缀；没有前缀（用户手工放进回收目录的）
+	 *  是 `0`，排在最后。
+	 */
+	deletedAt: number,
+	/**  回收目录里的真名，同毫秒时的 tiebreaker。 */
+	entry: string,
+};
+
 /**  回收目录里的一条。 */
 export type TrashEntry = {
 	/**
@@ -719,5 +762,46 @@ export type TrashEntry = {
 	deletedAt: number,
 	/**  字节数（磁盘真值）。 */
 	size: number,
+};
+
+/**
+ *  一页回收站条目。
+ * 
+ *  # `total` 与 `entries.len()` 的分工
+ * 
+ *  这两个数字回答的是**两个不同的问题**，分页之后必然分叉：
+ * 
+ *  | 字段 | 回答 | 用途 |
+ *  |---|---|---|
+ *  | `total` | 回收目录里一共有多少个文件 | 「共 N 条」、清空确认框、侧栏徽标 |
+ *  | `entries.len()` | **这一页**给了多少条 | 决定还要不要继续翻 |
+ * 
+ *  拿 `entries.len()` 当总数是这一刀要消灭的第一个洞：加载了两页之后它是
+ *  400，而回收站里可能有 10000 条。反过来拿 `total` 当「还能翻几页」的依据
+ *  也不行——`total` 里包含还没加载的那些。
+ * 
+ *  # `next` 是**事实**，不是估算
+ * 
+ *  `next === null` 只表示一件事：**这次调用之后，游标后面没有别的条目了**。
+ *  它由「多取一条」得出（见 `ki_vault::trash::page`），**不是**由
+ *  `entries.len() < limit` 推出来的——目录被跳过、条目在两次调用之间被恢复，
+ *  都会让长度小于 `limit` 而其实还有下一页。
+ * 
+ *  前端必须把 `next` 原样传回下一次调用，不要自己拼游标：游标的两个字段
+ *  一起构成排序键，少一个就会在「同毫秒两条」处漏掉一条。
+ */
+export type TrashPage = {
+	/**  这一页的条目，按删除时间倒序（最新在前）。 */
+	entries: TrashEntry[],
+	/**
+	 *  回收目录里**文件**的总数。不含目录、不含枚举时读不出来的条目。
+	 * 
+	 *  它是**一次 `read_dir` 的快照**，不是缓存：枚举之后被外部恢复/清掉的
+	 *  条目会让它短暂偏大，下一次刷新自动对齐。刻意不缓存目录列表——回收站
+	 *  随时会被改动，缓存只会让 `total` 变成谎话。
+	 */
+	total: number,
+	/**  下一页的游标。`null` = 没有下一页。 */
+	next: TrashCursor | null,
 };
 

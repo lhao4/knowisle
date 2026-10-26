@@ -31,7 +31,9 @@ export type {
   ScanResult,
   SearchHit,
   SearchResult,
+  TrashCursor,
   TrashEntry,
+  TrashPage,
 } from './bindings'
 
 /** 递归扫描 Vault，返回 POSIX 相对路径的树。 */
@@ -124,13 +126,27 @@ export const noteRename = commands.noteRename
 export const noteDelete = commands.noteDelete
 
 /**
- * 列出回收站，按删除时间倒序。
+ * 列出回收站的**一页**，按删除时间倒序。
  *
  * 每一项带 `entry`（恢复用的磁盘真名）、`name`（展示名）、`origin`
  * （原路径，可能为 `null`）、`deletedAt`、`size`。
  *
  * `origin === null` 是**正常状态**：清单缺失或损坏。UI 必须显示成
  * 「原路径未知」，不能拿 `name` 拼一个看起来像路径的字符串——那是在骗用户。
+ *
+ * # 三个字段各回答一个问题
+ *
+ * - `entries`：这一页给了多少条。
+ * - `total`：回收目录里**一共**有多少条。分页之后它与 `entries.length`
+ *   必然分叉，别拿后者当总数。
+ * - `next`：下一页的游标，`null` = 没有下一页。它是服务端算出来的**事实**
+ *   （多取一条判出来的），**不要**用 `entries.length < limit` 自己推——
+ *   目录被跳过、条目在两次调用之间被恢复，都会让"这页不满"而其实还有下一页。
+ *
+ * # 参数
+ *
+ * - `cursor` 首页传 `null`，之后传上一页的 `next`，原样传回，不要自己拼。
+ * - `limit` 服务端钳制（`0 → 200`、`> 500 → 500`）。
  *
  * 列表为空不报错（从没删过东西的库就是这样）。
  */

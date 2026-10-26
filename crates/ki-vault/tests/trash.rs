@@ -42,12 +42,29 @@ use ki_core::{Fallback, KiError};
 #[cfg(unix)]
 use ki_core::IoKind;
 use ki_vault::{
-    delete_note, read_note, trash_list, trash_purge, trash_restore, MANIFEST_DIR, TRASH_DIR,
+    delete_note, read_note, trash_page, trash_purge, trash_restore, MANIFEST_DIR, TRASH_DIR,
 };
 use tempfile::TempDir;
 
 fn vault() -> TempDir {
     TempDir::new().unwrap()
+}
+
+/// 把所有页翻完，拼成一个列表。
+///
+/// 这些用例的条目都是个位数，分页对它们是透明的；`page` 返回 `next` 而不是
+/// 靠 `len < limit` 推断，所以这个 helper 不会在最后一页多转一圈。
+fn trash_list(root: &Path) -> Result<Vec<ki_core::TrashEntry>, KiError> {
+    let mut all = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = trash_page(root, cursor.as_ref(), 50)?;
+        all.extend(page.entries);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(all),
+        }
+    }
 }
 
 /// 回收目录里的条目名（排序后）。
@@ -662,6 +679,11 @@ fn purge_skips_directories_it_did_not_create() {
     fs::write(vault.path().join(TRASH_DIR).join("mine/keep.txt"), "x").unwrap();
 
     assert_eq!(trash_list(vault.path()).unwrap().len(), 1, "目录不算条目");
+    assert_eq!(
+        trash_page(vault.path(), None, 10).unwrap().total,
+        1,
+        "目录不出现，也不计入 total"
+    );
 
     let result = trash_purge(vault.path()).unwrap();
     assert_eq!(result.removed, 1, "只数删掉的文件，不数清单目录");
@@ -789,6 +811,223 @@ fn purge_reports_files_it_cannot_delete_instead_of_erroring() {
     assert_eq!(result.removed, 0);
     assert_eq!(result.failed, 3);
     assert_eq!(trash_entries(&vault).len(), 3, "一篇都没少");
+}
+
+/* ───────────────────── 分页 ───────────────────── */
+
+/// 造 `count` 条只有文件、没有清单的条目（时间戳逐条 +1ms）。
+fn build_entries(root: &Path, count: usize) -> Vec<String> {
+    let trash = root.join(TRASH_DIR);
+    fs::create_dir_all(&trash).unwrap();
+    let mut names = Vec::new();
+    for index in 0..count {
+        let name = format!("{}-n{index:03}.md", 1_700_000_000_000i64 + index as i64);
+        fs::File::create(trash.join(&name)).unwrap();
+        names.push(name);
+    }
+    names
+}
+
+/// 验收 2：97 条、页大小 7 —— 一路用 `next` 取到底，不重不漏。
+///
+/// # 为什么判据是集合而不是计数
+///
+/// `seen.len() == 97` 只证明没有重复；要证明没有**漏**，必须与磁盘上的
+/// 文件集合比。两者都成立才算「不重不漏」。
+#[test]
+fn paging_never_repeats_or_drops_an_entry() {
+    let vault = vault();
+    let names = build_entries(vault.path(), 97);
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0usize;
+    loop {
+        let page = trash_page(vault.path(), cursor.as_ref(), 7).unwrap();
+        assert_eq!(page.total, 97, "total 是总数，不随翻页变化");
+        assert!(page.entries.len() <= 7, "一页不许超过 limit");
+        seen.extend(page.entries.into_iter().map(|entry| entry.entry));
+        pages += 1;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, 14, "97 条 / 每页 7 条 = 14 页（最后一页 6 条）");
+    assert_eq!(seen.len(), 97, "翻页总数不对：漏了或重了");
+
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 97, "翻页返回了重复条目");
+
+    let mut expected = names.clone();
+    expected.sort();
+    assert_eq!(unique, expected, "翻页拿到的集合必须与磁盘上的文件集合相等");
+    assert_eq!(seen.first().unwrap(), names.last().unwrap(), "最新在前");
+    assert_eq!(seen.last().unwrap(), names.first().unwrap(), "最旧在最后");
+}
+
+/// 验收 3：同一毫秒的两条正好落在页边界上（页大小 1）。
+///
+/// 没有 tiebreaker 的实现会在第二页把另一条一起排除（`>` 判据）或重复
+/// 返回同一条（`>=` 判据）。tiebreaker 必须是 `entry` 而不是展示名：
+/// `a/c.md` 与 `b/c.md` 的展示名完全一样。
+#[test]
+fn entries_deleted_in_the_same_millisecond_cross_a_page_boundary_once() {
+    let vault = vault();
+    let trash = vault.path().join(TRASH_DIR);
+    fs::create_dir_all(&trash).unwrap();
+    for name in [
+        "1700000000000-a.md",
+        "1700000000000-b.md",
+        "1700000000001-c.md",
+    ] {
+        fs::File::create(trash.join(name)).unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = trash_page(vault.path(), cursor.as_ref(), 1).unwrap();
+        seen.extend(page.entries.into_iter().map(|entry| entry.entry));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            "1700000000001-c.md",
+            "1700000000000-b.md",
+            "1700000000000-a.md"
+        ],
+        "同毫秒的两条各出现一次，顺序由 entry 决定"
+    );
+}
+
+/// 验收 5：用户手工放进 `trash/` 的无时间戳文件 —— 仍列出、排最后、能恢复。
+///
+/// 排序键解析失败时按 `0` 处理，不是跳过：那个文件是用户的，他可能正想
+/// 把它捞回来。跳过等于让一条真实存在的记录在列表里凭空消失。
+#[test]
+fn an_entry_without_a_timestamp_prefix_is_listed_last_and_restorable() {
+    let vault = vault();
+    let trash = vault.path().join(TRASH_DIR);
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join("手工放进来的.md"), "手工").unwrap();
+    fs::File::create(trash.join("1700000000000-real.md")).unwrap();
+
+    let page = trash_page(vault.path(), None, 10).unwrap();
+    assert_eq!(page.total, 2, "没有前缀的条目也要计入 total");
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(page.entries[0].entry, "1700000000000-real.md");
+    assert_eq!(page.entries[1].entry, "手工放进来的.md", "没有前缀的排最后");
+    assert_eq!(
+        page.entries[1].name, "手工放进来的.md",
+        "剥不出前缀就原样返回，不猜"
+    );
+
+    let restored = trash_restore(vault.path(), "手工放进来的.md").unwrap();
+    assert_eq!(restored.fallback, Some(Fallback::RecordMissing));
+    assert_eq!(restored.path, "手工放进来的.md");
+    assert_eq!(
+        fs::read_to_string(vault.path().join("手工放进来的.md")).unwrap(),
+        "手工"
+    );
+}
+
+/// 清单被手改成别的 `deletedAt`：**排序仍按文件名**，显示值仍取清单。
+///
+/// # 这条是刻意钉住"不一致"的
+///
+/// 排序键必须不依赖 IO（否则为了排第一页得读全量清单，分页就不成立），
+/// 所以清单里的值改不动顺序。代价是这一条会排在与它显示的时间不一致的
+/// 位置上——那是**有意的**，不是 bug。若哪天有人把排序改回"读清单再排"，
+/// 这条会红。
+#[test]
+fn the_order_follows_the_file_name_even_when_the_manifest_says_otherwise() {
+    let vault = vault();
+    fs::write(vault.path().join("a.md"), "A").unwrap();
+    fs::write(vault.path().join("b.md"), "B").unwrap();
+    delete_note(vault.path(), "a.md").unwrap();
+    delete_note(vault.path(), "b.md").unwrap();
+
+    let names = trash_entries(&vault);
+    let older = names
+        .iter()
+        .find(|name| name.ends_with("-a.md"))
+        .expect("回收目录里应当有 a.md")
+        .clone();
+    fs::write(
+        vault
+            .path()
+            .join(MANIFEST_DIR)
+            .join(format!("{older}.json")),
+        r#"{"origin":"a.md","deletedAt":9999999999999}"#,
+    )
+    .unwrap();
+
+    let page = trash_page(vault.path(), None, 10).unwrap();
+    assert_eq!(page.entries.len(), 2);
+    assert!(
+        page.entries[0].entry.ends_with("-b.md"),
+        "排序按文件名前缀，b 在后删的那一条上：{:?}",
+        page.entries.iter().map(|e| &e.entry).collect::<Vec<_>>()
+    );
+    assert!(page.entries[1].entry.ends_with("-a.md"));
+    assert_eq!(
+        page.entries[1].deleted_at, 9_999_999_999_999,
+        "显示值仍然取清单（被手改成未来），与排序位置不一致是刻意的"
+    );
+}
+
+/// 验收 4 的数据层：翻页**期间**恢复一条，后续页不重不漏。
+///
+/// # 这是 keyset 与 offset 的分水岭
+///
+/// offset 分页在第 1 页之后删掉其中一条，第二页的 `skip(5)` 会跳过一条
+/// （所有行往前挪了一位），用户永远看不到它。keyset 不会：游标指向的是
+/// 「上次读到的那个键」，前面少一条与后面无关。
+///
+/// 这条用例不重新从 `null` 开始翻——那正是前端「恢复后不整页重取」的做法。
+#[test]
+fn a_restore_between_pages_does_not_shift_the_rest() {
+    let vault = vault();
+    let names = build_entries(vault.path(), 20);
+
+    let first = trash_page(vault.path(), None, 5).unwrap();
+    assert_eq!(first.entries.len(), 5);
+    assert!(first.next.is_some());
+
+    // 模拟"用户在已加载的列表里恢复了第一条"：文件离开回收目录。
+    let restored = first.entries[0].entry.clone();
+    fs::remove_file(vault.path().join(TRASH_DIR).join(&restored)).unwrap();
+
+    // 用第一页的 `next` 继续翻，**不**从 null 重来。已加载的那 5 条里
+    // 去掉刚恢复的一条，剩下的 4 条本来就还在列表里——前端也是这样算的。
+    let mut seen: Vec<String> = first.entries[1..]
+        .iter()
+        .map(|entry| entry.entry.clone())
+        .collect();
+    let mut cursor = first.next;
+    while let Some(position) = cursor {
+        let page = trash_page(vault.path(), Some(&position), 5).unwrap();
+        seen.extend(page.entries.into_iter().map(|entry| entry.entry));
+        cursor = page.next;
+    }
+
+    let mut expected = names;
+    expected.sort();
+    expected.retain(|name| name != &restored);
+    let mut got = seen.clone();
+    got.sort();
+
+    assert_eq!(seen.len(), 19, "20 条里恢复掉 1 条，剩下的必须都翻到");
+    assert_eq!(got, expected, "恢复一条之后翻页必须不重不漏");
 }
 
 /* ───────────────────── 崩溃（kill -9） ───────────────────── */

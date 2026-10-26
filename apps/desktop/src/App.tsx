@@ -14,6 +14,7 @@ import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { flattenVault, type QuickItem } from './lib/quick-open'
 import { useTheme } from './lib/theme'
+import { TRASH_MAX_ROWS, TRASH_PAGE_SIZE } from './lib/trash'
 import {
   appPing,
   describeError,
@@ -36,6 +37,7 @@ import {
   type ScanResult,
   type SearchHit,
   type TrashEntry,
+  type TrashPage,
 } from './api'
 
 /**
@@ -101,6 +103,15 @@ interface DeleteTarget {
   path: string
   name: string
 }
+
+/**
+ * 回收站的空状态。
+ *
+ * 模块级常量而不是每次 `{ entries: [], total: 0, next: null }`：`applyVault(null)`
+ * 会把它写回 state，字面量每次都是新对象，会让下游的 `useCallback` 依赖
+ * 每次重建。同一个引用也让"没打开过库"和"库是空的"在 React 眼里是一回事。
+ */
+const EMPTY_TRASH: TrashPage = { entries: [], total: 0, next: null }
 
 /** 取 Vault 相对路径的父目录（POSIX 分隔符）。根目录返回空串。 */
 function parentDir(path: string): string {
@@ -174,19 +185,38 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen)
 
   /**
-   * 回收站列表。**唯一**的条数来源：侧栏徽标与面板读的是同一份。
+   * 回收站列表（**一页 + 总数 + 游标**）。条数的唯一来源：侧栏徽标读
+   * `total`，面板读 `entries` 与 `total`。
    *
-   * 每次扫描、每次删除/恢复/清空之后重读。不用单独的 `trash_count` 命令：
-   * 那会让"徽标上的数字"与"面板里的行"有两个数据源，而它们迟早会不一致。
+   * # 为什么不再是一个数组
+   *
+   * 分页之后「加载了多少」与「一共有多少」必然分叉。拿 `entries.length`
+   * 当总数，加载两页之后徽标会写着 400 而回收站里有 10000 条。
+   *
+   * `next` 由服务端给（多取一条算出来的**事实**），前端只负责原样传回，
+   * 绝不拿 `entries.length < total` 自己推——目录被跳过、条目被外部恢复，
+   * 都会让"这页不满"而其实还有下一页。
+   *
+   * 每次扫描、每次删除/清空之后重读**第一页**；恢复一条是唯一的例外：
+   * 它只在本地移除那一行（见 `restoreFromTrash`）。
    */
-  const [trash, setTrash] = useState<TrashEntry[]>([])
+  const [trash, setTrash] = useState<TrashPage>(EMPTY_TRASH)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashLoading, setTrashLoading] = useState(false)
+  /** 「加载更多」在飞。防重复请求：连点两下会拿到同一页，同一批 `entry` 追加两遍。 */
+  const [trashLoadingMore, setTrashLoadingMore] = useState(false)
   /** 正在恢复的条目（`entry`）；`null` 表示空闲。 */
   const [trashRestoring, setTrashRestoring] = useState<string | null>(null)
   const [trashPurging, setTrashPurging] = useState(false)
   /** 面板里的错误行：读不出来 / 恢复失败。 */
   const [trashError, setTrashError] = useState<string | null>(null)
+  /**
+   * 面板里的**成功**回执（刚恢复了一条）。
+   *
+   * 与 `trashError` 分开：恢复成功不是错误，用红色错误行说它会让用户以为
+   * 出了事。它也不再走顶栏的 `flash`——面板是模态的，那句话会被盖住。
+   */
+  const [trashNotice, setTrashNotice] = useState<string | null>(null)
   /** 清空的二次确认是否打开。 */
   const [purgeOpen, setPurgeOpen] = useState(false)
   /** 面板容器。清空确认关掉之后把焦点还回来，理由见 `TrashPanel` 的注释。 */
@@ -245,15 +275,19 @@ export default function App() {
   const { pref: themePref, cycle: cycleTheme } = useTheme()
 
   /**
-   * 重读回收站列表。
+   * 重读回收站的**第一页**。
    *
    * 失败只记进面板的错误行，**不弹全局横幅**：回收站读不出来时用户很可能
    * 正在编辑，为一条旁路信息打断他不值得。而面板打开时他一定会看见。
+   *
+   * 永远从 `cursor = null` 开始：这是"重新看一遍磁盘"的语义，不是"接着上次
+   * 翻"。分页状态在 `trash` 里，重取会把它整个换掉——恢复一条不走这里
+   * （见 `restoreFromTrash`），否则用户会被弹回第 1 页。
    */
   const refreshTrash = useCallback(async (root: string) => {
     setTrashLoading(true)
     try {
-      setTrash(await trashList(root))
+      setTrash(await trashList(root, null, TRASH_PAGE_SIZE))
       setTrashError(null)
     } catch (err) {
       setTrashError(describeError(err))
@@ -263,24 +297,72 @@ export default function App() {
   }, [])
 
   /**
+   * 加载下一页并追加。
+   *
+   * # 三条约束，少一条都会出错
+   *
+   * 1. **只认 `next`**：它为空就是没有下一页。拿 `entries.length < total`
+   *    自己推会错——目录被跳过、条目在两次调用之间被恢复，都会让"这页不满"
+   *    而其实还有下一页。
+   * 2. **防重复请求**：连点两下会拿到同一页并追加两遍（同一个 `entry`
+   *    出现两次，React 的 key 冲突，恢复按钮也会指错行）。
+   * 3. **1000 行封顶**：那不是分页大小，是**渲染上限**。10k 个 DOM 节点
+   *    塞进面板会让滚动掉帧；而翻到第 1000 条还没找到东西时，该做的是搜索
+   *    （B-29 的第 ② 步），不是继续翻。
+   */
+  const loadMoreTrash = useCallback(async () => {
+    if (!vault) return
+    const cursor = trash.next
+    if (cursor === null || trashLoadingMore) return
+    if (trash.entries.length >= TRASH_MAX_ROWS) return
+
+    setTrashLoadingMore(true)
+    try {
+      const page = await trashList(vault.root, cursor, TRASH_PAGE_SIZE)
+      setTrash((current) => {
+        // 到上限就只收下放得下的那几条，并把 `next` 清掉——按钮随即变成
+        // 「已显示前 1000 条」，不再发请求。
+        const room = Math.max(0, TRASH_MAX_ROWS - current.entries.length)
+        const appended = page.entries.slice(0, room)
+        return {
+          entries: [...current.entries, ...appended],
+          total: page.total,
+          next: appended.length === page.entries.length ? page.next : null,
+        }
+      })
+      setTrashError(null)
+    } catch (err) {
+      setTrashError(describeError(err))
+    } finally {
+      setTrashLoadingMore(false)
+    }
+  }, [vault, trash.next, trash.entries.length, trashLoadingMore])
+
+  /**
    * 安装一次扫描结果：树进 state，扁平候选表进 ref，回收站条数跟着重读。
    *
    * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
    * 会让面板拿着上一个库的路径去 `noteRead`——报错是 PATH_ESCAPE，
    * 而真正的原因在另一个文件里。收成一个函数就没有漏掉的机会。
    *
-   * 回收站也在这里刷新：删完 / 恢复完 / 清空完都会走一次扫描，而徽标上的
-   * 数字必须与那次磁盘变化同步——否则用户删了一篇，侧栏还写着「回收站 0」。
+   * 回收站也在这里刷新：删完 / 清空完都会走一次扫描，而徽标上的数字必须
+   * 与那次磁盘变化同步——否则用户删了一篇，侧栏还写着「回收站 0」。
+   *
+   * # `keepTrash`：恢复一条时唯一要跳过的那一步
+   *
+   * 恢复也要重扫（树里要出现那篇笔记），但**不能**重取回收站：整页重取会
+   * 把正在看第 5 页的用户弹回第 1 页，而 keyset 存在的全部理由就是不让这件
+   * 事发生。那一行由调用方本地移除，`total` 跟着减 1。
    */
   const applyVault = useCallback(
-    (result: ScanResult | null) => {
+    (result: ScanResult | null, options?: { keepTrash?: boolean }) => {
       setVault(result)
       quickItems.current = result === null ? [] : flattenVault(result.tree)
       if (result === null) {
-        setTrash([])
+        setTrash(EMPTY_TRASH)
         return
       }
-      void refreshTrash(result.root)
+      if (options?.keepTrash !== true) void refreshTrash(result.root)
     },
     [refreshTrash],
   )
@@ -721,6 +803,7 @@ export default function App() {
   const openTrash = useCallback(() => {
     if (!vault) return
     setTrashError(null)
+    setTrashNotice(null)
     setTrashOpen(true)
     void refreshTrash(vault.root)
   }, [vault, refreshTrash])
@@ -735,15 +818,22 @@ export default function App() {
   /**
    * 从回收站恢复一条。
    *
-   * # 顺序与新建完全一致
+   * # 顺序与新建一致，但**不重取回收站**
    *
-   * 恢复 → **整库重扫** → 打开。重扫必须在打开之前：树要先有这一项，
+   * 恢复 → 整库重扫 → 打开。重扫必须在打开之前：树要先有这一项，
    * `openNote` 之后的高亮才有落点，否则用户会看到"正文换了、侧栏还是旧的"。
    *
-   * # 先收面板再打开
+   * 但扫描结果里**跳过**了回收站刷新（`keepTrash`）：整页重取会把正在看
+   * 第 5 页的用户弹回第 1 页。改成本地移除那一行 + `total - 1`——
+   * keyset 游标让已加载的前缀不会移位，所以「加载更多」之后仍然接着
+   * 下一页，不重不漏。这是 keyset 与 offset 的分水岭。
    *
-   * 面板是 fixed 全屏遮罩。留着它盖在刚恢复的正文上，用户会以为
-   * "恢复了但没打开"——而正文其实已经在了。
+   * # 面板**不关**
+   *
+   * 从回收站里挑东西的人多半还要接着挑下一条。每恢复一条就把面板关掉，
+   * 等于让他重新打开、重新翻回原来那一页。正文在面板后面打开，关掉面板
+   * （Esc）就能看到它——恢复成功的那句话写在面板的 `notice` 行里，
+   * 因为顶栏的 flash 会被面板盖住。
    *
    * # 为什么整条 `TrashEntry` 都传下去
    *
@@ -751,28 +841,32 @@ export default function App() {
    * 返回值里只有事实（`path` / `requested`），没有展示数据——扩契约去塞一个
    * `origin` 等于让 Rust 再算一遍前端手里已经有的东西。
    *
-   * 传的必须是**恢复前**那一份：`applyVault` 会触发列表重读，但那是异步的，
-   * 而且恢复之后这条已经不在列表里了。
+   * 传的必须是**恢复前**那一份：本地移除之后它就不在 `trash.entries` 里了。
    */
   const restoreFromTrash = useCallback(
     async (entry: TrashEntry) => {
       if (!vault) return
       setTrashRestoring(entry.entry)
       setTrashError(null)
+      setTrashNotice(null)
       try {
         const result = await trashRestore(vault.root, entry.entry)
-        applyVault(await vaultScan(vault.root))
+        applyVault(await vaultScan(vault.root), { keepTrash: true })
+        setTrash((current) => ({
+          entries: current.entries.filter((item) => item.entry !== entry.entry),
+          total: Math.max(0, current.total - 1),
+          next: current.next,
+        }))
         setRevealPath(result.path)
-        setTrashOpen(false)
+        setTrashNotice(describeRestore(result, entry))
         await openNote(result.path)
-        showFlash(describeRestore(result, entry))
       } catch (err) {
         setTrashError(describeError(err))
       } finally {
         setTrashRestoring(null)
       }
     },
-    [vault, applyVault, openNote, showFlash],
+    [vault, applyVault, openNote],
   )
 
   /**
@@ -794,7 +888,10 @@ export default function App() {
     setTrashPurging(true)
     try {
       const result = await trashPurge(vault.root)
+      // 清空之后**重置到第一页**：磁盘上已经空了，留着旧游标只会让「加载更多」
+      // 去翻一批不存在的条目。这也是唯一一处该丢掉分页状态的地方。
       await refreshTrash(vault.root)
+      setTrashNotice(null)
       if (result.failed > 0) {
         setTrashError(
           `已永久删除 ${result.removed} 篇，${result.failed} 篇删不掉（可能被占用），已留在列表里`,
@@ -1211,8 +1308,8 @@ export default function App() {
                   title="查看、恢复或清空已删除的笔记"
                 >
                   <span>回收站</span>
-                  {trash.length > 0 && (
-                    <span className="trash-link__count">{trash.length}</span>
+                  {trash.total > 0 && (
+                    <span className="trash-link__count">{trash.total}</span>
                   )}
                 </button>
               </div>
@@ -1409,12 +1506,17 @@ export default function App() {
       {trashOpen && (
         <TrashPanel
           panelRef={trashPanelRef}
-          entries={trash}
+          entries={trash.entries}
+          total={trash.total}
+          hasMore={trash.next !== null}
           loading={trashLoading}
+          loadingMore={trashLoadingMore}
           restoring={trashRestoring}
           purging={trashPurging}
           error={trashError}
+          notice={trashNotice}
           onRestore={(entry) => void restoreFromTrash(entry)}
+          onLoadMore={() => void loadMoreTrash()}
           onPurge={() => setPurgeOpen(true)}
           onClose={closeTrash}
         />
@@ -1432,7 +1534,7 @@ export default function App() {
           onClose={closePurge}
         >
           <p>
-            回收站里的 <span className="confirm__name">{trash.length}</span> 篇笔记会被
+            回收站里的 <span className="confirm__name">{trash.total}</span> 篇笔记会被
             <strong>永久删除</strong>，磁盘上不再有副本。
           </p>
           <p className="confirm__note">
