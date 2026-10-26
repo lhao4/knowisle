@@ -984,18 +984,43 @@ mod tests {
     }
 
     /// 路径闸：单个文件名通过，其余一律 `PathEscape`。
+    ///
+    /// # 反斜杠为什么按平台分支
+    ///
+    /// 这条闸问的是「这个名字会不会指向别处」。`\` **只在 Windows 上是分隔符**：
+    /// 那里 `trash.join("a\\b.md")` 会落到子目录 `trash/a/b.md`，必须拒；
+    /// Unix 上它是一个普通字符，`a\b.md` 就是回收目录里一个合法文件名，
+    /// **放行才对**——拒了它，那个条目在列表里永远看不见，而用户没法解释。
+    ///
+    /// 上一刀这里写成了一条跨平台的 bad 列表：Windows 全绿、Linux/macOS 红。
+    /// 又一次验证 TOOLING 那条「三平台只信 CI，Unix 专有行为本地暴露不出来」。
     #[test]
     fn check_entry_accepts_one_component_only() {
         assert!(check_entry("1700000000000-a.md").is_ok());
         assert!(check_entry("周会.md").is_ok());
 
-        for bad in ["", ".", "..", "../a.md", "a/b.md", "a\\b.md", "/etc/passwd"] {
+        let rejects = |bad: &str| {
             let err = check_entry(bad).expect_err(bad);
             assert!(
                 matches!(err, KiError::PathEscape { .. }),
                 "{bad} 应当是 PathEscape，实际 {err:?}"
             );
+        };
+
+        for bad in ["", ".", "..", "../a.md", "a/b.md", "/etc/passwd"] {
+            rejects(bad);
         }
+
+        // Windows 上 `\` 是分隔符：这个名字会指向 `trash/a/b.md`，必须拒。
+        #[cfg(windows)]
+        rejects("a\\b.md");
+
+        // Unix 上它是普通字符：一个合法条目名，必须放行。
+        #[cfg(unix)]
+        assert!(
+            check_entry("a\\b.md").is_ok(),
+            "Unix 上反斜杠不是分隔符，`a\\b.md` 是回收目录里的合法文件名"
+        );
     }
 
     /// 降级判据：**只有「父目录不存在」才降级**，其余错误一律冒泡。
