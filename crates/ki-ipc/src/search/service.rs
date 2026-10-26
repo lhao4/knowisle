@@ -38,8 +38,8 @@ use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
 };
 use ki_vault::{
-    flatten_files, fold_ascii, name_lower_for_path, read_note, scan_vault, FileRef, NoteLocator,
-    ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+    flatten_files, fold_ascii, name_lower_for_path, read_note, read_note_in, scan_vault, FileRef,
+    NoteLocator, ResolvedVault, ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
 };
 
 use super::cache::{canonical_root, ensure_root, lock};
@@ -124,6 +124,14 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
     let started = Instant::now();
     let mut stats = SyncStats::default();
 
+    // 库根只规范化一次，父目录链按**去重后的父目录集合**各查一次。
+    //
+    // 句柄只活在这一个函数里，这是刻意的：它内部的父目录缓存看不见
+    // 「父目录在这期间变成了软链」。让它跨过 `sync` 的边界，就会把一个
+    // 批处理内的可接受窗口变成进程级的不可见状态——那正是 B-09 的坑。
+    // 详见 `ki_vault::ResolvedVault` 的「缓存只能是单批次的」。
+    let vault = ResolvedVault::open(root)?;
+
     let mut files = flatten_files(&scan.tree);
     // 扫描器的顺序是「目录优先 + 名字不区分大小写」；同步只要一个确定性顺序，
     // 这样两批之间的分界在同样的输入下总是一样的（便于复现问题）。
@@ -158,7 +166,7 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
 
     for chunk in jobs.chunks(BATCH_SIZE) {
         // 阶段一：读盘与分词（事务外）。这里是最慢的一段，不能占着写锁。
-        let prepared = prepare(chunk, root, &known, &mut stats)?;
+        let prepared = prepare(chunk, &vault, &known, &mut stats)?;
 
         // 阶段二：写库（一个事务）。任何一条失败都整批回滚。
         db.batch(|batch| {
@@ -194,9 +202,12 @@ fn sync(db: &mut IndexDb, root: &Path, scan: &ScanResult, now: i64) -> Result<Sy
 ///
 /// 单篇失败**不连坐**：非 UTF-8、超大、IO 失败的条目只记成 `skipped` 并计数。
 /// 一条坏文件让整次同步报错，等于用户放了一个 GBK 文件就再也建不了索引。
+///
+/// 收的是**句柄**而不是 `root`：路径闸的开销按「库根一次 + 每个父目录一次」
+/// 摊，而不是按「每篇两次 canonicalize」。这是 B-27 第 ① 步的全部内容。
 fn prepare(
     chunk: &[Job],
-    root: &Path,
+    vault: &ResolvedVault,
     known: &HashMap<&str, &NoteState>,
     stats: &mut SyncStats,
 ) -> Result<Vec<Prepared>, KiError> {
@@ -220,7 +231,7 @@ fn prepare(
             continue;
         }
 
-        match read_note(root, &file.path) {
+        match read_note_in(vault, &file.path) {
             Ok(note) => {
                 // 用 `read_note` 返回的 size/mtime，而不是扫描时的值：
                 // 扫描与读取之间文件可能变了，存**实际索引的那一版**，

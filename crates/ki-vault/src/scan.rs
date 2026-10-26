@@ -10,6 +10,7 @@
 //! - **非 UTF-8 文件名跳过**：绝不 `unwrap()`，也绝不塞替换字符。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -17,7 +18,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use ki_core::{FileNode, KiError, NoteContent, ScanResult};
 
-use crate::path::{resolve_in_vault, to_posix};
+use crate::path::{to_posix, ResolvedVault};
 
 /// 目录级忽略名单：命中即**不再下降**。
 ///
@@ -260,10 +261,47 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
 
 /// 读取单篇笔记。
 ///
-/// 路径必须经由 `resolve_in_vault`，因此天然拒绝目录穿越。
+/// 路径必须经由 [`ResolvedVault`]，因此天然拒绝目录穿越。单篇调用用它就够了；
+/// **批量读取请用 [`read_note_in`]**——本函数每次都会重新规范化库根、
+/// 重新逐级查重解析点，一万篇就是两万次 `canonicalize`。
 pub fn read_note(root: &Path, rel: &str) -> Result<NoteContent, KiError> {
-    let absolute = resolve_in_vault(root, rel)?;
-    let meta = std::fs::metadata(&absolute).map_err(|e| KiError::io(rel, &e))?;
+    read_note_in(&ResolvedVault::open(root)?, rel)
+}
+
+/// 用已经打开好的库句柄读一篇。**建索引的热路径走这条。**
+///
+/// 与 [`read_note`] 的语义逐字相同，差别只在路径闸的开销：
+/// 库根只规范化一次、父目录链按去重后的目录集合各查一次（见 [`ResolvedVault`]）。
+///
+/// 句柄的生命周期决定了缓存的新鲜度。调用方必须让它随「一次批处理」结束，
+/// 不许存进任何活得更久的结构——理由写在 [`ResolvedVault`] 的「缓存只能是
+/// 单批次的」一节。
+pub fn read_note_in(vault: &ResolvedVault, rel: &str) -> Result<NoteContent, KiError> {
+    let absolute = vault.resolve(rel)?;
+
+    // 一次 `open` 拿到 handle，之后所有元数据都从 handle 取（`fstat`）。
+    //
+    // 为什么不是 `fs::metadata` + `fs::read`：那是**两次** `CreateFileW`
+    // （`fs::read` 内部自己 open 一次）。本机实测 path stat 147µs、open 619µs，
+    // 多这一次 stat 就是每篇多 14% 的固定成本，10k 篇白花 1.5 秒。
+    // 而 `fstat`（`file.metadata()`）实测只加 6µs——它不碰路径。
+    let mut file = match std::fs::File::open(&absolute) {
+        Ok(file) => file,
+        // Windows 上 `CreateFileW` 不带 `FILE_FLAG_BACKUP_SEMANTICS` 打不开目录，
+        // 于是「目标是目录」会以权限错误的形式冒出来。补一次判定把它归回
+        // `NotAFile`——这条只在失败路径上，不进热路径。
+        // （Linux 上打开目录是成功的，由下面的 `is_file()` 拦。）
+        Err(err) => {
+            return Err(match std::fs::metadata(&absolute) {
+                Ok(meta) if meta.is_dir() => KiError::NotAFile {
+                    path: rel.to_owned(),
+                },
+                _ => KiError::io(rel, &err),
+            })
+        }
+    };
+
+    let meta = file.metadata().map_err(|e| KiError::io(rel, &e))?;
 
     if !meta.is_file() {
         return Err(KiError::NotAFile {
@@ -277,7 +315,10 @@ pub fn read_note(root: &Path, rel: &str) -> Result<NoteContent, KiError> {
         });
     }
 
-    let bytes = std::fs::read(&absolute).map_err(|e| KiError::io(rel, &e))?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| KiError::io(rel, &e))?;
+
     let content = String::from_utf8(bytes).map_err(|_| KiError::InvalidEncoding {
         path: rel.to_owned(),
     })?;
