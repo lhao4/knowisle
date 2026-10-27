@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from './components/ConfirmDialog'
-import { ContextMenu, type ContextMenuItem } from './components/ContextMenu'
+import { ContextMenu } from './components/ContextMenu'
 import { TreeNode } from './components/FileTree'
 import { NamePrompt } from './components/NamePrompt'
 import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
@@ -10,6 +10,8 @@ import { QuickOpen } from './components/QuickOpen'
 import { SearchOverlay } from './components/SearchOverlay'
 import { ThemeToggle } from './components/ThemeToggle'
 import { TrashPanel } from './components/TrashPanel'
+import { useSidebar } from './hooks/useSidebar'
+import { parentDir } from './hooks/path'
 import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { flattenVault, type QuickItem } from './lib/quick-open'
@@ -60,51 +62,6 @@ const SAVED_FLASH_MS = 1200
 const LAST_VAULT_KEY = 'knowisle.lastVault'
 
 /**
- * 侧栏开合。`'1'` 展开 / `'0'` 折叠，缺省是展开。
- *
- * # 为什么不需要 `index.html` 的内联脚本
- *
- * 主题必须在样式生效前落到 `<html>` 上，所以它有一份"pre-React 的"内联副本。
- * 侧栏不一样：它是 React 画出来的，`.app` 与 `.sidebar` 在**同一次提交**里
- * 出现。在 `useState` 的初始化器里同步读，读到的就是首帧的值——不存在
- * 「先按 300px 画一帧、再变 0」的中间态。
- */
-const SIDEBAR_KEY = 'knowisle.sidebar'
-
-/** 读侧栏开合。隐私模式下 `localStorage` 的 getter 会抛，回落到展开。 */
-function readSidebarOpen(): boolean {
-  try {
-    return localStorage.getItem(SIDEBAR_KEY) !== '0'
-  } catch {
-    return true
-  }
-}
-
-/**
- * 正在输入名字的浮层。
- *
- * 两种意图共用一个组件，但**位置来源不同**：
- * - `create` 只需要目录（当前笔记所在目录，没有选中就是根目录）；
- * - `rename` 需要旧路径（新名字只在同一个目录内生效）。
- */
-type PromptState =
-  | { kind: 'create'; dir: string }
-  | { kind: 'rename'; path: string; name: string }
-
-/** 右键菜单：位置 + 它属于哪个节点（节点只用来生成菜单项，用完即弃）。 */
-interface MenuState {
-  node: FileNode
-  x: number
-  y: number
-}
-
-/** 等待二次确认的删除目标。 */
-interface DeleteTarget {
-  path: string
-  name: string
-}
-
-/**
  * 回收站的空状态。
  *
  * 模块级常量而不是每次 `{ entries: [], total: 0, next: null }`：`applyVault(null)`
@@ -113,12 +70,13 @@ interface DeleteTarget {
  */
 const EMPTY_TRASH: TrashPage = { entries: [], total: 0, next: null }
 
-/** 取 Vault 相对路径的父目录（POSIX 分隔符）。根目录返回空串。 */
-function parentDir(path: string): string {
-  const index = path.lastIndexOf('/')
-  return index < 0 ? '' : path.slice(0, index)
-}
-
+/**
+ * 应用根组件。
+ *
+ * 侧栏 / 搜索 / 回收站三个域的状态与副作用逐步抽进 `hooks/`，这里只留
+ * **跨域**的那几条：读写都在一个域里的进那个 hook，写入方横跨两个以上域的
+ * 留在这里，hook 通过参数拿、通过回调还。
+ */
 export default function App() {
   const [vault, setVault] = useState<ScanResult | null>(null)
   const [activeNote, setActiveNote] = useState<NoteContent | null>(null)
@@ -149,14 +107,8 @@ export default function App() {
    * `setState` 要等下一次渲染才看得见，挡不住紧随其后的第二次挂载。
    */
   const autoPickRef = useRef(false)
-  /** 正在输入名字的浮层。`null` 表示没有。 */
-  const [prompt, setPrompt] = useState<PromptState | null>(null)
-  /** 右键菜单。 */
-  const [menu, setMenu] = useState<MenuState | null>(null)
-  /** 等待二次确认的删除目标。`null` 表示没有确认框。 */
-  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
   /**
-   * 需要在树里露出来的路径（新建 / 改名之后）。
+   * 需要在树里露出来的路径（新建 / 改名 / 删除 / 恢复之后）。
    *
    * 只在**写入那一刻**设一次：`TreeNode` 按"值变化"展开目录，所以用户随后
    * 手动折叠不会被下一次无关重渲染弹开。
@@ -170,98 +122,6 @@ export default function App() {
    */
   const [outline, setOutline] = useState<OutlineItem[]>([])
   const outlineRef = useRef<OutlineHandle>(null)
-  /** 快速打开浮层是否可见。 */
-  const [paletteOpen, setPaletteOpen] = useState(false)
-  /** 全文搜索浮层是否可见。 */
-  const [searchOpen, setSearchOpen] = useState(false)
-  /**
-   * 侧栏是否展开。初值由初始化器同步读盘，理由见 `SIDEBAR_KEY`。
-   *
-   * **折叠是 CSS 隐藏，不是条件渲染**（`.app--sidebar-collapsed`）。
-   * `{sidebarOpen && <aside>}` 会在折叠一次之后把整棵子树卸载，而
-   * `TreeNode` 的展开状态是组件内 `useState`——用户手动展开过的目录会
-   * 全部回到初值，再展开时看起来像"我的树被重置了"。
-   */
-  const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen)
-
-  /**
-   * 回收站列表（**一页 + 总数 + 游标**）。条数的唯一来源：侧栏徽标读
-   * `total`，面板读 `entries` 与 `total`。
-   *
-   * # 为什么不再是一个数组
-   *
-   * 分页之后「加载了多少」与「一共有多少」必然分叉。拿 `entries.length`
-   * 当总数，加载两页之后徽标会写着 400 而回收站里有 10000 条。
-   *
-   * `next` 由服务端给（多取一条算出来的**事实**），前端只负责原样传回，
-   * 绝不拿 `entries.length < total` 自己推——目录被跳过、条目被外部恢复，
-   * 都会让"这页不满"而其实还有下一页。
-   *
-   * 每次扫描、每次删除/清空之后重读**第一页**；恢复一条是唯一的例外：
-   * 它只在本地移除那一行（见 `restoreFromTrash`）。
-   */
-  const [trash, setTrash] = useState<TrashPage>(EMPTY_TRASH)
-  const [trashOpen, setTrashOpen] = useState(false)
-  const [trashLoading, setTrashLoading] = useState(false)
-  /** 「加载更多」在飞。防重复请求：连点两下会拿到同一页，同一批 `entry` 追加两遍。 */
-  const [trashLoadingMore, setTrashLoadingMore] = useState(false)
-  /** 正在恢复的条目（`entry`）；`null` 表示空闲。 */
-  const [trashRestoring, setTrashRestoring] = useState<string | null>(null)
-  const [trashPurging, setTrashPurging] = useState(false)
-  /** 面板里的错误行：读不出来 / 恢复失败。 */
-  const [trashError, setTrashError] = useState<string | null>(null)
-  /**
-   * 面板里的**成功**回执（刚恢复了一条）。
-   *
-   * 与 `trashError` 分开：恢复成功不是错误，用红色错误行说它会让用户以为
-   * 出了事。它也不再走顶栏的 `flash`——面板是模态的，那句话会被盖住。
-   */
-  const [trashNotice, setTrashNotice] = useState<string | null>(null)
-  /** 清空的二次确认是否打开。 */
-  const [purgeOpen, setPurgeOpen] = useState(false)
-  /** 面板容器。清空确认关掉之后把焦点还回来，理由见 `TrashPanel` 的注释。 */
-  const trashPanelRef = useRef<HTMLDivElement>(null)
-
-  // 写回。`useEffect` 就够了：首帧敏感的是"读"，那件事在初始化器里做完了。
-  useEffect(() => {
-    try {
-      localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? '1' : '0')
-    } catch {
-      // 隐私模式 / 配额满：本次会话内照样生效，只是下次启动回到展开。
-    }
-  }, [sidebarOpen])
-
-  /**
-   * 折叠 / 展开侧栏。快捷键与顶栏按钮共用这一条路径。
-   *
-   * # 折叠前先把焦点救出来
-   *
-   * 焦点可能正在树里（用户点了一行再按 `Mod+\`）。`display:none` 会把聚焦
-   * 元素从文档里摘掉，焦点掉到 `<body>` 上——之后所有按键都没有落点，
-   * 用户会以为应用卡死了。只在焦点确实位于侧栏内时才动它：焦点本来就在
-   * 正文里的话，任何抢焦点的动作都是多余的。
-   */
-  const toggleSidebar = useCallback(() => {
-    if (sidebarOpen) {
-      const active = document.activeElement
-      if (active instanceof Element && active.closest('.sidebar') !== null) {
-        editorRef.current?.focus()
-      }
-    }
-    setSidebarOpen(!sidebarOpen)
-  }, [sidebarOpen])
-
-  /**
-   * 快速打开的全量候选，**只在扫描完成时重建一次**。
-   *
-   * 放 ref 而不是 state：它不参与渲染决策——面板打开时读一次就够了。
-   * 若放进 state，1000 个对象的数组会让每次 setState 都带上一次引用比较，
-   * 而它真正变化只在切 Vault 那一瞬间。
-   *
-   * 「每次开面板/每次按键都遍历树」是明确禁止的：那会把一次 O(n) 的
-   * 建表摊到每一次击键上，而结果每次都一样。
-   */
-  const quickItems = useRef<QuickItem[]>([])
 
   /**
    * 主题。
@@ -273,198 +133,6 @@ export default function App() {
    * 首帧的值由 `index.html` 的内联脚本设好，这里管的是之后的每一次变化。
    */
   const { pref: themePref, cycle: cycleTheme } = useTheme()
-
-  /**
-   * 重读回收站的**第一页**。
-   *
-   * 失败只记进面板的错误行，**不弹全局横幅**：回收站读不出来时用户很可能
-   * 正在编辑，为一条旁路信息打断他不值得。而面板打开时他一定会看见。
-   *
-   * 永远从 `cursor = null` 开始：这是"重新看一遍磁盘"的语义，不是"接着上次
-   * 翻"。分页状态在 `trash` 里，重取会把它整个换掉——恢复一条不走这里
-   * （见 `restoreFromTrash`），否则用户会被弹回第 1 页。
-   */
-  const refreshTrash = useCallback(async (root: string) => {
-    setTrashLoading(true)
-    try {
-      setTrash(await trashList(root, null, TRASH_PAGE_SIZE))
-      setTrashError(null)
-    } catch (err) {
-      setTrashError(describeError(err))
-    } finally {
-      setTrashLoading(false)
-    }
-  }, [])
-
-  /**
-   * 加载下一页并追加。
-   *
-   * # 三条约束，少一条都会出错
-   *
-   * 1. **只认 `next`**：它为空就是没有下一页。拿 `entries.length < total`
-   *    自己推会错——目录被跳过、条目在两次调用之间被恢复，都会让"这页不满"
-   *    而其实还有下一页。
-   * 2. **防重复请求**：连点两下会拿到同一页并追加两遍（同一个 `entry`
-   *    出现两次，React 的 key 冲突，恢复按钮也会指错行）。
-   * 3. **1000 行封顶**：那不是分页大小，是**渲染上限**。10k 个 DOM 节点
-   *    塞进面板会让滚动掉帧；而翻到第 1000 条还没找到东西时，该做的是搜索
-   *    （B-29 的第 ② 步），不是继续翻。
-   */
-  const loadMoreTrash = useCallback(async () => {
-    if (!vault) return
-    const cursor = trash.next
-    if (cursor === null || trashLoadingMore) return
-    if (trash.entries.length >= TRASH_MAX_ROWS) return
-
-    setTrashLoadingMore(true)
-    try {
-      const page = await trashList(vault.root, cursor, TRASH_PAGE_SIZE)
-      setTrash((current) => {
-        // 到上限就只收下放得下的那几条，并把 `next` 清掉——按钮随即变成
-        // 「已显示前 1000 条」，不再发请求。
-        const room = Math.max(0, TRASH_MAX_ROWS - current.entries.length)
-        const appended = page.entries.slice(0, room)
-        return {
-          entries: [...current.entries, ...appended],
-          total: page.total,
-          next: appended.length === page.entries.length ? page.next : null,
-        }
-      })
-      setTrashError(null)
-    } catch (err) {
-      setTrashError(describeError(err))
-    } finally {
-      setTrashLoadingMore(false)
-    }
-  }, [vault, trash.next, trash.entries.length, trashLoadingMore])
-
-  /**
-   * 安装一次扫描结果：树进 state，扁平候选表进 ref，回收站条数跟着重读。
-   *
-   * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
-   * 会让面板拿着上一个库的路径去 `noteRead`——报错是 PATH_ESCAPE，
-   * 而真正的原因在另一个文件里。收成一个函数就没有漏掉的机会。
-   *
-   * 回收站也在这里刷新：删完 / 清空完都会走一次扫描，而徽标上的数字必须
-   * 与那次磁盘变化同步——否则用户删了一篇，侧栏还写着「回收站 0」。
-   *
-   * # `keepTrash`：恢复一条时唯一要跳过的那一步
-   *
-   * 恢复也要重扫（树里要出现那篇笔记），但**不能**重取回收站：整页重取会
-   * 把正在看第 5 页的用户弹回第 1 页，而 keyset 存在的全部理由就是不让这件
-   * 事发生。那一行由调用方本地移除，`total` 跟着减 1。
-   */
-  const applyVault = useCallback(
-    (result: ScanResult | null, options?: { keepTrash?: boolean }) => {
-      setVault(result)
-      quickItems.current = result === null ? [] : flattenVault(result.tree)
-      if (result === null) {
-        setTrash(EMPTY_TRASH)
-        return
-      }
-      if (options?.keepTrash !== true) void refreshTrash(result.root)
-    },
-    [refreshTrash],
-  )
-
-  const showFlash = useCallback((text: string) => {
-    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
-    setFlash(text)
-    flashTimer.current = window.setTimeout(() => {
-      flashTimer.current = null
-      setFlash(null)
-    }, SAVED_FLASH_MS)
-  }, [])
-
-  // 组件卸载时把定时器收掉，否则它会对着已卸载的组件 setState。
-  useEffect(
-    () => () => {
-      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
-    },
-    [],
-  )
-
-  // 启动时 ping 一次：确认 Rust 侧真的起来了。
-  // 如果这一句失败，后面所有按钮都会失败，报错信息会误导排查方向。
-  useEffect(() => {
-    appPing()
-      .then((info) => setRuntime(`v${info.version} · pid ${info.pid}`))
-      .catch((err) => setRuntime(`IPC 未就绪：${describeError(err)}`))
-  }, [])
-
-  const pickVault = useCallback(async () => {
-    setError(null)
-    try {
-      const selected = await pickFolder('选择知识库文件夹')
-      /*
-       * 对话框**出现过**就算问过一次——取消、选错、随后扫描失败都写。
-       * 判据是「用户见过这个对话框」，不是「他选了目录」：不写的话，
-       * 取消一次的人每次启动都会被再弹一次，比不弹更烦。
-       *
-       * 位置必须在 `await pickFolder` **之后**：它抛错时对话框根本没出现，
-       * 那一次不该消耗掉「被问过」的资格，下次启动该重试。
-       */
-      localStorage.setItem(ONBOARDED_KEY, '1')
-      // 用户点了取消：返回 null，不是错误
-      if (selected === null) return
-
-      setBusy(true)
-      const result = await vaultScan(selected)
-      applyVault(result)
-      setActiveNote(null)
-      setSaveState(null)
-      setOutline([])
-      // 换库：上一轮的"露出来"和浮层都不再指向任何东西。
-      setRevealPath(null)
-      setPrompt(null)
-      setMenu(null)
-      localStorage.setItem(LAST_VAULT_KEY, result.root)
-    } catch (err) {
-      applyVault(null)
-      setActiveNote(null)
-      setOutline([])
-      setError(describeError(err))
-    } finally {
-      setBusy(false)
-    }
-  }, [applyVault])
-
-  /**
-   * 恢复上次打开的 Vault；没有记录就**自己把选择器弹出来**。
-   *
-   * 失败就静默清掉记录——目录可能被删了、改名了、或者挪到了没权限的地方，
-   * 这些都不该在启动时糊用户一脸错误。
-   *
-   * # 为什么这个 effect 写在 `pickVault` 下面
-   *
-   * 它要调 `pickVault`，而依赖数组是在**渲染期**求值的：写在 `pickVault`
-   * 定义之前，读到的就是 `const` 的 TDZ，直接抛 `ReferenceError`。
-   * 换成一个 ref 转手也能跑，但那等于为了排版顺序引入一个只在启动时
-   * 用一次的间接层。
-   *
-   * # 只有「没有记录」这一支会弹窗
-   *
-   * `last !== null` 那支保持原样（扫描、失败删记录）。用 `lastVault === null`
-   * 当「首次启动」是错的：扫描失败也会删记录，那批用户会每次启动都被弹。
-   * 判据见 `shouldAutoPick`——它还要看独立的 `onboarded`。
-   */
-  useEffect(() => {
-    const last = localStorage.getItem(LAST_VAULT_KEY)
-    if (last !== null) {
-      vaultScan(last)
-        .then(applyVault)
-        .catch(() => localStorage.removeItem(LAST_VAULT_KEY))
-      return
-    }
-    if (!shouldAutoPick({ lastVault: last, onboarded: localStorage.getItem(ONBOARDED_KEY) })) {
-      return
-    }
-    // StrictMode 下这个 effect 会挂载两次；闸门必须在 `pickVault()` **之前**
-    // 同步置位，否则第二次挂载会再弹一个对话框。
-    if (autoPickRef.current) return
-    autoPickRef.current = true
-    void pickVault()
-  }, [applyVault, pickVault])
 
   /**
    * 在途的冲刷。
@@ -574,14 +242,6 @@ export default function App() {
     [vault, activeNote, flushActiveNote],
   )
 
-  /** 树节点点击。`FileNode` 到路径的转换只在这里发生。 */
-  const selectNote = useCallback(
-    (node: FileNode) => {
-      void openNote(node.path)
-    },
-    [openNote],
-  )
-
   /**
    * 把焦点还给编辑器。
    *
@@ -638,11 +298,374 @@ export default function App() {
     window.requestAnimationFrame(tick)
   }, [])
 
-  /** 关闭名字浮层并把焦点还给编辑器。取消与成功共用这一条路径。 */
-  const closePrompt = useCallback(() => {
-    setPrompt(null)
-    focusEditor()
-  }, [focusEditor])
+  const hasVault = vault !== null
+
+  /**
+   * 回收站列表（**一页 + 总数 + 游标**）。条数的唯一来源：侧栏徽标读
+   * `total`，面板读 `entries` 与 `total`。
+   *
+   * # 为什么不再是一个数组
+   *
+   * 分页之后「加载了多少」与「一共有多少」必然分叉。拿 `entries.length`
+   * 当总数，加载两页之后徽标会写着 400 而回收站里有 10000 条。
+   *
+   * `next` 由服务端给（多取一条算出来的**事实**），前端只负责原样传回，
+   * 绝不拿 `entries.length < total` 自己推——目录被跳过、条目被外部恢复，
+   * 都会让"这页不满"而其实还有下一页。
+   *
+   * 每次扫描、每次删除/清空之后重读**第一页**；恢复一条是唯一的例外：
+   * 它只在本地移除那一行（见 `restoreFromTrash`）。
+   */
+  const [trash, setTrash] = useState<TrashPage>(EMPTY_TRASH)
+  const [trashOpen, setTrashOpen] = useState(false)
+  const [trashLoading, setTrashLoading] = useState(false)
+  /** 「加载更多」在飞。防重复请求：连点两下会拿到同一页，同一批 `entry` 追加两遍。 */
+  const [trashLoadingMore, setTrashLoadingMore] = useState(false)
+  /** 正在恢复的条目（`entry`）；`null` 表示空闲。 */
+  const [trashRestoring, setTrashRestoring] = useState<string | null>(null)
+  const [trashPurging, setTrashPurging] = useState(false)
+  /** 面板里的错误行：读不出来 / 恢复失败。 */
+  const [trashError, setTrashError] = useState<string | null>(null)
+  /**
+   * 面板里的**成功**回执（刚恢复了一条）。
+   *
+   * 与 `trashError` 分开：恢复成功不是错误，用红色错误行说它会让用户以为
+   * 出了事。它也不再走顶栏的 `flash`——面板是模态的，那句话会被盖住。
+   */
+  const [trashNotice, setTrashNotice] = useState<string | null>(null)
+  /** 清空的二次确认是否打开。 */
+  const [purgeOpen, setPurgeOpen] = useState(false)
+  /** 面板容器。清空确认关掉之后把焦点还回来，理由见 `TrashPanel` 的注释。 */
+  const trashPanelRef = useRef<HTMLDivElement>(null)
+
+  /**
+   * 重读回收站的**第一页**。
+   *
+   * 失败只记进面板的错误行，**不弹全局横幅**：回收站读不出来时用户很可能
+   * 正在编辑，为一条旁路信息打断他不值得。而面板打开时他一定会看见。
+   *
+   * 永远从 `cursor = null` 开始：这是"重新看一遍磁盘"的语义，不是"接着上次
+   * 翻"。分页状态在 `trash` 里，重取会把它整个换掉——恢复一条不走这里
+   * （见 `restoreFromTrash`），否则用户会被弹回第 1 页。
+   */
+  const refreshTrash = useCallback(async (root: string) => {
+    setTrashLoading(true)
+    try {
+      setTrash(await trashList(root, null, TRASH_PAGE_SIZE))
+      setTrashError(null)
+    } catch (err) {
+      setTrashError(describeError(err))
+    } finally {
+      setTrashLoading(false)
+    }
+  }, [])
+
+  /**
+   * 加载下一页并追加。
+   *
+   * # 三条约束，少一条都会出错
+   *
+   * 1. **只认 `next`**：它为空就是没有下一页。拿 `entries.length < total`
+   *    自己推会错——目录被跳过、条目在两次调用之间被恢复，都会让"这页不满"
+   *    而其实还有下一页。
+   * 2. **防重复请求**：连点两下会拿到同一页并追加两遍（同一个 `entry`
+   *    出现两次，React 的 key 冲突，恢复按钮也会指错行）。
+   * 3. **1000 行封顶**：那不是分页大小，是**渲染上限**。10k 个 DOM 节点
+   *    塞进面板会让滚动掉帧；而翻到第 1000 条还没找到东西时，该做的是搜索
+   *    （B-29 的第 ② 步），不是继续翻。
+   */
+  const loadMoreTrash = useCallback(async () => {
+    if (!vault) return
+    const cursor = trash.next
+    if (cursor === null || trashLoadingMore) return
+    if (trash.entries.length >= TRASH_MAX_ROWS) return
+
+    setTrashLoadingMore(true)
+    try {
+      const page = await trashList(vault.root, cursor, TRASH_PAGE_SIZE)
+      setTrash((current) => {
+        // 到上限就只收下放得下的那几条，并把 `next` 清掉——按钮随即变成
+        // 「已显示前 1000 条」，不再发请求。
+        const room = Math.max(0, TRASH_MAX_ROWS - current.entries.length)
+        const appended = page.entries.slice(0, room)
+        return {
+          entries: [...current.entries, ...appended],
+          total: page.total,
+          next: appended.length === page.entries.length ? page.next : null,
+        }
+      })
+      setTrashError(null)
+    } catch (err) {
+      setTrashError(describeError(err))
+    } finally {
+      setTrashLoadingMore(false)
+    }
+  }, [vault, trash.next, trash.entries.length, trashLoadingMore])
+
+  /**
+   * 打开回收站：**先开面板**，再读列表。
+   *
+   * 顺序是为了"点了就有反应"：读列表要过一次 IPC，先等它再开面板会有一段
+   * 什么都不发生的空白。面板自己会显示「读取中…」，那是诚实的中间态。
+   */
+  const openTrash = useCallback(() => {
+    if (!vault) return
+    setTrashError(null)
+    setTrashNotice(null)
+    setTrashOpen(true)
+    void refreshTrash(vault.root)
+  }, [vault, refreshTrash])
+
+  /** 关闭回收站并把焦点还给编辑器。取消与恢复成功共用这一条路径。 */
+  const closeTrash = useCallback(() => {
+    setTrashOpen(false)
+    setPurgeOpen(false)
+    editorRef.current?.focus()
+  }, [])
+
+  /**
+   * 清空回收站。**只由确认框触发**，没有任何"顺手清一下"的入口。
+   *
+   * # 部分失败也关确认框
+   *
+   * `trash_purge` 永远返回结果而不是错误：删不掉的留在回收目录里，列表刷新
+   * 后还看得见。所以这里返回 `null`（关框），把「删了 N 篇、M 篇删不掉」
+   * 写进面板的错误行——那行本来就是"整次操作的结果"，而确认框会把它盖住。
+   *
+   * 提示必须写在 `refreshTrash` **之后**：刷新成功会把错误行清空。
+   *
+   * 真正的 `Err` 只有一种（回收目录读不出来），那时一个都没动，
+   * 让确认框留在屏幕上给用户重试是对的。
+   */
+  const purgeTrash = useCallback(async (): Promise<string | null> => {
+    if (!vault) return '还没有打开知识库'
+    setTrashPurging(true)
+    try {
+      const result = await trashPurge(vault.root)
+      // 清空之后**重置到第一页**：磁盘上已经空了，留着旧游标只会让「加载更多」
+      // 去翻一批不存在的条目。这也是唯一一处该丢掉分页状态的地方。
+      await refreshTrash(vault.root)
+      setTrashNotice(null)
+      if (result.failed > 0) {
+        setTrashError(
+          `已永久删除 ${result.removed} 篇，${result.failed} 篇删不掉（可能被占用），已留在列表里`,
+        )
+      }
+      return null
+    } catch (err) {
+      return describeError(err)
+    } finally {
+      setTrashPurging(false)
+    }
+  }, [vault, refreshTrash])
+
+  /**
+   * 关掉清空确认，把焦点还给面板。
+   *
+   * `ConfirmDialog` 卸载后焦点会落到 `<body>`，而 Esc 监听挂在面板容器上——
+   * 那一刻用户按 Esc 关不掉回收站，看起来像卡住了。
+   */
+  const closePurge = useCallback(() => {
+    setPurgeOpen(false)
+    trashPanelRef.current?.focus()
+  }, [])
+
+  /** 快速打开浮层是否可见。 */
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  /** 全文搜索浮层是否可见。 */
+  const [searchOpen, setSearchOpen] = useState(false)
+  /**
+   * 快速打开的全量候选，**只在扫描完成时重建一次**。
+   *
+   * 放 ref 而不是 state：它不参与渲染决策——面板打开时读一次就够了。
+   * 若放进 state，1000 个对象的数组会让每次 setState 都带上一次引用比较，
+   * 而它真正变化只在切 Vault 那一瞬间。
+   *
+   * 「每次开面板/每次按键都遍历树」是明确禁止的：那会把一次 O(n) 的
+   * 建表摊到每一次击键上，而结果每次都一样。
+   */
+  const quickItems = useRef<QuickItem[]>([])
+
+  /**
+   * 快速打开里选中一项：先收浮层，再走同一条打开路径。
+   *
+   * 顺序不能反——`openNote` 是异步的，若先开笔记再收浮层，浮层会盖着
+   * 已经换好的正文停留到 IPC 往返结束，看起来像「点了没反应」。
+   */
+  const openFromPalette = useCallback(
+    (path: string) => {
+      setPaletteOpen(false)
+      void openNote(path)
+    },
+    [openNote],
+  )
+
+  /**
+   * 关闭浮层并把焦点还给编辑器。
+   *
+   * 光标位置不变是这里的全部重点：`focus()` 只是把 DOM 焦点交还，
+   * 不碰 `EditorState.selection`。详见 `NoteEditorHandle.focus`。
+   */
+  const closePalette = useCallback(() => {
+    setPaletteOpen(false)
+    editorRef.current?.focus()
+  }, [])
+
+  /**
+   * 搜索浮层里选中一条命中：先收浮层，再走同一条打开路径。
+   *
+   * # 为什么必须 `await`
+   *
+   * 跨文件时编辑器按 `note.path` 重建。`openNote` resolve 之前，`viewRef`
+   * 指向的是即将销毁的旧视图——在它上面 dispatch selection，用户看到的
+   * 是「跳过去了，但光标在开头」。`revealHit` 内部还会再兜一层（路径对不上
+   * 就等挂载），两道保险各自独立：这一道挡"根本没打开"，那一道挡"打开了但没挂载"。
+   */
+  const openFromSearch = useCallback(
+    async (hit: SearchHit) => {
+      setSearchOpen(false)
+      const opened = await openNote(hit.path)
+      if (opened) editorRef.current?.revealHit(hit)
+    },
+    [openNote],
+  )
+
+  /** 关闭搜索浮层并把焦点还给编辑器。光标位置不变——`focus()` 不碰 selection。 */
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false)
+    editorRef.current?.focus()
+  }, [])
+
+  /**
+   * 搜索前的落盘。失败不阻断搜索。
+   *
+   * 不阻断的理由：搜索读的是磁盘（唯一真相源）。冲突时磁盘上是对方那一版，
+   * 搜出来的也就是对方那一版——同时冲突横幅已经明示"你的改动还没保存"。
+   * 若在这里中断搜索，用户会以为搜索坏了，而真正的问题在保存冲突上。
+   */
+  const prepareSearch = useCallback(async () => {
+    await flushActiveNote()
+  }, [flushActiveNote])
+
+  /**
+   * `Cmd/Ctrl+P`。
+   *
+   * # 只注册一份
+   *
+   * `main.tsx` 开着 `StrictMode`：dev 下每个 effect 会「挂载 → 清理 → 再挂载」。
+   * 只要清理函数摘掉的是**同一个函数引用**，稳态下就只剩一份监听。
+   * 反过来，把监听写在渲染体里、或用 `onKeyDown` 之外的原生监听却忘了
+   * 返回清理函数，一次按键会进来两次——表现是「点一次 Enter 打开两次」，
+   * 第二次会把第一次的结果打断。
+   *
+   * 依赖只有 `hasVault`（布尔量）：它整个会话最多变一次，所以这个监听
+   * 不会因为切笔记、打字、保存状态轮询而反复注册。
+   *
+   * # 只开不关
+   *
+   * 浮层已经打开时再按一次 `Mod+P` 是**空操作**，不做 toggle。toggle 会
+   * 从这条路径关掉浮层，而这条路径拿不到「把焦点还给编辑器」的语义
+   * （`closePalette` 才有），于是焦点会落到 body 上——同一次关闭，走 Esc
+   * 和走 Mod+P 得到两种焦点状态。关闭只有一个入口：Esc。
+   */
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.repeat || e.altKey || e.shiftKey) return
+      if (!e.metaKey && !e.ctrlKey) return
+      if (e.key !== 'p' && e.key !== 'P') return
+      // WebView 里 `Ctrl+P` 是「打印」，不拦会弹出一个打印对话框。
+      e.preventDefault()
+      // 搜索浮层开着时不响应：两层浮层叠在一起，Esc 该关谁就没有答案了。
+      // 回收站同理——它是全屏遮罩，浮层开在它后面等于没开。
+      if (!hasVault || searchOpen || trashOpen) return
+      setPaletteOpen(true)
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [hasVault, searchOpen, trashOpen])
+
+  /**
+   * `Cmd/Ctrl+Shift+F` 全文搜索。
+   *
+   * 与 `Mod+P` 是两条独立监听，各自只认自己那个组合键。塞进同一个 handler
+   * 会让「按了 F 但没按 Shift」「按了 P 但按了 Shift」这些判断互相纠缠，
+   * 而它们本来就是互斥的两种意图。
+   *
+   * 只开不关：浮层已开时再按是空操作。关闭只有 Esc 一个入口——只有那条路径
+   * 带「把焦点还给编辑器」的语义（`closeSearch`）。
+   */
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.repeat || e.altKey) return
+      if (!e.metaKey && !e.ctrlKey) return
+      if (!e.shiftKey) return
+      if (e.key !== 'f' && e.key !== 'F') return
+      e.preventDefault()
+      // 快速打开开着时不响应，理由同上一条（反方向）。
+      if (!hasVault || paletteOpen || trashOpen) return
+      setSearchOpen(true)
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [hasVault, paletteOpen, trashOpen])
+
+  /**
+   * 安装一次扫描结果：树进 state，扁平候选表进搜索域，回收站条数跟着重读。
+   *
+   * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
+   * 会让面板拿着上一个库的路径去 `noteRead`——报错是 PATH_ESCAPE，
+   * 而真正的原因在另一个文件里。收成一个函数就没有漏掉的机会。
+   *
+   * 回收站也在这里刷新：删完 / 清空完都会走一次扫描，而徽标上的数字必须
+   * 与那次磁盘变化同步——否则用户删了一篇，侧栏还写着「回收站 0」。
+   *
+   * # `keepTrash`：恢复一条时唯一要跳过的那一步
+   *
+   * 恢复也要重扫（树里要出现那篇笔记），但**不能**重取回收站：整页重取会
+   * 把正在看第 5 页的用户弹回第 1 页，而 keyset 存在的全部理由就是不让这件
+   * 事发生。那一行由 `settleRestore` 本地移除，`total` 跟着减 1。
+   */
+  const applyVault = useCallback(
+    (result: ScanResult | null, options?: { keepTrash?: boolean }) => {
+      setVault(result)
+      quickItems.current = result === null ? [] : flattenVault(result.tree)
+      if (result === null) {
+        setTrash(EMPTY_TRASH)
+        return
+      }
+      if (options?.keepTrash !== true) void refreshTrash(result.root)
+    },
+    [refreshTrash],
+  )
+
+  /**
+   * 侧栏域。它要知道另外两个域的全屏浮层：`Mod+N` 叠层会让 Esc 没有答案。
+   */
+  const {
+    open: sidebarOpen,
+    toggle: toggleSidebar,
+    prompt,
+    menu,
+    deleteTarget,
+    createDir,
+    openCreate,
+    openMenu,
+    closeMenu,
+    closePrompt,
+    closeDelete,
+    menuItemsFor,
+    reset: resetSidebarOverlays,
+  } = useSidebar({
+    activeNote,
+    hasVault,
+    editorRef,
+    focusEditor,
+    paletteOpen,
+    searchOpen,
+    trashOpen,
+  })
 
   /**
    * 新建笔记。`dir` 是目标目录（Vault 相对路径，空串表示根目录）。
@@ -719,13 +742,6 @@ export default function App() {
     [vault, activeNote, flushActiveNote, applyVault],
   )
 
-  /** 右键菜单：坐标来自事件，节点只用来决定菜单项。 */
-  const openMenu = useCallback((node: FileNode, x: number, y: number) => {
-    setMenu({ node, x, y })
-  }, [])
-
-  const closeMenu = useCallback(() => setMenu(null), [])
-
   /**
    * 删除笔记：移进 `.knowisle/trash/`，然后整库重扫。
    *
@@ -784,38 +800,6 @@ export default function App() {
   )
 
   /**
-   * 关闭确认框并把焦点还给编辑器。
-   *
-   * 删除成功后编辑器已经卸载，`focus()` 是空操作（句柄里的 `viewRef` 为 null），
-   * 所以这条路径不需要分支——取消与成功共用它。
-   */
-  const closeDelete = useCallback(() => {
-    setDeleteTarget(null)
-    focusEditor()
-  }, [focusEditor])
-
-  /**
-   * 打开回收站：**先开面板**，再读列表。
-   *
-   * 顺序是为了"点了就有反应"：读列表要过一次 IPC，先等它再开面板会有一段
-   * 什么都不发生的空白。面板自己会显示「读取中…」，那是诚实的中间态。
-   */
-  const openTrash = useCallback(() => {
-    if (!vault) return
-    setTrashError(null)
-    setTrashNotice(null)
-    setTrashOpen(true)
-    void refreshTrash(vault.root)
-  }, [vault, refreshTrash])
-
-  /** 关闭回收站并把焦点还给编辑器。取消与恢复成功共用这一条路径。 */
-  const closeTrash = useCallback(() => {
-    setTrashOpen(false)
-    setPurgeOpen(false)
-    editorRef.current?.focus()
-  }, [])
-
-  /**
    * 从回收站恢复一条。
    *
    * # 顺序与新建一致，但**不重取回收站**
@@ -869,285 +853,111 @@ export default function App() {
     [vault, applyVault, openNote],
   )
 
-  /**
-   * 清空回收站。**只由确认框触发**，没有任何"顺手清一下"的入口。
-   *
-   * # 部分失败也关确认框
-   *
-   * `trash_purge` 永远返回结果而不是错误：删不掉的留在回收目录里，列表刷新
-   * 后还看得见。所以这里返回 `null`（关框），把「删了 N 篇、M 篇删不掉」
-   * 写进面板的错误行——那行本来就是"整次操作的结果"，而确认框会把它盖住。
-   *
-   * 提示必须写在 `refreshTrash` **之后**：刷新成功会把错误行清空。
-   *
-   * 真正的 `Err` 只有一种（回收目录读不出来），那时一个都没动，
-   * 让确认框留在屏幕上给用户重试是对的。
-   */
-  const purgeTrash = useCallback(async (): Promise<string | null> => {
-    if (!vault) return '还没有打开知识库'
-    setTrashPurging(true)
+  const showFlash = useCallback((text: string) => {
+    if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
+    setFlash(text)
+    flashTimer.current = window.setTimeout(() => {
+      flashTimer.current = null
+      setFlash(null)
+    }, SAVED_FLASH_MS)
+  }, [])
+
+  // 组件卸载时把定时器收掉，否则它会对着已卸载的组件 setState。
+  useEffect(
+    () => () => {
+      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current)
+    },
+    [],
+  )
+
+  // 启动时 ping 一次：确认 Rust 侧真的起来了。
+  // 如果这一句失败，后面所有按钮都会失败，报错信息会误导排查方向。
+  useEffect(() => {
+    appPing()
+      .then((info) => setRuntime(`v${info.version} · pid ${info.pid}`))
+      .catch((err) => setRuntime(`IPC 未就绪：${describeError(err)}`))
+  }, [])
+
+  const pickVault = useCallback(async () => {
+    setError(null)
     try {
-      const result = await trashPurge(vault.root)
-      // 清空之后**重置到第一页**：磁盘上已经空了，留着旧游标只会让「加载更多」
-      // 去翻一批不存在的条目。这也是唯一一处该丢掉分页状态的地方。
-      await refreshTrash(vault.root)
-      setTrashNotice(null)
-      if (result.failed > 0) {
-        setTrashError(
-          `已永久删除 ${result.removed} 篇，${result.failed} 篇删不掉（可能被占用），已留在列表里`,
-        )
-      }
-      return null
+      const selected = await pickFolder('选择知识库文件夹')
+      /*
+       * 对话框**出现过**就算问过一次——取消、选错、随后扫描失败都写。
+       * 判据是「用户见过这个对话框」，不是「他选了目录」：不写的话，
+       * 取消一次的人每次启动都会被再弹一次，比不弹更烦。
+       *
+       * 位置必须在 `await pickFolder` **之后**：它抛错时对话框根本没出现，
+       * 那一次不该消耗掉「被问过」的资格，下次启动该重试。
+       */
+      localStorage.setItem(ONBOARDED_KEY, '1')
+      // 用户点了取消：返回 null，不是错误
+      if (selected === null) return
+
+      setBusy(true)
+      const result = await vaultScan(selected)
+      applyVault(result)
+      setActiveNote(null)
+      setSaveState(null)
+      setOutline([])
+      // 换库：上一轮的"露出来"和浮层都不再指向任何东西。
+      setRevealPath(null)
+      resetSidebarOverlays()
+      localStorage.setItem(LAST_VAULT_KEY, result.root)
     } catch (err) {
-      return describeError(err)
+      applyVault(null)
+      setActiveNote(null)
+      setOutline([])
+      setError(describeError(err))
     } finally {
-      setTrashPurging(false)
+      setBusy(false)
     }
-  }, [vault, refreshTrash])
+  }, [applyVault, resetSidebarOverlays])
 
   /**
-   * 关掉清空确认，把焦点还给面板。
+   * 恢复上次打开的 Vault；没有记录就**自己把选择器弹出来**。
    *
-   * `ConfirmDialog` 卸载后焦点会落到 `<body>`，而 Esc 监听挂在面板容器上——
-   * 那一刻用户按 Esc 关不掉回收站，看起来像卡住了。
-   */
-  const closePurge = useCallback(() => {
-    setPurgeOpen(false)
-    trashPanelRef.current?.focus()
-  }, [])
-
-  /**
-   * 菜单项。目录只有「新建」，文件多「重命名」与「删除」。
+   * 失败就静默清掉记录——目录可能被删了、改名了、或者挪到了没权限的地方，
+   * 这些都不该在启动时糊用户一脸错误。
    *
-   * 目录不改名也不删除：那会把一整片笔记从树里搬走（扫描器按路径建树），
-   * 属于"移动"而不是"改名"，本轮明确不做。菜单里不出现，用户就不会去试。
+   * # 为什么这个 effect 写在 `pickVault` 下面
+   *
+   * 它要调 `pickVault`，而依赖数组是在**渲染期**求值的：写在 `pickVault`
+   * 定义之前，读到的就是 `const` 的 TDZ，直接抛 `ReferenceError`。
+   * 换成一个 ref 转手也能跑，但那等于为了排版顺序引入一个只在启动时
+   * 用一次的间接层。
+   *
+   * # 只有「没有记录」这一支会弹窗
+   *
+   * `last !== null` 那支保持原样（扫描、失败删记录）。用 `lastVault === null`
+   * 当「首次启动」是错的：扫描失败也会删记录，那批用户会每次启动都被弹。
+   * 判据见 `shouldAutoPick`——它还要看独立的 `onboarded`。
    */
-  const menuItemsFor = (node: FileNode): ContextMenuItem[] => {
-    const dir = node.kind === 'dir' ? node.path : parentDir(node.path)
-    const items: ContextMenuItem[] = [
-      { label: '新建笔记', onSelect: () => setPrompt({ kind: 'create', dir }) },
-    ]
-    if (node.kind === 'file') {
-      items.push({
-        label: '重命名',
-        onSelect: () => setPrompt({ kind: 'rename', path: node.path, name: node.name }),
-      })
-      items.push({
-        label: '删除',
-        onSelect: () => setDeleteTarget({ path: node.path, name: node.name }),
-      })
+  useEffect(() => {
+    const last = localStorage.getItem(LAST_VAULT_KEY)
+    if (last !== null) {
+      vaultScan(last)
+        .then(applyVault)
+        .catch(() => localStorage.removeItem(LAST_VAULT_KEY))
+      return
     }
-    return items
-  }
+    if (!shouldAutoPick({ lastVault: last, onboarded: localStorage.getItem(ONBOARDED_KEY) })) {
+      return
+    }
+    // StrictMode 下这个 effect 会挂载两次；闸门必须在 `pickVault()` **之前**
+    // 同步置位，否则第二次挂载会再弹一个对话框。
+    if (autoPickRef.current) return
+    autoPickRef.current = true
+    void pickVault()
+  }, [applyVault, pickVault])
 
-  /**
-   * 快速打开里选中一项：先收浮层，再走同一条打开路径。
-   *
-   * 顺序不能反——`openNote` 是异步的，若先开笔记再收浮层，浮层会盖着
-   * 已经换好的正文停留到 IPC 往返结束，看起来像「点了没反应」。
-   */
-  const openFromPalette = useCallback(
-    (path: string) => {
-      setPaletteOpen(false)
-      void openNote(path)
+  /** 树节点点击。`FileNode` 到路径的转换只在这里发生。 */
+  const selectNote = useCallback(
+    (node: FileNode) => {
+      void openNote(node.path)
     },
     [openNote],
   )
-
-  /**
-   * 关闭浮层并把焦点还给编辑器。
-   *
-   * 光标位置不变是这里的全部重点：`focus()` 只是把 DOM 焦点交还，
-   * 不碰 `EditorState.selection`。详见 `NoteEditorHandle.focus`。
-   */
-  const closePalette = useCallback(() => {
-    setPaletteOpen(false)
-    editorRef.current?.focus()
-  }, [])
-
-  /**
-   * 搜索浮层里选中一条命中：先收浮层，再走同一条打开路径。
-   *
-   * # 为什么必须 `await`
-   *
-   * 跨文件时编辑器按 `note.path` 重建。`openNote` resolve 之前，`viewRef`
-   * 指向的是即将销毁的旧视图——在它上面 dispatch selection，用户看到的
-   * 是「跳过去了，但光标在开头」。`revealHit` 内部还会再兜一层（路径对不上
-   * 就等挂载），两道保险各自独立：这一道挡"根本没打开"，那一道挡"打开了但没挂载"。
-   */
-  const openFromSearch = useCallback(
-    async (hit: SearchHit) => {
-      setSearchOpen(false)
-      const opened = await openNote(hit.path)
-      if (opened) editorRef.current?.revealHit(hit)
-    },
-    [openNote],
-  )
-
-  /** 关闭搜索浮层并把焦点还给编辑器。光标位置不变——`focus()` 不碰 selection。 */
-  const closeSearch = useCallback(() => {
-    setSearchOpen(false)
-    editorRef.current?.focus()
-  }, [])
-
-  /**
-   * 搜索前的落盘。失败不阻断搜索。
-   *
-   * 不阻断的理由：搜索读的是磁盘（唯一真相源）。冲突时磁盘上是对方那一版，
-   * 搜出来的也就是对方那一版——同时冲突横幅已经明示"你的改动还没保存"。
-   * 若在这里中断搜索，用户会以为搜索坏了，而真正的问题在保存冲突上。
-   */
-  const prepareSearch = useCallback(async () => {
-    await flushActiveNote()
-  }, [flushActiveNote])
-
-  /**
-   * 「新建」的目标目录：当前笔记所在目录，没有选中就是根目录。
-   *
-   * 侧栏的「＋ 新建」与 `Mod+N` 共用它。两处各算一遍的话，某天改了一处
-   * 就会出现"按钮建在日记里、快捷键建在根目录"这种谁也说不清的行为。
-   */
-  const createDir = activeNote === null ? '' : parentDir(activeNote.path)
-  /** 屏幕上是否有任意一层浮层 / 菜单。`Mod+N` 据此判断要不要装死。 */
-  const overlayOpen =
-    prompt !== null ||
-    paletteOpen ||
-    searchOpen ||
-    menu !== null ||
-    deleteTarget !== null ||
-    trashOpen
-
-  /**
-   * `Cmd/Ctrl+P`。
-   *
-   * # 只注册一份
-   *
-   * `main.tsx` 开着 `StrictMode`：dev 下每个 effect 会「挂载 → 清理 → 再挂载」。
-   * 只要清理函数摘掉的是**同一个函数引用**，稳态下就只剩一份监听。
-   * 反过来，把监听写在渲染体里、或用 `onKeyDown` 之外的原生监听却忘了
-   * 返回清理函数，一次按键会进来两次——表现是「点一次 Enter 打开两次」，
-   * 第二次会把第一次的结果打断。
-   *
-   * 依赖只有 `hasVault`（布尔量）：它整个会话最多变一次，所以这个监听
-   * 不会因为切笔记、打字、保存状态轮询而反复注册。
-   *
-   * # 只开不关
-   *
-   * 浮层已经打开时再按一次 `Mod+P` 是**空操作**，不做 toggle。toggle 会
-   * 从这条路径关掉浮层，而这条路径拿不到「把焦点还给编辑器」的语义
-   * （`closePalette` 才有），于是焦点会落到 body 上——同一次关闭，走 Esc
-   * 和走 Mod+P 得到两种焦点状态。关闭只有一个入口：Esc。
-   */
-  const hasVault = vault !== null
-  useEffect(() => {
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.repeat || e.altKey || e.shiftKey) return
-      if (!e.metaKey && !e.ctrlKey) return
-      if (e.key !== 'p' && e.key !== 'P') return
-      // WebView 里 `Ctrl+P` 是「打印」，不拦会弹出一个打印对话框。
-      e.preventDefault()
-      // 搜索浮层开着时不响应：两层浮层叠在一起，Esc 该关谁就没有答案了。
-      // 回收站同理——它是全屏遮罩，浮层开在它后面等于没开。
-      if (!hasVault || searchOpen || trashOpen) return
-      setPaletteOpen(true)
-    }
-
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [hasVault, searchOpen, trashOpen])
-
-  /**
-   * `Cmd/Ctrl+Shift+F` 全文搜索。
-   *
-   * 与 `Mod+P` 是两条独立监听，各自只认自己那个组合键。塞进同一个 handler
-   * 会让「按了 F 但没按 Shift」「按了 P 但按了 Shift」这些判断互相纠缠，
-   * 而它们本来就是互斥的两种意图。
-   *
-   * 只开不关：浮层已开时再按是空操作。关闭只有 Esc 一个入口——只有那条路径
-   * 带「把焦点还给编辑器」的语义（`closeSearch`）。
-   */
-  useEffect(() => {
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.repeat || e.altKey) return
-      if (!e.metaKey && !e.ctrlKey) return
-      if (!e.shiftKey) return
-      if (e.key !== 'f' && e.key !== 'F') return
-      e.preventDefault()
-      // 快速打开开着时不响应，理由同上一条（反方向）。
-      if (!hasVault || paletteOpen || trashOpen) return
-      setSearchOpen(true)
-    }
-
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [hasVault, paletteOpen, trashOpen])
-
-  /**
-   * `Cmd/Ctrl+N` 新建笔记。
-   *
-   * # 为什么是 window 级
-   *
-   * 「新建」与焦点无关：用户点着树、看着大纲、刚关掉一个浮层，都该能按。
-   * 加粗 / 斜体正相反——它们必须有文档选区，所以挂在 CM6 的 keymap 上
-   * （见 `NoteEditor`）。两种注册方式不能混：把 `Mod+B` 挂到 window 上，
-   * 名字输入框里按一下就会改到背后的文档。
-   *
-   * # 任一闪层打开时空操作
-   *
-   * 不是为了"优雅"：`Mod+N` 再开一层，屏幕上就有两个 `.prompt`，而 Esc
-   * 只关最上面那层——用户会以为卡住了。快捷键不叠层是硬约束。
-   *
-   * # 无库时也要 `preventDefault`
-   *
-   * WebView2 里 `Ctrl+N` 是"新建窗口"。不拦的话，用户在欢迎页按一下就会
-   * 多出一个空窗口，而这个应用没有任何多窗口设计。
-   */
-  useEffect(() => {
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.repeat || e.altKey || e.shiftKey) return
-      if (!e.metaKey && !e.ctrlKey) return
-      if (e.key !== 'n' && e.key !== 'N') return
-      e.preventDefault()
-      if (!hasVault || overlayOpen) return
-      setPrompt({ kind: 'create', dir: createDir })
-    }
-
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [hasVault, overlayOpen, createDir])
-
-  /**
-   * `Cmd/Ctrl+\` 折叠 / 展开侧栏（Notion 的键位）。
-   *
-   * # 为什么不判 `hasVault`
-   *
-   * 侧栏在没打开库时是一个 placeholder，收起来同样能让欢迎页占满整宽。
-   * 更重要的是：顶栏那个按钮**任何时候都在**，快捷键却只在有库时生效的话，
-   * 同一次开合会因为"有没有库"而有两种答案。同一条路径，同一个判据。
-   *
-   * # 为什么不判浮层
-   *
-   * 浮层是 fixed 定位、盖在最上面，侧栏在后面收起来既看不见也不打断输入。
-   * 唯一有代价的是 `Mod+N`——那会叠层，所以它单独判（见上一条）。
-   *
-   * # `e.key` 之外还要看 `e.code`
-   *
-   * 部分布局（以及某些输入法开启时的 WebView）给的 `key` 不是反斜杠。
-   * 物理键位是同一个，所以 `Backslash` 也认。带 Shift 的组合已经被上面的
-   * 早退挡住了，不会误伤 `|`。
-   */
-  useEffect(() => {
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.repeat || e.altKey || e.shiftKey) return
-      if (!e.metaKey && !e.ctrlKey) return
-      if (e.key !== '\\' && e.code !== 'Backslash') return
-      e.preventDefault()
-      toggleSidebar()
-    }
-
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [toggleSidebar])
 
   /** 大纲点击：把光标送到该标题行，并把这一行滚到视口顶部。 */
   const jumpTo = useCallback((pos: number) => {
@@ -1264,7 +1074,7 @@ export default function App() {
                 <button
                   type="button"
                   className="btn btn--small"
-                  onClick={() => setPrompt({ kind: 'create', dir: createDir })}
+                  onClick={() => openCreate()}
                   title={createDir === '' ? '在 Vault 根目录新建' : `在 ${createDir} 新建`}
                 >
                   ＋ 新建
@@ -1391,7 +1201,7 @@ export default function App() {
                     <button
                       type="button"
                       className="btn btn--primary"
-                      onClick={() => setPrompt({ kind: 'create', dir: createDir })}
+                      onClick={() => openCreate()}
                     >
                       写第一篇
                     </button>
@@ -1546,6 +1356,19 @@ export default function App() {
   )
 }
 
+/** 把保存状态翻成一句人话。空串表示还没开始编辑，不显示。 */
+function describeSaveState(state: SaveState | null): string {
+  if (state === null) return ''
+  if (state.lastError !== null) {
+    return state.lastError.code === 'CONFLICT' ? '冲突 · 未保存' : '保存失败'
+  }
+  if (state.dirty) return '保存中…'
+  if (state.lastSavedMtime !== null) {
+    return `已保存 ${new Date(state.lastSavedMtime).toLocaleTimeString('zh-CN')}`
+  }
+  return ''
+}
+
 /**
  * 恢复结果的一句话。
  *
@@ -1598,17 +1421,4 @@ function describeLanding(result: RestoreResult, entry: TrashEntry): string {
   }
   const _exhaustive: never = result.fallback
   return _exhaustive
-}
-
-/** 把保存状态翻成一句人话。空串表示还没开始编辑，不显示。 */
-function describeSaveState(state: SaveState | null): string {
-  if (state === null) return ''
-  if (state.lastError !== null) {
-    return state.lastError.code === 'CONFLICT' ? '冲突 · 未保存' : '保存失败'
-  }
-  if (state.dirty) return '保存中…'
-  if (state.lastSavedMtime !== null) {
-    return `已保存 ${new Date(state.lastSavedMtime).toLocaleTimeString('zh-CN')}`
-  }
-  return ''
 }
