@@ -2,7 +2,7 @@
 //
 // 三条规矩（都是踩过的）：
 //
-// 1. **不许出现本机绝对路径**。脚本入库之后别人也要能跑，而 `E:\MyProject\...`
+// 1. **不许出现本机绝对路径**。脚本入库之后别人也要能跑，而写死的盘符路径
 //    只在这台机器上成立。仓库根从 `import.meta.url` 反算。
 // 2. **夹具放系统临时目录**，不放仓库的 `.tmp/`。本机实测：`.tmp` 里删一个
 //    文件 390ms，`%TEMP%` 里 1.8ms——1000 篇的夹具差出几十秒（TOOLING）。
@@ -15,13 +15,25 @@ import { fileURLToPath } from 'node:url'
 /** 仓库根（`scripts/e2e/` 往上两层）。 */
 export const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
-/** 快速打开 / 全文搜索共用的夹具库：1000 篇 + 2 个坏文件。 */
+/** 快速打开 / 全文搜索 / 文件树共用的夹具库：1000 篇 + 2 个坏文件。 */
 export const QUICK_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-vault-quick')
 
 /** 后台索引状态用例的夹具库：更大，好让「正在建」这段窗口足够宽。 */
 export const INDEX_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-vault-index')
 
-/** 脚本产物（验收报告 JSON）。 */
+/** 回收站三件各自的夹具库。分开是刻意的：三个脚本各自要求「应用刚重启」，
+ *  共用一个库会让上一轮恢复出来的文件改变下一轮的撞名落点（B-32）。 */
+export const TRASH_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-trash')
+export const TRASH_RESTORE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-trash-restore')
+/** 10k 条分页夹具。构造与清理都在 Rust 侧（node 的 rmSync 删不动两万个文件）。 */
+export const TRASH_PAGE_VAULT = path.join(os.tmpdir(), 'ki-e2e-trash-page')
+
+/** 快捷键 / 大纲 / 主题各自的夹具库。 */
+export const KEYS_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-keys')
+export const OUTLINE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-outline')
+export const THEME_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-theme')
+
+/** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 
 /** WebView2 的调试端口。 */
@@ -29,6 +41,25 @@ export const CDP_PORT = Number(process.env.KI_CDP_PORT ?? 9222)
 
 /** 应用 dev 页面的来源。连 target 时必须认它，不能只认 `type === 'page'`。 */
 export const APP_ORIGIN = 'http://127.0.0.1:1420'
+
+/** debug 产物。`tauri dev` / `cargo build -p knowisle` 都落在这里。 */
+export const APP_EXE = path.join(
+  REPO,
+  'target',
+  'debug',
+  process.platform === 'win32' ? 'knowisle.exe' : 'knowisle',
+)
+
+/**
+ * 是否由脚本自己杀掉并重启应用。
+ *
+ * 默认**不**重启：`pnpm e2e:trash` 直接连一个已经开着的应用，连不上就显式失败
+ * （B-19：前置缺失必须响，不能空跑出一片绿）。`e2e:all` 传 `--restart`，
+ * 每一步都换一个新进程——调试槽位是进程级静态（B-16），同一进程里跑第二个
+ * 脚本会让 `addScriptToEvaluateOnNewDocument` 的探针重复注入。
+ */
+export const RESTART =
+  process.argv.includes('--restart') || process.env.KI_E2E_RESTART === '1'
 
 /** 一次 CDP 往返之后给 React 的默认喘息时间。 */
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))

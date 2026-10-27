@@ -13,9 +13,83 @@
 // 每次全量重写：上一轮跑剩下的文件会让 `totalFiles` 漂移，而「1000 篇」是
 // 验收口径（B-32：第一次绿、第二次红的脚本比没有脚本更糟）。
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 import { QUICK_VAULT } from './env.mjs'
+
+/**
+ * 兜底：这些脚本会 `unlink` / `rmSync`，绝不允许被指向真人的库。
+ *
+ * 判据是「在系统临时目录下」，不是「路径含 `.tmp`」——后者在别人机器上
+ * 未必成立，而前者恰好也排除了仓库里的 `.tmp`（那里删一个文件 390ms）。
+ */
+export function assertTempVault(root) {
+  const temp = path.resolve(os.tmpdir()).toLowerCase()
+  const abs = path.resolve(root).toLowerCase()
+  const rel = path.relative(temp, abs)
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`夹具路径必须在系统临时目录（${os.tmpdir()}）下：${root}`)
+  }
+}
+
+/**
+ * 递归删掉库里所有 `.md`，**不删普通目录**。
+ *
+ * 幂等性的全部来源（B-32）：上一轮恢复出来的 `c 2.md`、`f 2.md` 会改变这一轮
+ * 的落点（撞名判定看的是磁盘），于是「应该恢复成 c 2.md」变成「c 3.md」——
+ * 断言没错，起点错了。这类失败最贵：它看起来像实现坏了。
+ *
+ * 名字以 `.md` 结尾的**目录**要整块删：夹具会用「同名目录」模拟"这个名字被
+ * 占了"，只删文件的话下一轮 `writeFileSync('a/b/f.md')` 直接撞 `EISDIR`。
+ */
+export function sweepNotes(dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === '.knowisle') continue
+    const abs = path.join(dir, entry.name)
+    if (!entry.isDirectory()) {
+      if (entry.name.endsWith('.md')) fs.unlinkSync(abs)
+      continue
+    }
+    if (entry.name.endsWith('.md')) fs.rmSync(abs, { recursive: true, force: true })
+    else sweepNotes(abs)
+  }
+}
+
+/**
+ * 只清回收站（文件 + 清单），不碰笔记。
+ *
+ * 回收目录里躺的是**正文**，不是元数据：上一轮留下的 `...-dup.md` 会让这一轮
+ * 「trash 里恰好 1 份」的断言直接红在一个正确的实现上（B-32）。它与笔记的重写
+ * 是两件事，所以单独一个函数——`prepareQuickVault` 需要「1000 篇 + 空回收站」，
+ * 而 `resetVault` 只想要其中一半。
+ *
+ * **不删 `.knowisle/` 本身**：应用开着时 `index.sqlite` 被连接占着，Windows 上
+ * 会抛 `EBUSY`。回收目录与清单是普通文件，应用不持有，可以直接清。
+ */
+export function clearTrash(root) {
+  assertTempVault(root)
+  for (const dir of ['trash', 'trash-manifest']) {
+    fs.rmSync(path.join(root, '.knowisle', dir), { recursive: true, force: true })
+  }
+}
+
+/**
+ * 把夹具库拉回起点：删 `.md`、清回收站、重写指定的文件。
+ *
+ * @param files `{ 'a/b/c.md': '正文' }`，相对路径 → 内容。
+ */
+export function resetVault(root, files = {}, { clearTrash: wipeTrash = false } = {}) {
+  assertTempVault(root)
+  fs.mkdirSync(root, { recursive: true })
+  sweepNotes(root)
+  if (wipeTrash) clearTrash(root)
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(root, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content, 'utf8')
+  }
+}
 
 /** 每篇样本的内容。刻意短：验收需要「整篇都渲染出来」，才能由 DOM 反算绝对偏移。 */
 const body = (title, dir, n) => `# ${title}
@@ -98,6 +172,9 @@ export function prepareQuickVault() {
   }
 
   wipeVault(root)
+  // 回收站也一起清：`wipeVault` 保留了 `.knowisle/`，而回收目录里躺的是正文。
+  // 「trash 里恰好 1 份」这类断言（文件树 / 回收站脚本）在上一轮的残留面前必红。
+  clearTrash(root)
   for (const [index, file] of files.entries()) {
     const abs = path.join(root, file.dir, file.name)
     fs.mkdirSync(path.dirname(abs), { recursive: true })
