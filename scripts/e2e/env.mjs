@@ -8,6 +8,7 @@
 //    文件 390ms，`%TEMP%` 里 1.8ms——1000 篇的夹具差出几十秒（TOOLING）。
 // 3. **端口可以用环境变量覆盖**。同时开两个调试实例时，9222 会被先起的那个
 //    占住，脚本连到错误的 target 上，症状是"页面里什么都没有"。
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -35,6 +36,12 @@ export const THEME_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-theme')
 
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
+
+// 全新 clone 里没有 `.tmp/`（它被 `.gitignore` 忽略，也不会被 `git clone` 带出来）。
+// 不建的话，脚本会**跑完全部判据之后**崩在写报告那一行——ENOENT，看起来像
+// 判据挂了，其实全绿。这条是「新机器模拟」跑出来的：`git clone` + `pnpm install`
+// 之后直接跑，六条判据全过，收尾抛 ENOENT。
+fs.mkdirSync(OUT_DIR, { recursive: true })
 
 /** WebView2 的调试端口。 */
 export const CDP_PORT = Number(process.env.KI_CDP_PORT ?? 9222)
