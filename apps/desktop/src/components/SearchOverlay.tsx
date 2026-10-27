@@ -324,13 +324,19 @@ function summaryOf(
 
   const parts: string[] = []
   parts.push(
-    // 「至少」不是谦虚：`truncated` 有两种成因——命中超过 200 条，
-    // 或者候选池饱和（某条通道取满了上限）。后者的 `total` 是**下界**，
-    // 因为 contentless 的 FTS 表不存正文，要数全库就得读全库。
-    // 两种成因在契约里合并成同一个布尔值，所以文案统一说「至少」。
+    // 三个状态，别合并：
+    // - `truncated`：候选池没数全，`total` 是**下界** → 「至少 N 条」。
+    // - `total > hits.length`：数清了，但只返回前 200 条 → 「前 N 条 · 共 M 条」。
+    // - 两者都不成立：全都在这儿 → 「N 条」。
+    //
+    // `truncated` 曾经把前两种混成一个布尔值（命中超过 200 条也算截断），
+    // 于是「total 准确但只显示 200 条」也被说成「至少」——准确值被降级成了
+    // 下界。现在它是「total 不准」的唯一信号（契约见 `SearchResult::truncated`）。
     result.truncated
       ? `前 ${result.hits.length} 条 · 至少 ${result.total} 条`
-      : `${result.hits.length} 条`,
+      : result.total > result.hits.length
+        ? `前 ${result.hits.length} 条 · 共 ${result.total} 条`
+        : `${result.hits.length} 条`,
   )
   parts.push(`索引 ${result.indexedFiles} 篇`)
   if (result.skippedFiles > 0) parts.push(`跳过 ${result.skippedFiles}`)
