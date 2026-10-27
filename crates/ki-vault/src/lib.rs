@@ -37,8 +37,8 @@ pub use scan::{
     flatten_files, read_note, read_note_in, scan_vault, FileRef, ScanOptions, MAX_SAFE_DEPTH,
 };
 pub use search::{
-    fold_ascii, name_lower_for_path, note_stem, NoteLocator, SearchIndex, MAX_HITS,
-    MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+    fold_ascii, name_lower_for_path, note_stem, Located, NoteLocator, QueryNeedles, SearchIndex,
+    MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
 };
 pub use trash::{
     page as trash_page, purge as trash_purge, restore as trash_restore, DEFAULT_PAGE_LIMIT,

@@ -118,8 +118,61 @@ fn one_line_yields_one_hit_even_if_it_repeats() {
 fn per_file_cap_is_enforced() {
     let dir = vault(&[("a.md", "hit\nhit\nhit\nhit\nhit\n")]);
     let result = search(dir.path(), "hit");
-    assert_eq!(result.total, MAX_HITS_PER_FILE);
+    // `total` 数的是**行数**：写 5 行就是 5 行。`MAX_HITS_PER_FILE` 只限制
+    // 返回几条——拿返回条数当行数的话，一篇写 10 次只算 3 次，而 `truncated`
+    // 是 false（它只表示 total 是下界），UI 于是会理直气壮地少报。
+    assert_eq!(result.total, 5, "total 是行数，不受每篇返回上限影响");
     assert_eq!(result.hits.len(), MAX_HITS_PER_FILE);
+}
+
+/// 多词查询是 **AND**：每个词都得出现在同一行里。
+///
+/// 旧实现把整串当一个 needle，`foo bar` 只能命中「foo bar」这个连续子串——
+/// 于是「分开写的两个词」一条都搜不到。用户在搜索框里按空格分词是通用直觉，
+/// 而旧语义把空格当成了正文的一部分。
+#[test]
+fn multi_word_query_is_an_and_of_substrings() {
+    let dir = vault(&[
+        ("both.md", "foo 在左，bar 在右\n"),
+        ("only-foo.md", "只有 foo\n"),
+        ("only-bar.md", "只有 bar\n"),
+        ("adjacent.md", "foo bar\n"),
+    ]);
+
+    let result = search(dir.path(), "foo bar");
+    let mut paths: Vec<&str> = result.hits.iter().map(|hit| hit.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["adjacent.md", "both.md"], "两个词都出现的行才算命中");
+    assert_eq!(result.total, 2);
+
+    // 词序无关：AND 是对称的。
+    let swapped = search(dir.path(), "bar foo");
+    assert_eq!(swapped.total, 2);
+}
+
+/// 多词命中的锚点取**最靠左**的那个词：行号/列号/摘要仍然指向一个真实位置。
+#[test]
+fn multi_word_hit_anchors_at_the_leftmost_word() {
+    let dir = vault(&[("a.md", "bar 在前 foo 在后\n")]);
+    let result = search(dir.path(), "foo bar");
+    assert_eq!(result.hits.len(), 1);
+    let hit = &result.hits[0];
+    assert_eq!(hit.column, 0, "锚点是 bar 的起点，不是 foo 的");
+    assert_eq!(
+        slice_utf16(&hit.text, hit.from, hit.to),
+        "bar",
+        "from/to 指向锚点那个词"
+    );
+}
+
+/// 拆词不能把「一行只出一条」的契约弄丢：同一行出现多次仍然只算一条。
+#[test]
+fn multi_word_query_still_yields_one_hit_per_line() {
+    let dir = vault(&[("a.md", "foo bar foo bar\nfoo bar\n")]);
+    let result = search(dir.path(), "bar foo");
+    assert_eq!(result.total, 2, "两行各一条");
+    assert_eq!(result.hits[0].line, 1);
+    assert_eq!(result.hits[1].line, 2);
 }
 
 #[test]

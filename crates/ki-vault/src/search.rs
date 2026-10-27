@@ -2,8 +2,9 @@
 //!
 //! # 这不是搜索引擎
 //!
-//! 匹配规则只有一条：**ASCII 大小写折叠之后的子串匹配**。不模糊、不分词、
-//! 不支持正则。中文天然可用——UTF-8 的子串匹配对中文是精确的。
+//! 匹配规则只有一条：**ASCII 大小写折叠之后的子串匹配**，多词按空白拆开后
+//! 取 AND（[`QueryNeedles`]）。不模糊、不做统计分词、不支持正则。
+//! 中文天然可用——UTF-8 的子串匹配对中文是精确的。
 //!
 //! 为什么不做模糊：用户按 `Cmd+Shift+F` 时想找的是"哪篇笔记写了这句话"，
 //! 不是"哪篇笔记的字母顺序最接近"。模糊匹配在文件名上是对的（见 `quick-open`），
@@ -37,10 +38,15 @@ use crate::scan::{read_note, scan_vault, ScanOptions};
 /// 编辑，只是搜不到——这个取舍必须让用户看得见（结果里报 `skippedFiles`）。
 pub const MAX_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 
-/// 每篇最多返回几条命中行。
+/// 每篇最多**返回**几条命中行。
 ///
 /// 一篇笔记里同一个词出现 50 次，对"找到这篇"没有额外帮助，只会把别的笔记
 /// 挤出前 200 条。
+///
+/// 它**只管返回多少条**，不影响 [`Located::lines`]——后者是这篇里命中的
+/// **全部**行数，`total` 用它。两者分开是「total 是行数」这句话能成立的前提：
+/// 拿返回条数当行数，一篇写 10 次的笔记只会被算 3 次，而 `truncated` 是 false
+/// （它只表示 total 是下界），于是 UI 会理直气壮地少报。
 pub const MAX_HITS_PER_FILE: usize = 3;
 
 /// 一次搜索最多返回多少条命中行。
@@ -54,6 +60,86 @@ const SNIPPET_BEFORE: usize = 60;
 /// 结果列表一行最多显示两行文本；240 字符已经超过两行的容量。
 /// 它的主要作用不是省流量，而是让"一行 5000 字"的笔记不会把列表撑变形。
 const SNIPPET_CHARS: usize = 240;
+
+/// 一条查询在定位层的形态：**整串**（判文件名）+ **拆开的词**（判行）。
+///
+/// # 为什么要拆词
+///
+/// 定位器原本把**原始 query 整串**当一个 needle 做 `str::find`。于是
+/// `笔记 下的第` 是一个**含空格的字面串**，而不是「三个词同时出现」。
+/// 用户在搜索框里按空格分词是通用直觉（旧的内存引擎也吃这套），
+/// 整串语义让多词查询几乎恒为 0 条——而候选池里明明有 1000 篇。
+///
+/// # 为什么 `whole` 还要留着
+///
+/// `name_hit` 的判据是「文件名也命中」，它必须与文件名通道
+/// （`name_lower LIKE %query%`，见 `ki-store` 的 `match_name`）**同源**。
+/// 两边都看整串：若这里改成「每个词都在文件名里」，定位器会把某些行标成
+/// `name_hit = true`，而文件名通道根本没让这篇进池——排序看着不对劲，
+/// 没有任何报错。多词查询因此拿不到文件名优先，这是**已知且刻意保留**的
+/// 收窄（文件名通道的拆词是另一件事，不在本刀）。
+///
+/// # 换行
+///
+/// 含 `\n` / `\r` 的查询拆不出「同一行」的概念（`plan()` 直接判 Empty）。
+/// 这里跟着判空：拆词之后 `a\nb` 会变成 `a AND b`，那会**放宽**语义，
+/// 与旧引擎「跨行命中一律跳过」的契约冲突。
+pub struct QueryNeedles {
+    /// 整串折叠后的形式。只用于 `name_hit`。
+    whole: String,
+    /// 按空白拆开、各自折叠、丢弃空串、去重。行命中要求**全部**出现。
+    words: Vec<String>,
+}
+
+impl QueryNeedles {
+    pub fn new(query: &str) -> Self {
+        let trimmed = query.trim();
+        let whole = fold_ascii(trimmed);
+        if trimmed.contains(['\n', '\r']) {
+            return Self {
+                whole,
+                words: Vec::new(),
+            };
+        }
+
+        let mut words: Vec<String> = Vec::new();
+        for word in trimmed.split_whitespace() {
+            let folded = fold_ascii(word);
+            // 折叠之后为空的词必须**整条丢弃**：空 needle 会让 `find` 在
+            // 偏移 0 处恒命中，把每一行都变成命中。`fold_ascii` 只映射 A-Z、
+            // 不改长度，所以能折叠成空的词本来就不存在——这道判断防的是
+            // 「将来有人把折叠换成会丢字符的实现」。
+            if folded.is_empty() || words.contains(&folded) {
+                continue;
+            }
+            words.push(folded);
+        }
+        Self { whole, words }
+    }
+
+    /// 拆出来的词（已折叠）。空表示这条查询没有可定位的东西。
+    pub fn words(&self) -> &[String] {
+        &self.words
+    }
+
+    /// 整串折叠后的形式。文件名通道与 `name_hit` 都用它。
+    pub fn whole(&self) -> &str {
+        &self.whole
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+}
+
+/// 一篇笔记的定位结果。
+#[derive(Debug, Default)]
+pub struct Located {
+    /// 命中行，按行号升序，最多 `max` 条。
+    pub hits: Vec<SearchHit>,
+    /// 这篇里命中的**全部**行数（不设上限）。`total` 用它。
+    pub lines: usize,
+}
 
 /// 一篇正文的定位器。
 ///
@@ -101,53 +187,62 @@ impl NoteLocator {
         &self.content
     }
 
-    /// 找出这篇正文里最多 `max` 条命中行。
+    /// 找出这篇正文里最多 `max` 条命中行，并数清一共命中多少行。
     ///
-    /// 传入的是**原始 query**（内部自行 trim + 折叠）。查询为空时返回空——
-    /// 空 needle 会让 `find` 在偏移 0 处恒命中，把每篇都变成一条命中。
-    pub fn hits(&self, query: &str, max: usize) -> Vec<SearchHit> {
-        let needle = fold_ascii(query.trim());
-        if needle.is_empty() {
-            return Vec::new();
+    /// 逐行判定：一行算命中当且仅当**每个词都出现在这一行里**。同一行只出
+    /// 一条（锚点取最靠左的那个词的出现位置），跨行的词不算命中——行号、
+    /// 列号、摘要窗口的规则与单 needle 时代逐字相同，单 needle 查询的结果
+    /// 因此逐元素不变。
+    ///
+    /// `lines` 与 `hits` 的区别是**计数不设上限**：一篇里写 10 次就算 10 行，
+    /// 只是最多返回 `max` 条。旧实现拿返回条数当行数，`total` 于是恒等于
+    /// `Σ min(每篇命中行, 3)`——那不是行数。
+    pub fn locate(&self, query: &QueryNeedles, max: usize) -> Located {
+        if query.words.is_empty() {
+            return Located::default();
         }
-        self.hits_with_needle(&needle, max)
-    }
+        // 整串判文件名：与文件名通道同源，多词查询因此几乎恒为 false。
+        let name_hit = !query.whole.is_empty() && self.name_lower.contains(&query.whole);
 
-    /// 已经折叠好的 needle。批量查询时省掉每篇一次 `fold_ascii` 的分配。
-    pub(crate) fn hits_with_needle(&self, needle: &str, max: usize) -> Vec<SearchHit> {
-        if needle.is_empty() || max == 0 {
-            return Vec::new();
-        }
-        let name_hit = self.name_lower.contains(needle);
         let mut hits: Vec<SearchHit> = Vec::with_capacity(max.min(MAX_HITS_PER_FILE));
-        let mut cursor = 0usize;
+        let mut lines = 0usize;
 
-        // 每轮最多产出一条命中，然后跳到下一行——同一行的后续命中不再单独成条。
-        // 注意 `hits.len()` 而不是 `cursor`：跨行被跳过的命中不消耗每篇的配额。
-        while hits.len() < max {
-            let Some(offset) = self.lower[cursor..].find(needle) else {
-                break;
-            };
-            let at = cursor + offset;
-            if let Some(hit) = self.make_hit(at, needle.len(), name_hit) {
-                hits.push(hit);
+        for index in 0..self.line_starts.len() {
+            let (line_start, line_end) = line_bounds(&self.content, &self.line_starts, index);
+            let line_lower = &self.lower[line_start..line_end];
+
+            // 每个词都得在**这一行**里；锚点取最靠左的那个，与单 needle 的
+            // 「首次出现」是同一个位置。
+            let mut anchor = usize::MAX;
+            let mut anchor_len = 0usize;
+            let mut all = true;
+            for word in &query.words {
+                match line_lower.find(word.as_str()) {
+                    Some(offset) => {
+                        if offset < anchor {
+                            anchor = offset;
+                            anchor_len = word.len();
+                        }
+                    }
+                    None => {
+                        all = false;
+                        break;
+                    }
+                }
             }
-            cursor = self.next_line_start(at);
-            if cursor >= self.content.len() {
-                break;
+            if !all {
+                continue;
+            }
+
+            lines += 1;
+            if hits.len() < max {
+                if let Some(hit) = self.make_hit(line_start + anchor, anchor_len, name_hit) {
+                    hits.push(hit);
+                }
             }
         }
 
-        hits
-    }
-
-    /// 命中位置所在行的下一行起始偏移。用来保证"一行只出一条命中"。
-    fn next_line_start(&self, at: usize) -> usize {
-        let index = line_index(&self.line_starts, at);
-        match self.line_starts.get(index + 1) {
-            Some(&next) => next as usize,
-            None => self.content.len(),
-        }
+        Located { hits, lines }
     }
 
     /// 组装一条命中；命中横跨两行时返回 `None`。
@@ -281,8 +376,8 @@ impl SearchIndex {
             self.refresh(path);
         }
 
-        let needle = fold_ascii(query.trim());
-        if needle.is_empty() {
+        let needles = QueryNeedles::new(query);
+        if needles.is_empty() {
             return self.finish(Vec::new(), 0);
         }
 
@@ -290,9 +385,9 @@ impl SearchIndex {
         let mut total = 0usize;
 
         for file in &self.files {
-            let file_hits = file.hits_with_needle(&needle, MAX_HITS_PER_FILE);
-            total += file_hits.len();
-            hits.extend(file_hits);
+            let located = file.locate(&needles, MAX_HITS_PER_FILE);
+            total += located.lines;
+            hits.extend(located.hits);
         }
 
         // 文件名命中优先，再按 path、行号。三者都是确定的，所以结果与遍历顺序无关。

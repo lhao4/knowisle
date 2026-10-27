@@ -53,8 +53,8 @@ use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
 };
 use ki_vault::{
-    flatten_files, fold_ascii, name_lower_for_path, read_note, read_note_in, scan_vault, FileRef,
-    NoteLocator, ResolvedVault, ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+    flatten_files, name_lower_for_path, read_note, read_note_in, scan_vault, FileRef, NoteLocator,
+    QueryNeedles, ResolvedVault, ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
 };
 
 use super::cache::{
@@ -665,6 +665,8 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
 
     let counts = db.counts()?;
     let qplan = plan(query);
+    // 拆词只做一次：每篇定位都要用它，逐篇 `fold_ascii` 会白分配一遍。
+    let needles = QueryNeedles::new(query);
 
     let mut result = match qplan.mode {
         Mode::Empty => finish(Vec::new(), 0, counts, false),
@@ -677,9 +679,11 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
                 .into_iter()
                 .map(|candidate| candidate.path)
                 .collect();
-            locate_all(&root, &pool, query, counts, false)
+            // 全扫读过每一篇，`total` 恒为准确值——除非某篇读不到，
+            // 那时由 `locate_all` 自己把它降级成下界。
+            locate_all(&root, &pool, &needles, counts, false)
         }
-        Mode::Ascii | Mode::Cjk => indexed_search(db, &root, query, &qplan, counts)?,
+        Mode::Ascii | Mode::Cjk => indexed_search(db, &root, &needles, &qplan, counts)?,
     };
 
     result.index_ms = pending_ms + open_ms;
@@ -692,7 +696,7 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
 fn indexed_search(
     db: &IndexDb,
     root: &Path,
-    query: &str,
+    query: &QueryNeedles,
     qplan: &Plan,
     counts: Counts,
 ) -> Result<SearchResult, KiError> {
@@ -706,11 +710,11 @@ fn indexed_search(
 
     // 文件名通道与 FTS 通道互不替代：`name_hit` 是排序契约的第一键，
     // 一篇文件名命中但正文没命中的笔记必须进池，否则「按文件名搜」直接失效。
-    let needle = fold_ascii(query.trim());
+    let needle = query.whole();
     let names = if needle.is_empty() {
         Vec::new()
     } else {
-        db.match_name(&needle, NAME_LIMIT)?
+        db.match_name(needle, NAME_LIMIT)?
     };
 
     let fused = fuse(&[
@@ -740,7 +744,7 @@ fn indexed_search(
 fn locate_all(
     root: &Path,
     pool: &[String],
-    query: &str,
+    query: &QueryNeedles,
     counts: Counts,
     pool_saturated: bool,
 ) -> SearchResult {
@@ -751,9 +755,9 @@ fn locate_all(
         let Ok(note) = read_note(root, path) else {
             continue;
         };
-        let file_hits = NoteLocator::new(note.path, note.content).hits(query, MAX_HITS_PER_FILE);
-        total += file_hits.len();
-        hits.extend(file_hits);
+        let located = NoteLocator::new(note.path, note.content).locate(query, MAX_HITS_PER_FILE);
+        total += located.lines;
+        hits.extend(located.hits);
     }
 
     finish(hits, total, counts, pool_saturated)
