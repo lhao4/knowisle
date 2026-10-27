@@ -402,12 +402,15 @@ impl SearchIndex {
     }
 
     fn finish(&self, mut hits: Vec<SearchHit>, total: usize) -> SearchResult {
-        let truncated = hits.len() > MAX_HITS;
+        // 全扫路径的 `total` **恒为准确值**：每一篇都定位过，没有任何候选被
+        // 预算截掉。所以 `truncated`（= "total 是下界"）永远是 false，
+        // 哪怕 `hits` 被截到 200 条——「只返回前 200 条」与「数不清」是两件事，
+        // 旧实现把两者塞进同一个布尔值，UI 于是会把准确值说成「至少」。
         hits.truncate(MAX_HITS);
         SearchResult {
             hits,
             total,
-            truncated,
+            truncated: false,
             indexed_files: self.files.len(),
             skipped_files: self.skipped,
             // 下面三个字段由缓存层填：索引自己不知道"这次是不是刚建的"，

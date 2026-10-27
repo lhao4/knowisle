@@ -156,14 +156,15 @@ fn concurrent_searches_open_the_index_once() {
     );
 }
 
-/// 通道取满 `CHANNEL_LIMIT` 时，`total` 从「准确值」降级为「下界」，
-/// 结果必须标成 `truncated`——否则 UI 会把「至少 200 条」说成「共 200 条」。
+/// 候选都在预算之内时，`total` 是**准确值**——不是下界。
+///
+/// 205 篇各一条命中：`hits` 被截到 200 条，但那是「只返回前 200 条」，
+/// 与「数不清」是两件事。旧实现把两者塞进同一个 `truncated`，于是
+/// 「共 205 条」被 UI 说成「至少 205 条」——准确值被降级成了下界。
 #[test]
-fn pool_saturation_marks_the_result_as_truncated() {
+fn pool_within_budget_reports_an_exact_total() {
     let _guard = serial();
     let dir = vault();
-    // 每篇一个 "alpha"，命中行数刚好等于通道上限（200），
-    // 所以 `hits.len() > MAX_HITS` 不成立，只有「池饱和」能让 truncated 为真。
     for i in 0..205 {
         fs::write(dir.path().join(format!("n{i:03}.md")), "alpha").expect("写");
     }
@@ -171,12 +172,32 @@ fn pool_saturation_marks_the_result_as_truncated() {
 
     let result = service::search(dir.path(), "alpha", None).expect("搜索");
     assert_eq!(result.hits.len(), 200);
+    assert_eq!(result.total, 205, "候选全在手里，total 必须是准确值");
+    assert!(!result.truncated, "total 准确时不许标成下界");
+}
+
+/// 候选超过 `POOL_EXACT_MAX` 时，池子按 `POOL_SCAN_MAX` 截断，`total`
+/// 降级为下界，结果**必须**标成 `truncated`——否则 UI 会把「至少 200 条」
+/// 说成「共 200 条」。
+///
+/// 夹具是 1201 篇（刚过预算一条），所以这条用例慢（建索引十秒量级）。
+/// 边界本身（1200 / 1201）由 `service.rs` 里的 `pool_plan` 单测钉住，
+/// 这里只需要证明「超预算 → truncated」这条线真的接上了。
+#[test]
+fn pool_over_budget_marks_the_result_as_truncated() {
+    let _guard = serial();
+    let dir = vault();
+    for i in 0..1201 {
+        fs::write(dir.path().join(format!("n{i:04}.md")), "alpha").expect("写");
+    }
+    index(dir.path());
+
+    let result = service::search(dir.path(), "alpha", None).expect("搜索");
+    assert_eq!(result.hits.len(), 200);
     assert!(
         result.truncated,
-        "候选池饱和时 truncated 必须为真（total 已是下界）"
+        "候选超过预算时 truncated 必须为真（total 已是下界）"
     );
-    assert!(
-        result.total <= 205,
-        "total 是池内命中数，不会超过全库命中数"
-    );
+    assert_eq!(result.total, 200, "下界 = 池内命中行数（每篇一条）");
+    assert!(result.total < 1201, "下界当然小于全库命中数");
 }

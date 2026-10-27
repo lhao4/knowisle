@@ -68,15 +68,32 @@ use super::cache::{
 /// 太大则单批的读盘时间会明显拉长（用户在这期间看到的还是旧索引）。
 const BATCH_SIZE: usize = 256;
 
-/// 每条 FTS 通道取前多少篇。
-const CHANNEL_LIMIT: usize = 200;
+/// 候选池的**精确预算**：候选不超过这个数时，全部定位，`total` 是准确值。
+///
+/// # 为什么是一个文件数，而不是"查询宽度"
+///
+/// 试过按查询的 token 数（bigram 数）自适应，实测**预测不了命中面**：
+/// `样本笔记` 与 `本地优先` 都是 3 个 bigram，前者命中 1000/1000 篇，
+/// 后者在 10k 库上命中 10000/10000 篇——同一个宽度，命中面可以差一个数量级。
+/// 真正的判据是「索引说有多少篇可能命中」，它必须**查一次才知道**，
+/// 而查它的代价只是一次索引扫描（不读正文）。所以预算按候选数给，
+/// 取候选时多取一条用来判「有没有取满」。
+///
+/// # 1200 是怎么来的
+///
+/// 它必须盖住「小库里的宽查询」：1000 篇的库里，一个命中全部笔记的词
+/// （`样本笔记`）要 1000 篇才数得准，验收就是这么钉的。1200 给夹具留了
+/// 余量，同时把**精确路径的最坏代价**钉在 1200 篇上——与库多大无关。
+/// 10k 库上这个上界的代价见 `POOL_SCAN_MAX` 的说明。
+const POOL_EXACT_MAX: usize = 1200;
 
-/// 文件名通道取前多少篇。它**全部进池**——`name_hit` 是排序契约的第一键，
-/// 被截断挤掉会让「按文件名搜」直接失效。
-const NAME_LIMIT: usize = 400;
-
-/// 候选池上限。超过就只保留 RRF 分数最高的那些，并把结果标成 `truncated`。
-const POOL_LIMIT: usize = 400;
+/// 候选超过精确预算时只定位这么多篇。
+///
+/// 此时 `total` **必然是下界**（`truncated = true`，UI 说「至少」），
+/// 多读几篇只会让下界从 200 变成 400，对用户没有信息量；而少读一篇省一次
+/// 磁盘 open。取 200 还有一条硬理由：`hits` 本来就截断到 `MAX_HITS = 200`，
+/// 一篇至少贡献一条命中时，200 篇刚好能把结果列表填满。
+const POOL_SCAN_MAX: usize = 200;
 
 /// 一次同步的结果。
 #[derive(Debug, Clone)]
@@ -693,6 +710,18 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
 }
 
 /// 走 FTS 通道：候选 → RRF 融合 → 定位。
+///
+/// # 候选池的大小是算出来的，不是拍出来的
+///
+/// 池子只有一个作用：**让 `total` 数得准**。数得准的前提是「候选全在手里」，
+/// 而候选有多少只有索引知道。所以两条通道都取 `POOL_EXACT_MAX + 1` 条：
+/// 融合之后不超过 `POOL_EXACT_MAX`，就说明**没有任何一条通道取满**，
+/// 池子 = 全部候选，`total` 是准确值；否则池子按 `POOL_SCAN_MAX` 截断，
+/// `total` 降级为下界，`truncated` 为真。
+///
+/// 旧实现把「通道取满 200 条」当成饱和判据，于是「命中 1000 篇」与
+/// 「命中 200 篇」在池子里长得一模一样，`total` 报 200 而全库是 1000
+/// ——UI 说「至少 200 条」，用户以为只有 200 条。
 fn indexed_search(
     db: &IndexDb,
     root: &Path,
@@ -700,21 +729,21 @@ fn indexed_search(
     qplan: &Plan,
     counts: Counts,
 ) -> Result<SearchResult, KiError> {
+    let limit = POOL_EXACT_MAX + 1;
     let channel = match qplan.mode {
-        Mode::Ascii => db.match_ascii(&qplan.expr, CHANNEL_LIMIT)?,
-        Mode::Cjk => db.match_zh(&qplan.expr, CHANNEL_LIMIT)?,
+        Mode::Ascii => db.match_ascii(&qplan.expr, limit)?,
+        Mode::Cjk => db.match_zh(&qplan.expr, limit)?,
         _ => unreachable!("indexed_search 只处理 Ascii / Cjk"),
     };
-    // 取满了就说明池可能被截断，`total` 从「准确值」降级为「下界」。
-    let channel_saturated = channel.len() >= CHANNEL_LIMIT;
 
     // 文件名通道与 FTS 通道互不替代：`name_hit` 是排序契约的第一键，
     // 一篇文件名命中但正文没命中的笔记必须进池，否则「按文件名搜」直接失效。
+    // 它和 FTS 通道用同一个预算：判据是「池子完整」，不是「每条通道各自完整」。
     let needle = query.whole();
     let names = if needle.is_empty() {
         Vec::new()
     } else {
-        db.match_name(needle, NAME_LIMIT)?
+        db.match_name(needle, limit)?
     };
 
     let fused = fuse(&[
@@ -727,20 +756,35 @@ fn indexed_search(
         paths.insert(candidate.id, candidate.path.as_str());
     }
 
-    let pool_saturated = channel_saturated || fused.len() > POOL_LIMIT;
+    // 池子完整 ⇔ 融合后的候选不超过预算。取满任意一条通道都会让融合结果
+    // 至少等于那个上限，所以这一个判断同时覆盖两条通道。
+    let (take, complete) = pool_plan(fused.len());
     let pool: Vec<String> = fused
         .iter()
-        .take(POOL_LIMIT)
+        .take(take)
         .filter_map(|hit| paths.get(&hit.id).map(|path| (*path).to_string()))
         .collect();
 
-    Ok(locate_all(root, &pool, query, counts, pool_saturated))
+    Ok(locate_all(root, &pool, query, counts, !complete))
+}
+
+/// 候选池的取法：完整就全取，超预算就按扫描上限截断。
+///
+/// 抽成纯函数是为了让 1200/1201 这条边界能被一条**不建索引**的用例钉住——
+/// 边界用例若只能靠 1201 篇夹具来测，跑一次十几秒，最后一定会被人删掉。
+fn pool_plan(candidates: usize) -> (usize, bool) {
+    if candidates <= POOL_EXACT_MAX {
+        (candidates, true)
+    } else {
+        (POOL_SCAN_MAX, false)
+    }
 }
 
 /// 对候选池逐篇定位，产出最终结果。
 ///
 /// 读不到的文件静默跳过：它可能在扫描与搜索之间被删掉了。**不要**因此把
-/// 整次搜索变成错误——一篇被删的笔记不该让用户搜不了整个库。
+/// 整次搜索变成错误——一篇被删的笔记不该让用户搜不了整个库。但它确实让
+/// `total` 少算了一篇的命中，所以结果要降级成「下界」（`truncated = true`）。
 fn locate_all(
     root: &Path,
     pool: &[String],
@@ -750,9 +794,11 @@ fn locate_all(
 ) -> SearchResult {
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut total = 0usize;
+    let mut incomplete = pool_saturated;
 
     for path in pool {
         let Ok(note) = read_note(root, path) else {
+            incomplete = true;
             continue;
         };
         let located = NoteLocator::new(note.path, note.content).locate(query, MAX_HITS_PER_FILE);
@@ -760,13 +806,18 @@ fn locate_all(
         hits.extend(located.hits);
     }
 
-    finish(hits, total, counts, pool_saturated)
+    finish(hits, total, counts, incomplete)
 }
 
 /// 排序、截断、填诊断字段。
 ///
 /// 排序键与旧引擎**逐字相同**：文件名命中优先 → 路径 → 行号。三者都是确定的，
 /// 所以结果与遍历顺序无关（候选池的顺序来自 RRF，但它不影响最终顺序）。
+///
+/// `truncated` **只表示一件事**：`total` 是下界。它不再是「`hits` 被截到
+/// 200 条」的同义词——那件事永远成立（`hits` 就是只返回 200 条），把它也
+/// 算进 `truncated` 会让「total 准确」的结果被 UI 说成「至少 N 条」。
+/// 契约只有一条：**`total` 不准 ⇔ `truncated` 为真**。
 fn finish(
     mut hits: Vec<SearchHit>,
     total: usize,
@@ -780,13 +831,12 @@ fn finish(
             .then_with(|| a.line.cmp(&b.line))
     });
 
-    let truncated = hits.len() > MAX_HITS || pool_saturated;
     hits.truncate(MAX_HITS);
 
     SearchResult {
         hits,
         total,
-        truncated,
+        truncated: pool_saturated,
         indexed_files: counts.ok,
         skipped_files: counts.skipped,
         index_ms: 0,
@@ -935,5 +985,30 @@ fn indexed_note(note: &ki_core::NoteContent) -> IndexedNote {
         mtime: note.mtime,
         body_ascii: project(&note.content),
         body_tokens: token_stream(&note.content),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 池子的边界：预算以内全取（`total` 准确），预算之外截到扫描上限（下界）。
+    ///
+    /// 这条用例存在的唯一理由是「1200 与 1201 差一条」这个判据不值得用
+    /// 1201 篇夹具去测，而它又是 `truncated` 会不会漏报的唯一边界。
+    #[test]
+    fn pool_plan_is_exact_up_to_the_budget() {
+        assert_eq!(pool_plan(0), (0, true));
+        assert_eq!(pool_plan(1), (1, true));
+        assert_eq!(pool_plan(POOL_EXACT_MAX), (POOL_EXACT_MAX, true));
+        assert_eq!(pool_plan(POOL_EXACT_MAX + 1), (POOL_SCAN_MAX, false));
+        assert_eq!(pool_plan(10_000), (POOL_SCAN_MAX, false));
+    }
+
+    /// 下界必须**小于**预算，否则「截断」比「全取」还贵。
+    #[test]
+    fn scan_cap_is_much_smaller_than_the_exact_budget() {
+        assert!(POOL_SCAN_MAX < POOL_EXACT_MAX);
+        assert_eq!(POOL_SCAN_MAX, MAX_HITS, "截断时刚好够填满结果列表");
     }
 }

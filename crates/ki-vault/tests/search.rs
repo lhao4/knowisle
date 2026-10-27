@@ -188,7 +188,12 @@ fn global_cap_is_enforced_and_total_keeps_the_real_count() {
     let result = search(dir.path(), "hit");
     assert_eq!(result.total, 240);
     assert_eq!(result.hits.len(), MAX_HITS);
-    assert!(result.truncated);
+    // 全扫路径读过每一篇，`total` 是准确值。`hits` 只返回 200 条是**另一件事**，
+    // 它不代表数不清——`truncated` 只表示「total 是下界」。
+    assert!(
+        !result.truncated,
+        "total 准确时不许标成下界，否则 UI 会把「共 240 条」说成「至少 240 条」"
+    );
 }
 
 #[test]
