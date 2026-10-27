@@ -17,6 +17,14 @@
     "check": "cargo check --workspace",
     "test": "pnpm --filter @knowisle/desktop test && cargo test --workspace",
     "test:web": "pnpm --filter @knowisle/desktop test",
-    "test:rust": "cargo test --workspace"
+    "test:rust": "cargo test --workspace",
+    "e2e:trash": "node scripts/e2e/cdp-trash.mjs",
+    "e2e:trash-restore": "node scripts/e2e/cdp-trash-restore.mjs",
+    "e2e:trash-page": "node scripts/e2e/cdp-trash-page.mjs",
+    "e2e:tree": "node scripts/e2e/cdp-tree.mjs",
+    "e2e:outline": "node scripts/e2e/cdp-outline.mjs",
+    "e2e:keys": "node scripts/e2e/cdp-keys.mjs",
+    "e2e:theme": "node scripts/e2e/cdp-theme.mjs",
+    "e2e:all": "node scripts/e2e/all.mjs"
   }
 }
