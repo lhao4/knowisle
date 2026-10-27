@@ -55,11 +55,29 @@ const SAVED_FLASH_MS = 1200
 const LAST_VAULT_KEY = 'knowisle.lastVault'
 
 /**
- * 应用根组件。
+ * `App.tsx` 只剩**跨域**状态与编排。
  *
- * 侧栏 / 搜索 / 回收站三个域的状态与副作用逐步抽进 `hooks/`，这里只留
- * **跨域**的那几条：读写都在一个域里的进那个 hook，写入方横跨两个以上域的
- * 留在这里，hook 通过参数拿、通过回调还。
+ * # 三个域在哪
+ *
+ * - `hooks/useSidebar.ts` 折叠态、右键菜单、新建/改名的名字浮层、删除确认；
+ * - `hooks/useSearch.ts` 快速打开与全文搜索两个浮层、候选表；
+ * - `hooks/useTrash.ts` 回收站分页、面板开合、恢复、清空。
+ *
+ * 判据是「谁读它、谁写它」。读写都在一个域里的，进那个 hook；写入方横跨
+ * 两个以上域的，留在这里，hook 通过参数拿、通过回调还。
+ *
+ * # 留在这里的那几条，以及为什么
+ *
+ * - `vault` / `activeNote` / `docId` / `outline`：读写都跨域（侧栏画树、搜索
+ *   取 root、回收站取 root、编辑器重建认 docId）。
+ * - `revealPath`：读只有一处（`TreeNode`），但**写它的动作横跨五个**——
+ *   新建、改名、删除、回收站恢复、换库。塞进任一 hook 都要给另外两个域
+ *   各开一个 setter 口子，那是把耦合换个地方放。
+ * - `flash` / `saveState` / `error` / `busy` / `runtime`：都在顶栏与横幅上，
+ *   写它们的是保存链路、扫描链路、打开链路——没有一个是单一域的。
+ * - `openNote` 链路（`flushActiveNote` → `noteRead` → 切文档）：顺序是红线，
+ *   它横跨三个域，**不许**拆进两个 hook。反了会静默丢最后几个字。
+ * - `editorRef` / `outlineRef`：句柄本身没有归属，谁需要谁拿。
  */
 export default function App() {
   const [vault, setVault] = useState<ScanResult | null>(null)
