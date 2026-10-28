@@ -109,8 +109,26 @@ pub struct ScanResult {
 pub struct NoteContent {
     /// Vault 相对路径（POSIX），与请求时传入的一致。
     pub path: String,
-    /// 已去除 UTF-8 BOM 的正文。
+    /// 正文。BOM（UTF-8 / UTF-16 / UTF-32 的）已剥离。
     pub content: String,
+    /// 这篇是从别的编码转过来的话，原编码的名字（`"GBK"` / `"Big5"` / `"UTF-16LE"`…）；
+    /// `None` 严格等价于「磁盘上本来就是 UTF-8」。
+    ///
+    /// # 为什么是字符串而不是枚举
+    ///
+    /// 前端**只拿它拼一句话**（「已按 GBK 解码」），不据此分支——保存写回
+    /// 哪个编码由 Rust 在写盘前重新探测，前端说了不算。枚举会逼前端再写一张
+    /// 标签表，两张表迟早会漂；而一个「取值集合封闭但只用于展示」的字段，
+    /// 字符串就是它最小的形状。
+    ///
+    /// 带 BOM 的 UTF-8 **不会**出现在这里：它是文件头的一种写法，不是
+    /// 另一种字符集，提示用户「已按 UTF-8 (BOM) 解码」只会制造困惑。
+    ///
+    /// 不挂 `#[serde(default)]`：这个字段**永远**会被序列化（不是
+    /// `skip_serializing_if`），所以线上形状恒为 `string | null`。
+    /// 加了 `default` 反而会让生成出来的 TS 变成可选字段，前端就得多写
+    /// 一次 `undefined` 判断——契约形状不该由 serde 的便利性决定。
+    pub decoded_from: Option<String>,
     pub size: u64,
     pub mtime: i64,
 }

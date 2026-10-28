@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ki_core::{KiError, SaveResult};
 
+use crate::encoding::{self, EncodeError, Encoding};
 use crate::path::resolve_for_write;
 use crate::scan::{stat, MAX_NOTE_BYTES};
 
@@ -66,14 +67,21 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// # 内容
 ///
-/// 正文**逐字节原样**写入，不做换行转换、不加末尾换行、不写 BOM。
-/// 注意 `read_note` 会剥掉开头的 UTF-8 BOM，所以调用方不该自己塞一个进去，
-/// 否则"写进去的"和"读出来的"会差三个字节。
+/// 正文按**磁盘上现有的编码**写回：UTF-8 的写 UTF-8，GBK 的写 GBK，
+/// 带 BOM 的把 BOM 原样带上。不做换行转换、不加末尾换行。
+///
+/// 这一点不是锦上添花：用户打开一篇 GBK 笔记改一个字，如果写回 UTF-8，
+/// 这篇笔记在他别的工具里就坏了，而他没同意过。所以编码由**写盘前重新
+/// 探测磁盘**决定，不由调用方指定——少一个可以传错的参数。
+///
+/// 编不回去（GBK 装不下 emoji）时拒绝保存（[`KiError::EncodingNotWritable`]），
+/// 磁盘一个字节都不动。
 ///
 /// # 上限
 ///
 /// 与 [`crate::read_note`] 共用 [`MAX_NOTE_BYTES`]：写不进去的内容，
-/// 也就不该被写进去——能写不能读是一种最难排查的不一致。
+/// 也就不该被写进去——能写不能读是一种最难排查的不一致。判据是**编码后
+/// 的字节数**（UTF-16 会比 UTF-8 大一截）。
 pub fn write_note(root: &Path, rel: &str, content: &str) -> Result<SaveResult, KiError> {
     write_note_checked(root, rel, content, None)
 }
@@ -103,11 +111,10 @@ pub fn write_note_checked(
     content: &str,
     expected_mtime: Option<i64>,
 ) -> Result<SaveResult, KiError> {
-    let bytes = content.as_bytes();
-    if bytes.len() as u64 > MAX_NOTE_BYTES {
+    if content.len() as u64 > MAX_NOTE_BYTES {
         return Err(KiError::TooLarge {
             path: rel.to_owned(),
-            size: bytes.len() as u64,
+            size: content.len() as u64,
         });
     }
 
@@ -129,7 +136,19 @@ pub fn write_note_checked(
         }
     }
 
-    atomic_replace(&target, bytes).map_err(|e| KiError::io(rel, &e))?;
+    // 冲突检查之后才探测编码：这中间文件已经不会变（我们拿着 mtime 的
+    // 承诺），探测到的就是「用户打开时看到的那一版」的编码。
+    let encoding = existing_encoding(&target, rel)?;
+    let bytes = encoding::encode(content, encoding).map_err(|err| encode_error(rel, err))?;
+
+    if bytes.len() as u64 > MAX_NOTE_BYTES {
+        return Err(KiError::TooLarge {
+            path: rel.to_owned(),
+            size: bytes.len() as u64,
+        });
+    }
+
+    atomic_replace(&target, &bytes).map_err(|e| KiError::io(rel, &e))?;
 
     // 回执取磁盘真值，不拿入参长度充数——编码或换行被改写时这里会立刻不符。
     let meta = std::fs::metadata(&target).map_err(|e| KiError::io(rel, &e))?;
@@ -140,6 +159,87 @@ pub fn write_note_checked(
         size,
         mtime,
     })
+}
+
+/// 磁盘上这篇现在是什么编码。
+///
+/// 文件不存在 = 新建 = UTF-8（不带 BOM）。
+///
+/// # 为什么要读一遍整个文件
+///
+/// 编码探测要看正文（BOM 与 NUL 模式在头几字节，但「往返是否无损」要看全篇）。
+/// 这次读是保存路径上唯一多出来的 IO，代价与随后的写同量级——自动保存
+/// 有 1.5 秒节流，这点开销换「不偷偷改用户的编码」是划算的。
+///
+/// # 两条拒绝
+///
+/// - 认不出编码的现有文件：读都读不出来，写回去只会把它变成 UTF-8。
+/// - 往返不无损的现有文件：`decode → encode` 不等于原字节，写回去就是在
+///   改用户的字节（Big5 的重复映射会踩到），§3 说这种时候只许只读。
+fn existing_encoding(target: &Path, rel: &str) -> Result<Encoding, KiError> {
+    let meta = match std::fs::metadata(target) {
+        Ok(meta) => meta,
+        // 新建。`resolve_for_write` 已经确认父目录存在且路径在库内。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Encoding::Utf8),
+        Err(err) => return Err(KiError::io(rel, &err)),
+    };
+    if !meta.is_file() {
+        return Err(KiError::NotAFile {
+            path: rel.to_owned(),
+        });
+    }
+    if meta.len() > MAX_NOTE_BYTES {
+        return Err(KiError::TooLarge {
+            path: rel.to_owned(),
+            size: meta.len(),
+        });
+    }
+
+    let existing = std::fs::read(target).map_err(|e| KiError::io(rel, &e))?;
+    let Some(encoding) = encoding::detect(&existing) else {
+        return Err(KiError::EncodingNotWritable {
+            path: rel.to_owned(),
+            encoding: "未知编码".to_owned(),
+            reason: "磁盘上这一篇的编码认不出来，写回去会把它变成 UTF-8".to_owned(),
+        });
+    };
+
+    // UTF-8 两种形态由构造保证无损，不必再跑一遍编解码。
+    if !encoding.is_utf8() && !encoding::is_lossless(&existing, encoding) {
+        return Err(KiError::EncodingNotWritable {
+            path: rel.to_owned(),
+            encoding: encoding.label().to_owned(),
+            reason: "原文件的字节在该编码下无法无损回写（存在重复映射），保存会改掉它的字节"
+                .to_owned(),
+        });
+    }
+
+    Ok(encoding)
+}
+
+/// 把编码失败翻成可读的错误。磁盘此刻一个字节都没动。
+fn encode_error(rel: &str, err: EncodeError) -> KiError {
+    match err {
+        EncodeError::Unmappable { encoding, ch } => KiError::EncodingNotWritable {
+            path: rel.to_owned(),
+            encoding: encoding.label().to_owned(),
+            reason: match ch {
+                Some(ch) => format!(
+                    "正文里有 {} 表示不了的字符：{ch}。删掉它再保存。",
+                    encoding.label()
+                ),
+                None => format!(
+                    "正文里有 {} 表示不了的字符。删掉它再保存。",
+                    encoding.label()
+                ),
+            },
+        },
+        EncodeError::NotRoundTrippable { encoding } => KiError::EncodingNotWritable {
+            path: rel.to_owned(),
+            encoding: encoding.label().to_owned(),
+            reason: "正文按这个编码写出去再读回来会变样，已阻止保存".to_owned(),
+        },
+    }
 }
 
 /// 把 `bytes` 原子地替换到 `target`：`tmp → fsync → rename`。

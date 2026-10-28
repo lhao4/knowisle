@@ -60,7 +60,11 @@ pub struct SkippedNote {
 pub enum SkipReason {
     /// 超过单篇索引上限（2MB）。
     TooLarge,
-    /// 不是合法 UTF-8。
+    /// 认不出编码：BOM、NUL 模式、严格 UTF-8、探测四道都过了还是解不出来。
+    ///
+    /// 名字是历史包袱（第八刀之前它真的只表示「不是合法 UTF-8」）。没改，
+    /// 是因为这个串落进 `note.skip_reason` 列，改名等于给一张派生表加迁移——
+    /// 而这张表的处置动作只有「整库重建」一种，不值得为它开迁移。
     InvalidUtf8,
     /// 读取时 IO 失败。
     Io,

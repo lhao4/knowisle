@@ -358,15 +358,21 @@ fn read_note_strips_utf8_bom() {
     );
 }
 
+/// `FF FE` 是 UTF-16LE 的 BOM。M7 第八刀之前这条用例断言「非 UTF-8 必须
+/// 报错」；现在它断言**按 BOM 解出来是什么**——契约从「认不出就拒绝」
+/// 变成「认得出就解开」，这一行就是那次变更的落点。
+///
+/// 后面两字节 `00 41` 在 UTF-16LE 里是**低字节在前**，所以是 `U+4100`
+/// （`䄀`）而不是 `U+0041`。要 `A` 得写成 `41 00`——别照字面想当然。
 #[test]
-fn read_note_rejects_non_utf8() {
+fn read_note_decodes_utf16le_with_bom() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    // 0xFF 0xFE 是 UTF-16LE BOM 的开头，作为 UTF-8 非法
-    fs::write(root.join("gbk.md"), [0xFF, 0xFE, 0x00, 0x41]).unwrap();
+    fs::write(root.join("u16.md"), [0xFF, 0xFE, 0x00, 0x41]).unwrap();
 
-    let err = read_note(root, "gbk.md").expect_err("非 UTF-8 必须报错而不是 panic");
-    assert!(format!("{err:?}").contains("InvalidEncoding"));
+    let note = read_note(root, "u16.md").expect("带 BOM 的 UTF-16LE 必须能读");
+    assert_eq!(note.content, "\u{4100}");
+    assert_eq!(note.decoded_from.as_deref(), Some("UTF-16LE"));
 }
 
 #[test]

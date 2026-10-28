@@ -19,8 +19,14 @@
 //! 写入遵循公理 A5（`tmp → fsync → rename`），实现集中在 [`write`] 模块。
 //! 自动保存的**时机决策**在 [`autosave`]——但只有纯逻辑，线程与状态在 `ki-ipc`。
 //! 更高层的东西（历史快照、oplog）不在本 crate，它们属于 M1 之后。
+//!
+//! 编码（[`encoding`]）属于「读写」的一部分，不是独立的一层：它决定
+//! [`scan::read_note`] 读出来的正文是什么，也决定 [`write`] 写回去的字节是什么。
+//! 两者必须是同一份判定，否则会出现「读的时候按 GBK、写的时候按 UTF-8」——
+//! 那就是静默转码。
 
 pub mod autosave;
+pub mod encoding;
 pub mod fileops;
 pub mod naming;
 pub mod path;
@@ -30,6 +36,7 @@ pub mod trash;
 pub mod write;
 
 pub use autosave::{SaveThrottle, AUTOSAVE_INTERVAL};
+pub use encoding::{Decoded, EncodeError, Encoding, Undecodable};
 pub use fileops::{create_note, delete_note, rename_note};
 pub use naming::normalize_note_name;
 pub use path::{resolve_for_write, resolve_in_vault, to_posix, ResolvedVault};

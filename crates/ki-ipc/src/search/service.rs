@@ -598,6 +598,14 @@ fn prepare(
 ///
 /// 这样下次扫描看到同样的 size/mtime 就判"未变"，不会为一个 3MB 的文件
 /// 反复读盘。文件一旦被改动，size 或 mtime 必然变，届时自然会重试。
+///
+/// # 第三条复活路径
+///
+/// 前两条（文件被改、`refresh_path` 对当前打开的那篇重试）都不适用于
+/// 「一直没被碰过的 GBK 笔记」。它们靠的是 `TOKENIZER_VERSION` 变化触发
+/// 整库重建——第八刀就是这么让旧库里那批 `invalid_utf8` 的篇复活的。
+/// **跳过记录里没有版本字段**，所以只改解码逻辑而不 bump 版本，等于对
+/// 已经建过库的用户什么都没做。
 fn skipped_note(file: &FileRef, reason: SkipReason) -> SkippedNote {
     SkippedNote {
         path: file.path.clone(),

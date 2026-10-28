@@ -168,11 +168,15 @@ fn oversized_files_are_skipped_without_reading_and_not_retried() {
     assert_eq!((counts.ok, counts.skipped), (0, 1));
 }
 
-/// 非 UTF-8 文件只跳过并计数，不让整次同步失败。
+/// 认不出编码的文件只跳过并计数，不让整次同步失败。
 #[test]
-fn invalid_utf8_file_is_skipped_not_fatal() {
+fn undecodable_file_is_skipped_not_fatal() {
     let dir = vault();
-    fs::write(dir.path().join("gbk.md"), [0xB0, 0xA1, 0xB0, 0xA1]).expect("写非 UTF-8");
+    // `01 FF 02` 解出来只可能是控制字符：四道探测（BOM / NUL 模式 /
+    // 严格 UTF-8 / 猜）全过不去。
+    // （M7 第八刀之前这里放的是 GBK 字节 `B0 A1 B0 A1`——它现在解得开，
+    // 不再是「坏文件」，见下面那条用例。）
+    fs::write(dir.path().join("bad.md"), [0x01, 0xFF, 0x02]).expect("写认不出编码的文件");
     fs::write(dir.path().join("ok.md"), "alpha").expect("写正常文件");
 
     let stats = sync(dir.path());
@@ -181,6 +185,92 @@ fn invalid_utf8_file_is_skipped_not_fatal() {
 
     let counts = inspect(dir.path()).counts().expect("读计数");
     assert_eq!((counts.ok, counts.skipped), (1, 1));
+}
+
+/// GBK 笔记进得了索引，也搜得到——「看得见搜不到」那一半在这一刀被修掉。
+///
+/// 判据是 `total` 与 `hits` 都要对，且**两种编码各一篇对照**：只放一篇 GBK
+/// 的话，「搜到了」可能只是因为文件名撞上了查询词。
+#[test]
+fn gbk_note_is_indexed_and_searchable() {
+    let dir = vault();
+    // 「中文笔记」的 GBK 字节。
+    fs::write(
+        dir.path().join("gbk.md"),
+        [0xD6u8, 0xD0, 0xCE, 0xC4, 0xB1, 0xCA, 0xBC, 0xC7, 0x0A],
+    )
+    .expect("写 GBK 文件");
+    fs::write(dir.path().join("utf8.md"), "对照：中文笔记\n").expect("写 UTF-8 对照");
+
+    let stats = sync(dir.path());
+    assert_eq!(stats.inserted, 2, "两篇都该进索引");
+    assert_eq!(stats.skipped, 0, "GBK 不再是「跳过」");
+
+    let counts = inspect(dir.path()).counts().expect("读计数");
+    assert_eq!((counts.ok, counts.skipped), (2, 0));
+
+    let hits = ki_ipc::search::service::search(dir.path(), "中文笔记", None).expect("搜索");
+    assert_eq!(hits.total, 2, "GBK 那篇的正文子串必须命中");
+    let paths: Vec<&str> = hits.hits.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(paths.contains(&"gbk.md"), "实际命中：{paths:?}");
+    assert!(paths.contains(&"utf8.md"), "实际命中：{paths:?}");
+}
+
+/// 版本不符 → 整库重建 → 上一篇被跳过的笔记复活。
+///
+/// 这是「被跳过的篇不会自己复活」那条病的解药：跳过记录用扫描时的
+/// size/mtime 落库，文件没动就永远判「未变」。只有 `TOKENIZER_VERSION`
+/// 变了才会整库重来，那篇才会被重新读一次。
+///
+/// 用例把 `meta.tokenizer_version` 改回上一版来模拟「旧库」——不能靠
+/// 编译期常量，那个值在本进程里是固定的。
+#[test]
+fn a_skipped_note_revives_after_a_version_bump() {
+    let dir = vault();
+    let gbk = [0xD6u8, 0xD0, 0xCE, 0xC4, 0xB1, 0xCA, 0xBC, 0xC7, 0x0A];
+    fs::write(dir.path().join("gbk.md"), gbk).expect("写 GBK 文件");
+    sync(dir.path());
+
+    // 手工把库改回「旧版本 + 这篇是跳过的」。
+    //
+    // 注意不能用 `inspect()` 验前置状态：`IndexDb::open` 一看到版本不符就会
+    // **当场整库重建**，把刚做出来的旧库抹掉。所以下面用裸连接读。
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(".knowisle/index.sqlite"))
+            .expect("打开索引库");
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'tokenizer_version'",
+            ["bigram-v2/ascii-proj-v2"],
+        )
+        .expect("改版本");
+        conn.execute(
+            "UPDATE note SET status = 'skipped', skip_reason = 'invalid_utf8' WHERE path = 'gbk.md'",
+            [],
+        )
+        .expect("改成跳过");
+
+        let skipped: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM note WHERE status = 'skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("读计数");
+        assert_eq!(skipped, 1, "前置状态：这篇在旧库里是跳过的");
+    }
+
+    // 再同步一次：版本不符 → 整库重建 → 全量重读。
+    let stats = sync(dir.path());
+    assert_eq!(stats.inserted, 1, "重建之后这篇是「新插入」");
+    assert_eq!(
+        inspect(dir.path()).counts().expect("读计数"),
+        ki_store::Counts { ok: 1, skipped: 0 },
+        "重建之后它必须是 ok"
+    );
+
+    let hits = ki_ipc::search::service::search(dir.path(), "中文笔记", None).expect("搜索");
+    assert_eq!(hits.total, 1);
+    assert_eq!(hits.hits[0].path, "gbk.md");
 }
 
 /// 两个 Vault 不能串味：切库时缓存的连接必须被释放。

@@ -18,6 +18,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use ki_core::{FileNode, KiError, NoteContent, ScanResult};
 
+use crate::encoding;
 use crate::path::{to_posix, ResolvedVault};
 
 /// 目录级忽略名单：命中即**不再下降**。
@@ -319,21 +320,23 @@ pub fn read_note_in(vault: &ResolvedVault, rel: &str) -> Result<NoteContent, KiE
     file.read_to_end(&mut bytes)
         .map_err(|e| KiError::io(rel, &e))?;
 
-    let content = String::from_utf8(bytes).map_err(|_| KiError::InvalidEncoding {
+    // 编码探测与解码都在 [`crate::encoding`] 里：BOM → NUL 模式 → 严格
+    // UTF-8 → 猜。**不要把 `String::from_utf8` 搬回这里**——无 BOM 的
+    // UTF-16LE 纯 ASCII 是合法 UTF-8，在探测之前做严格 UTF-8 会把它静默
+    // 读成一串带 NUL 的乱码。
+    //
+    // BOM 也在那里剥（UTF-8 的、UTF-16 的、UTF-32 的）：Windows 记事本
+    // 保存 UTF-8 时会写 BOM，不去掉的话第一个 `# 标题` 前面多了个不可见字符，
+    // 大纲解析与"首个标题"逻辑会同时失效。
+    let decoded = encoding::decode(bytes).map_err(|_| KiError::InvalidEncoding {
         path: rel.to_owned(),
     })?;
-
-    // Windows 记事本保存 UTF-8 时会写 BOM。不去掉的话，第一个 `# 标题`
-    // 前面多了个不可见字符，大纲解析与"首个标题"逻辑会同时失效。
-    let content = match content.strip_prefix('\u{feff}') {
-        Some(stripped) => stripped.to_owned(),
-        None => content,
-    };
 
     let (size, mtime) = stat(Some(meta));
     Ok(NoteContent {
         path: rel.to_owned(),
-        content,
+        decoded_from: decoded.transcoded_from().map(str::to_owned),
+        content: decoded.text,
         size,
         mtime,
     })

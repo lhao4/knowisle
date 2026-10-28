@@ -658,6 +658,23 @@ body {
   color: var(--ki-text-faint);
 }
 
+/*
+ * 「已按 GBK 解码」。
+ *
+ * 用 warn 色而不是 danger：文件没坏，只是它不是 UTF-8——红色会让人以为
+ * 数据出了问题。也刻意不做成可关闭的：它描述的是这篇笔记当前的**事实**，
+ * 关掉之后用户下次打开还是同一篇 GBK 笔记。
+ */
+.viewer__encoding {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 24px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+  background: var(--ki-bg-warn-soft);
+  color: var(--ki-warn);
+  font-size: 12px;
+}
+
 /* ───────────────────────── 编辑器（CodeMirror 6） ───────────────────────── */
 
 /*

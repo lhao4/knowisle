@@ -859,6 +859,23 @@ export default function App() {
                   <span className="viewer__meta">{saveLabel}</span>
                 </header>
 
+                {/*
+                 * 「已按 GBK 解码」——只有真的转码了才出现。
+                 *
+                 * 这一行不是装饰：用户看到乱码时第一反应是文件坏了，而这条
+                 * 提示说明「文件是好的，只是它的编码不是 UTF-8」。带 BOM 的
+                 * UTF-8 不会走到这里（`decodedFrom` 为 null），因为它压根不算
+                 * 转码，提示只会制造困惑。
+                 *
+                 * 保存不受它影响：写回哪个编码由 Rust 在写盘前重新探测磁盘，
+                 * 前端说了不算。
+                 */}
+                {activeNote.decodedFrom !== null && (
+                  <p className="viewer__encoding" role="status">
+                    已按 {activeNote.decodedFrom} 解码
+                  </p>
+                )}
+
                 <NoteEditor
                   ref={editorRef}
                   root={vault.root}

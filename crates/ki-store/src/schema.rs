@@ -31,6 +31,7 @@ pub const SCHEMA_VERSION: i32 = 1;
 /// | `bigram-v1/ascii-proj-v1` | 初始：CJK 重叠 bigram + 跨脚本边界 bigram |
 /// | `bigram-v2/ascii-proj-v1` | 每个 CJK run 多一个**末字符的单字 token**（覆盖 token）。单字查询从全扫改成 `"c"*` 前缀通道。老库必须整库重建：v1 的库里没有单字 token，单字查询会**静默搜不到** |
 /// | `bigram-v2/ascii-proj-v2` | 通道 A 多一张**词内 bigram** 表（`note_fts_ascii_bi`），`us` 这类词中子串从全扫/漏召回变成 `"us"` 精确命中。投影规则本身没变，但**通道 A 的索引内容**变了，所以照样整库重建 |
+/// | `bigram-v2/ascii-proj-v3` | 读取侧开始按 BOM / NUL 模式 / 探测解码 GBK、UTF-16、Big5 等编码。切分规则一个字没改，但**喂给分词器的正文变了**（原本被跳过的 GBK 篇现在进得来，正文从「无」变成了真的字），所以库里存着的 token 不再等于「当前规则算出来的 token」。代价：`bm25` 的 `df` 会变——原本被跳过的篇开始贡献词频，同一批查询的排序可能与旧库不同。那是修复，不是回归 |
 ///
 /// # 为什么没有独立的 `ASCII_INDEX_VERSION`
 ///
@@ -38,7 +39,7 @@ pub const SCHEMA_VERSION: i32 = 1;
 /// 算出来的」。处置动作也完全相同：整库重建。拆成两个 key 只会让
 /// [`crate::db::inspect`] 多一次比较、多一条「一个版本对了另一个没对」的
 /// 中间态，而没有任何动作会因此不同。
-pub const TOKENIZER_VERSION: &str = "bigram-v2/ascii-proj-v2";
+pub const TOKENIZER_VERSION: &str = "bigram-v2/ascii-proj-v3";
 
 /// 索引库文件名（放在 `<vault>/.knowisle/` 下）。
 pub const DB_FILE: &str = "index.sqlite";

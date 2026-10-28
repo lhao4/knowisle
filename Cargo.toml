@@ -27,6 +27,18 @@ thiserror = "2"
 walkdir = "2.5"
 dunce = "1"
 
+# ---- 编码 ----
+# 解码 GBK / GB18030 / Big5 / windows-1252 与 UTF-16。选它而不是 `iconv`：
+# 它是 WHATWG Encoding Standard 的参考实现（浏览器用什么它就用什么），纯 Rust，
+# 且提供 `decode_without_bom_handling_and_without_replacement` —— 后者是本刀
+# 「不许 from_utf8_lossy 兜底」这条红线的落点：要么完整解出来，要么返回 None。
+encoding_rs = "0.8"
+# 严格 UTF-8 失败之后猜一次。**只在这条分支上跑**，所以 10k 篇 UTF-8 建库
+# 一次都不会进它（ADR-007「10k 建库 +0%」的实测见 §0.5③）。
+# 选它而不是「一律按 GB18030 解」：实测 Big5 与 windows-1252 在 GB18030 下
+# 要么解成乱码、要么直接失败，而 chardetng 两样都猜对。
+chardetng = "0.1"
+
 # ---- SQLite ----
 # `bundled` 会**顺带**开 FTS5：libsqlite3-sys 的 bundled 构建脚本里写死了
 # `-DSQLITE_ENABLE_FTS5`，不需要额外 feature（也没有单独的 `fts5` feature）。

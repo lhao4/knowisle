@@ -216,8 +216,9 @@ fn file_name_hits_rank_before_content_hits() {
 fn bad_files_are_skipped_without_failing_the_whole_index() {
     let dir = vault(&[("good.md", "可以搜到\n")]);
 
-    // 非 UTF-8（GBK 的「中文」是 D6 D0 CE C4）。
-    fs::write(dir.path().join("gbk.md"), [0xD6u8, 0xD0, 0xCE, 0xC4]).expect("写 GBK 文件失败");
+    // 认不出编码：`01 FF 02` 解出来只可能是控制字符，四道探测全过不去。
+    // （M7 第八刀之前这里放的是 GBK 字节——它现在解得开了，不再是「坏文件」。）
+    fs::write(dir.path().join("bad.md"), [0x01u8, 0xFF, 0x02]).expect("写坏文件失败");
     // 超过索引上限。内容全是 'x'，不含关键词，但必须计入 skipped。
     let huge = "x".repeat(MAX_INDEX_BYTES as usize + 1);
     fs::write(dir.path().join("huge.md"), huge).expect("写超大文件失败");
@@ -228,6 +229,30 @@ fn bad_files_are_skipped_without_failing_the_whole_index() {
     assert_eq!(result.skipped_files, 2);
     assert_eq!(result.total, 1);
     assert_eq!(result.hits[0].path, "good.md");
+}
+
+/// GBK 笔记现在进得了索引，也搜得到——M7 第八刀的核心行为变更。
+///
+/// 改动前它是 `skipped_files`，表现为「侧栏看得见、搜不到」。
+#[test]
+fn gbk_note_is_indexed_and_searchable() {
+    let dir = vault(&[("utf8.md", "对照：中文笔记\n")]);
+    // 「中文笔记」的 GBK 字节。
+    fs::write(
+        dir.path().join("gbk.md"),
+        [0xD6u8, 0xD0, 0xCE, 0xC4, 0xB1, 0xCA, 0xBC, 0xC7, 0x0A],
+    )
+    .expect("写 GBK 文件失败");
+
+    let mut index = SearchIndex::build(dir.path()).expect("建索引失败");
+    let result = index.search("中文笔记", None);
+
+    assert_eq!(result.indexed_files, 2, "两篇都该进索引");
+    assert_eq!(result.skipped_files, 0);
+    assert_eq!(result.total, 2, "GBK 那篇的正文子串必须命中");
+    let paths: Vec<&str> = result.hits.iter().map(|hit| hit.path.as_str()).collect();
+    assert!(paths.contains(&"gbk.md"), "实际命中：{paths:?}");
+    assert!(paths.contains(&"utf8.md"), "实际命中：{paths:?}");
 }
 
 #[test]

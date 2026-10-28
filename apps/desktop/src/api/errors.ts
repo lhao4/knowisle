@@ -66,7 +66,11 @@ export function describeError(error: unknown): string {
     case 'IO':
       return describeIo(error.detail)
     case 'INVALID_ENCODING':
-      return `文件不是合法的 UTF-8：${error.detail.path}`
+      return `认不出这篇笔记的编码：${error.detail.path}\n它可能不是文本文件，或者用了一种很少见的编码。`
+    case 'ENCODING_NOT_WRITABLE':
+      // 关键信息是「磁盘没动」——用户最怕的是「点了保存、文件被我搞坏了」。
+      // `reason` 由 Rust 给出（哪个字符装不下 / 为什么不能回写），前端不重算。
+      return `无法按 ${error.detail.encoding} 保存：${error.detail.path}\n${error.detail.reason}\n磁盘上的文件没有被改动。`
     case 'INVALID_NAME':
       // 理由由 Rust 给出（"请用半角"这类可执行的话）。前端不再拼一遍，
       // 否则规则一旦增删，两处文案就会各说各的。

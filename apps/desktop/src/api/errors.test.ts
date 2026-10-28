@@ -7,11 +7,11 @@ import { describeError, isKiError } from './errors'
  * `errors.ts` 的行为契约。
  *
  * 穷尽性本身由 `const _exhaustive: never` 兜住——这里要验的是**另一件事**：
- * 12 个变体是不是真的给出了 12 种不同的下一步。文案重复不会编译失败，
+ * 13 个变体是不是真的给出了 13 种不同的下一步。文案重复不会编译失败，
  * 只会让用户在两种完全不同的故障前看到同一句话。
  */
 
-/** 12 个变体各一份样本。`KiError` 的判别联合由 tsc 校验，写错一个字段就编不过。 */
+/** 13 个变体各一份样本。`KiError` 的判别联合由 tsc 校验，写错一个字段就编不过。 */
 const SAMPLES: readonly { name: string; error: KiError; detail: string }[] = [
   { name: 'NOT_A_DIRECTORY', error: { code: 'NOT_A_DIRECTORY', detail: { path: 'notes' } }, detail: 'notes' },
   {
@@ -41,6 +41,18 @@ const SAMPLES: readonly { name: string; error: KiError; detail: string }[] = [
     name: 'INVALID_ENCODING',
     error: { code: 'INVALID_ENCODING', detail: { path: 'gbk.md' } },
     detail: 'gbk.md',
+  },
+  {
+    name: 'ENCODING_NOT_WRITABLE',
+    error: {
+      code: 'ENCODING_NOT_WRITABLE',
+      detail: {
+        path: 'gbk.md',
+        encoding: 'GBK',
+        reason: '正文里有 GBK 表示不了的字符：😀。删掉它再保存。',
+      },
+    },
+    detail: '😀',
   },
   {
     name: 'INVALID_NAME',
@@ -105,8 +117,8 @@ describe('isKiError', () => {
   })
 })
 
-describe('describeError · KiError 的 12 个变体', () => {
-  it('12 个变体映射到 12 种互不相同的文案', () => {
+describe('describeError · KiError 的 13 个变体', () => {
+  it('13 个变体映射到 13 种互不相同的文案', () => {
     const texts = SAMPLES.map((sample) => describeError(sample.error))
     expect(new Set(texts).size).toBe(SAMPLES.length)
   })
