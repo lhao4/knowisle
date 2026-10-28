@@ -44,6 +44,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::PoisonError;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,8 +54,9 @@ use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
 };
 use ki_vault::{
-    flatten_files, name_lower_for_path, read_note, read_note_in, scan_vault, FileRef, NoteLocator,
-    QueryNeedles, ResolvedVault, ScanOptions, MAX_HITS, MAX_HITS_PER_FILE, MAX_INDEX_BYTES,
+    flatten_files, name_lower_for_path, read_note, read_note_in, scan_vault, FileRef, Located,
+    NoteLocator, QueryNeedles, ResolvedVault, ScanOptions, MAX_HITS, MAX_HITS_PER_FILE,
+    MAX_INDEX_BYTES,
 };
 
 use super::cache::{
@@ -355,6 +357,7 @@ impl Beacon<'_> {
 /// 卡时间窗在 Linux 上会假绿（1000 篇建库只有几十毫秒），在慢机器上会假红。
 #[doc(hidden)]
 pub mod hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// 每批写库之后做什么：参数是**已提交的批数**（从 1 开始），
@@ -363,6 +366,28 @@ pub mod hooks {
 
     /// 已安装的钩子。`None` 是生产环境的常态。
     pub static AFTER_BATCH: Mutex<Option<AfterBatch>> = Mutex::new(None);
+
+    /// 定位线程数的覆盖。`0` = 按机器自动（`available_parallelism` 钳到 8）。
+    ///
+    /// 只给测试与基准用：验收要求「同一份 pool 在 1/2/4/8 线程下 `hits` 逐元素
+    /// 相同」，而线程数若只由 `available_parallelism()` 决定，这条用例在 8 核
+    /// 机器上永远只测得到一种取值。
+    ///
+    /// 它**不是**用户配置：不持久化、不走 IPC、不进 `bindings.ts`。
+    pub static LOCATE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+    /// 写 [`LOCATE_THREADS`]。`0` 恢复自动。
+    pub fn set_locate_threads(threads: usize) {
+        LOCATE_THREADS.store(threads, Ordering::Relaxed);
+    }
+
+    /// 当前配置下，这个长度的 pool 会用几个线程。
+    ///
+    /// 对拍用例必须能断言「覆盖真的生效了」，否则一个没接上的钩子会让
+    /// 「1/2/4/8 线程下结果相同」变成一句废话——四次跑的都是同一条串行路径。
+    pub fn locate_threads_for_test(pool_len: usize) -> usize {
+        super::locate_threads(pool_len)
+    }
 }
 
 /// 调一次测试钩子。生产环境没有钩子，只多一次空锁（每次同步几十次）。
@@ -780,11 +805,84 @@ fn pool_plan(candidates: usize) -> (usize, bool) {
     }
 }
 
+/// 定位阶段的线程数上限。
+///
+/// # 为什么是 8
+///
+/// 并行读盘的收益在 8 线程已经基本吃完。本机探针（1000 篇 pool、release、
+/// 杀软实时保护开着、同一进程、5 次取中位数）得到 1/2/4/8/16 线程 =
+/// 1.00 / 2.02 / 2.97 / **3.27** / 3.97×：8→16 只多 0.7×，代价是双倍的
+/// 在途内存（每线程 ≤ 4 MB）与一倍的线程。ADR-007 的纯 open 微基准
+/// 同样是「8→16 已饱和」（2427 / 2259 / 2154 ms）。
+const MAX_LOCATE_THREADS: usize = 8;
+
+/// pool 短到这个数以内就串行。
+///
+/// 开线程的固定开销与「读 1–2 篇」是同一个量级。`00042` 那种单候选查询
+/// 改前是 5.32 ms，是搜索里最快的一条路径——并行化不许把它变慢。
+const MIN_PARALLEL_POOL: usize = 3;
+
+/// 一个 worker 的局部结果。
+///
+/// 每个线程攒自己的一份，最后**按 worker 序号**合并。跨线程只做 `usize` 的
+/// `+=` 与 `bool` 的 `|=`，不引入 `Mutex`，也不依赖「谁先完成」——顺序由
+/// [`finish`] 的全序排序决定。
+#[derive(Default)]
+struct LocatePart {
+    hits: Vec<SearchHit>,
+    lines: usize,
+    failed: bool,
+}
+
+/// 本次定位用几个线程。
+///
+/// 判据只有两条：pool 太短就串行（省建线程），否则按机器核数钳到
+/// [`MAX_LOCATE_THREADS`]。**不是用户配置**——唯一的覆盖入口是
+/// [`hooks::LOCATE_THREADS`]，只给测试与基准。
+fn locate_threads(pool_len: usize) -> usize {
+    if pool_len < MIN_PARALLEL_POOL {
+        return 1;
+    }
+    let forced = hooks::LOCATE_THREADS.load(Ordering::Relaxed);
+    let wanted = if forced > 0 {
+        forced
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    };
+    wanted.clamp(1, MAX_LOCATE_THREADS).min(pool_len)
+}
+
+/// 一篇的定位：读盘 → 构造定位器 → 找命中。`None` 表示这篇读不到。
+fn locate_one(root: &Path, path: &str, query: &QueryNeedles) -> Option<Located> {
+    let note = read_note(root, path).ok()?;
+    Some(NoteLocator::new(note.path, note.content).locate(query, MAX_HITS_PER_FILE))
+}
+
+/// 串行定位一整段。1 线程与短 pool 走这条。
+fn locate_serial(root: &Path, pool: &[String], query: &QueryNeedles) -> LocatePart {
+    let mut part = LocatePart::default();
+    for path in pool {
+        match locate_one(root, path, query) {
+            Some(located) => {
+                part.lines += located.lines;
+                part.hits.extend(located.hits);
+            }
+            // 读不到 ⇒ 少了一篇的命中 ⇒ `total` 只能是下界。
+            None => part.failed = true,
+        }
+    }
+    part
+}
+
 /// 对候选池逐篇定位，产出最终结果。
 ///
 /// 读不到的文件静默跳过：它可能在扫描与搜索之间被删掉了。**不要**因此把
 /// 整次搜索变成错误——一篇被删的笔记不该让用户搜不了整个库。但它确实让
 /// `total` 少算了一篇的命中，所以结果要降级成「下界」（`truncated = true`）。
+///
+/// 逐篇的那一步被抽成 [`locate_one`]、整段被抽成 [`locate_serial`]：并行的
+/// 版本要复用同一个「读一篇 → 定位 → 攒命中」单元，否则两条路的判定逻辑会
+/// 分叉。本提交只做这次抽取，行为逐字节不变。
 fn locate_all(
     root: &Path,
     pool: &[String],
@@ -792,21 +890,16 @@ fn locate_all(
     counts: Counts,
     pool_saturated: bool,
 ) -> SearchResult {
-    let mut hits: Vec<SearchHit> = Vec::new();
-    let mut total = 0usize;
-    let mut incomplete = pool_saturated;
+    let part = locate_serial(root, pool, query);
 
-    for path in pool {
-        let Ok(note) = read_note(root, path) else {
-            incomplete = true;
-            continue;
-        };
-        let located = NoteLocator::new(note.path, note.content).locate(query, MAX_HITS_PER_FILE);
-        total += located.lines;
-        hits.extend(located.hits);
-    }
-
-    finish(hits, total, counts, incomplete)
+    // 两条让 `total` 变成下界的路合成一个信号：池子被预算截断，或池里有篇
+    // 读不到。
+    finish(
+        part.hits,
+        part.lines,
+        counts,
+        pool_saturated || part.failed,
+    )
 }
 
 /// 排序、截断、填诊断字段。
