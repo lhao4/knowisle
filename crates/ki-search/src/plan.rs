@@ -12,16 +12,30 @@
 //! | 模式 | 何时 | 谁干活 |
 //! |---|---|---|
 //! | [`Mode::Empty`] | 空查询 / 含换行 | 直接返回空结果 |
-//! | [`Mode::FullScan`] | 单字、纯标点、emoji、只有孤立 CJK 单字 | 逐篇字面扫描 |
-//! | [`Mode::Cjk`] | 查询里有 ≥2 字的 CJK run | `note_fts_zh` |
+//! | [`Mode::FullScan`] | ASCII 单字、纯标点、emoji、含 CJK 但切不出 token | 逐篇字面扫描 |
+//! | [`Mode::Cjk`] | 查询里有 CJK 且切得出 token（**含单个 CJK 字**） | `note_fts_zh` |
 //! | [`Mode::Ascii`] | 查询里只有 ASCII 词 | `note_fts` |
 //!
 //! # 全扫不是兜底，是正确性要求
 //!
-//! 单字查询没有 bigram，纯 emoji 查询没有 token——这些情况索引**根本没有
-//! 可查的东西**。硬拿空表达式去 MATCH 会抛错（`MATCH ''` 是语法错误，
-//! `MATCH '""'` 才是空集），而返回空集又是错的（库里确实有 `的` 这个字）。
-//! 所以只有两条路：全扫，或者撒谎。选全扫。
+//! 索引里**根本没有可查的东西**时，硬拿空表达式去 MATCH 会抛错
+//! （`MATCH ''` 是语法错误，`MATCH '""'` 才是空集），而返回空集又是错的
+//! （库里确实有 `🙂` 这个字）。所以只有两条路：全扫，或者撒谎。选全扫。
+//!
+//! 今天还留在全扫这一列的只有三类：ASCII 单字（ASCII 投影是**词首对齐**的，
+//! `"a"*` 查不到 `Rust` 里的 `a`）、纯 emoji / 纯标点（没有 token）、
+//! 以及 `🙂的` / `A 的` 这种「有 CJK 但切不出 token」的查询。
+//!
+//! # CJK 单字为什么能走索引
+//!
+//! 它以前也在全扫那一列：没有 bigram，索引里查不到。但索引侧给每个 CJK run
+//! 补了末字符的单字 token（见 [`crate::bigram::index_tokens`]），于是
+//! 「字出现在正文任何位置 ⇒ 至少有一个以它开头的 token」成立，`"记"*`
+//! 就是一条合法的 FTS5 前缀查询。
+//!
+//! **单字不是一种新的查询类型**：它产出的仍是 `Mode::Cjk` + 一个表达式，
+//! 下游的 `indexed_search` 一行都不用改。多一条分支就多一处会与主路分叉的
+//! 地方，而分叉的那一条永远是最少被跑到的。
 
 use crate::{ascii, bigram};
 
@@ -34,7 +48,7 @@ pub enum Mode {
     FullScan,
     /// 通道 A：ASCII 词的前缀匹配。
     Ascii,
-    /// 通道 B：CJK bigram 的 AND。
+    /// 通道 B：CJK bigram 的 AND；单字查询是一条前缀（`"记"*`）。
     Cjk,
 }
 
@@ -89,9 +103,23 @@ pub fn plan(query: &str) -> Plan {
         return Plan::bare(Mode::Empty);
     }
 
-    // 3. 单字符。没有 bigram，索引里查不到；而全库找单个字符是有意义的
-    //    （`的`、`a`），所以走全扫而不是返回空。
+    // 3. 单字符。分两类：
+    //    - CJK 单字：索引里**有**以它开头的 token（run 内部 bigram 的首字，
+    //      以及每个 run 末字符的覆盖 token），所以 `"c"*` 是一条合法的前缀
+    //      查询，走索引而不是全扫。
+    //    - ASCII 单字 / 纯标点 / emoji：索引里查不到。ASCII 投影是**词首
+    //      对齐**的，`"a"*` 会漏掉 `Rust` 里的 `a`；emoji 根本没有 token。
+    //      全库找单个字符是有意义的（`🙂`），所以全扫而不是返回空。
     if needle.chars().count() == 1 {
+        let c = needle.chars().next().expect("上面刚判过非空");
+        if bigram::is_cjk(c) {
+            return Plan {
+                mode: Mode::Cjk,
+                // 星号必须在引号**外**：`"记"*` 是前缀，`"记*"` 是字面 token。
+                expr: format!("{}*", quote(&c.to_string())),
+                ascii_words: Vec::new(),
+            };
+        }
         return Plan::bare(Mode::FullScan);
     }
 
@@ -194,11 +222,36 @@ mod tests {
         assert_eq!(plan("\nrust\n").mode, Mode::Ascii);
     }
 
+    /// CJK 单字走前缀通道：`"c"*`，模式仍是 `Cjk`（不是新查询类型）。
+    ///
+    /// 这条的依据在索引侧：`index_tokens` 给每个 run 补了末字符的单字 token，
+    /// 所以「字出现在正文任何位置」都能被前缀查到。见
+    /// `bigram::every_cjk_char_has_a_token_starting_with_it`。
     #[test]
-    fn single_char_goes_full_scan() {
-        assert_eq!(plan("的").mode, Mode::FullScan);
-        assert_eq!(plan("a").mode, Mode::FullScan);
-        assert_eq!(plan("🙂").mode, Mode::FullScan);
+    fn single_cjk_char_uses_the_prefix_channel() {
+        for (query, expr) in [
+            ("的", r#""的"*"#),
+            ("记", r#""记"*"#),
+            ("屿", r#""屿"*"#),
+            // 假名、谚文也在 `is_cjk` 里，走同一条路。
+            ("あ", r#""あ"*"#),
+            ("한", r#""한"*"#),
+        ] {
+            let p = plan(query);
+            assert_eq!(p.mode, Mode::Cjk, "{query:?}");
+            assert_eq!(p.expr, expr, "{query:?}");
+            assert!(p.needs_match(), "{query:?}");
+        }
+    }
+
+    /// ASCII 单字、纯标点、emoji 仍然全扫——索引里没有它们的 token。
+    #[test]
+    fn single_ascii_punctuation_and_emoji_still_full_scan() {
+        for query in ["a", "Z", "1", "🙂", "，", "—"] {
+            let p = plan(query);
+            assert_eq!(p.mode, Mode::FullScan, "{query:?}");
+            assert!(!p.needs_match(), "{query:?}");
+        }
     }
 
     #[test]
@@ -302,7 +355,7 @@ mod tests {
     /// 全扫与空计划都不带表达式——调用方靠 `mode` 分流，不该去读 `expr`。
     #[test]
     fn non_match_modes_have_empty_expr() {
-        for q in ["", "的", "🙂🙂"] {
+        for q in ["", "a", "🙂🙂", "🙂的"] {
             let p = plan(q);
             assert!(p.expr.is_empty(), "{q:?}");
             assert!(!p.needs_match());

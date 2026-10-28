@@ -23,7 +23,14 @@ pub const SCHEMA_VERSION: i32 = 1;
 ///
 /// 改动 [`crate::db::IndexDb`] 用到的任何切分/投影规则时必须同步改这个串，
 /// 否则老库会带着旧 token 继续被查询，表现为「搜不到刚写的词」。
-pub const TOKENIZER_VERSION: &str = "bigram-v1/ascii-proj-v1";
+///
+/// # 版本史
+///
+/// | 串 | 改了什么 |
+/// |---|---|
+/// | `bigram-v1/ascii-proj-v1` | 初始：CJK 重叠 bigram + 跨脚本边界 bigram |
+/// | `bigram-v2/ascii-proj-v1` | 每个 CJK run 多一个**末字符的单字 token**（覆盖 token）。单字查询从全扫改成 `"c"*` 前缀通道。老库必须整库重建：v1 的库里没有单字 token，单字查询会**静默搜不到** |
+pub const TOKENIZER_VERSION: &str = "bigram-v2/ascii-proj-v1";
 
 /// 索引库文件名（放在 `<vault>/.knowisle/` 下）。
 pub const DB_FILE: &str = "index.sqlite";

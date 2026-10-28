@@ -712,9 +712,14 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
 
     let mut result = match qplan.mode {
         Mode::Empty => finish(Vec::new(), 0, counts, false),
-        // 全扫：索引里没有可查的 token（单字、纯 emoji、孤立 CJK 单字），
-        // 只能把已索引的笔记全部过一遍定位器。代价与旧引擎建索引时读一遍全库
-        // 相当——不存正文就必须重新读，这是 contentless 的必然结果。
+        // 全扫：索引里没有可查的 token（ASCII 单字、纯 emoji、纯标点、
+        // `🙂的` 这种切不出 token 的查询），只能把已索引的笔记全部过一遍
+        // 定位器。代价与旧引擎建索引时读一遍全库相当——不存正文就必须重新读，
+        // 这是 contentless 的必然结果。
+        //
+        // **CJK 单字不在这条路上了**（M7 第六刀）：索引侧有覆盖 token，
+        // `"记"*` 走 `indexed_search`。10k 库上它从 4.4 s 落到几十毫秒，
+        // 而这里剩下的几种查询在真实输入里是边角。
         Mode::FullScan => {
             let pool: Vec<String> = db
                 .ok_candidates()?
@@ -747,6 +752,13 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
 /// 旧实现把「通道取满 200 条」当成饱和判据，于是「命中 1000 篇」与
 /// 「命中 200 篇」在池子里长得一模一样，`total` 报 200 而全库是 1000
 /// ——UI 说「至少 200 条」，用户以为只有 200 条。
+///
+/// # 单字也走这里，没有第二条分支
+///
+/// `plan()` 对 CJK 单字产出的是 `Mode::Cjk` + `"记"*`，与本函数处理多字
+/// 查询的路径逐行相同。因此单字的精度**恰好**是池子预算的精度：候选
+/// ≤1200 时 `total` 是准确值，>1200 时截到 200 篇、`truncated = true`。
+/// 后者是本刀唯一允许的契约变更（见 [`ki_core::SearchResult::total`]）。
 fn indexed_search(
     db: &IndexDb,
     root: &Path,
@@ -965,6 +977,9 @@ fn locate_parallel(
 /// `Mode::FullScan` 与 `indexed_search` 都走这里，不写两份：前者的 pool 是
 /// 全库（10k 篇），后者最多 1200 篇。并行对前者的收益最大（16.6 s → 4.4 s），
 /// 而跨步 worker 保证它不会把 10k 篇正文一次性读进内存。
+///
+/// M7 第六刀之后全扫只剩 ASCII 单字 / emoji / 纯标点这几种，10k 库上仍然
+/// 是 4.4 s 那一档——**这是刻意的**：它们的索引里确实没有可查的 token。
 fn locate_all(
     root: &Path,
     pool: &[String],

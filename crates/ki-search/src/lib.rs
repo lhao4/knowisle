@@ -3,7 +3,9 @@
 //! 这个 crate 里**没有一行 IO**：不读文件、不连数据库、不看 Vault。它只回答
 //! 三个问题——
 //!
-//! 1. 一段正文该被切成哪些 token（[`bigram`]、[`ascii`]）；
+//! 1. 一段正文该被切成哪些 token（[`bigram`]、[`ascii`]）；注意**查询侧与
+//!    索引侧不是同一份 token**——索引侧多一组覆盖 token，让单字查询也能走
+//!    前缀通道（见 [`bigram::index_tokens`]）；
 //! 2. 一个查询该被翻成什么样的 FTS5 表达式、或者干脆走全扫（[`plan`]）；
 //! 3. 多路候选该怎么合并成一条有序列表（[`rrf`]）。
 //!
@@ -29,6 +31,6 @@ pub mod plan;
 pub mod rrf;
 
 pub use ascii::project;
-pub use bigram::{is_cjk, token_stream, tokens};
+pub use bigram::{index_tokens, is_cjk, token_stream, tokens};
 pub use plan::{plan, Mode, Plan};
 pub use rrf::{fuse, Fused, RRF_K};
