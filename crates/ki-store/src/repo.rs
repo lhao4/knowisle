@@ -26,8 +26,8 @@ use crate::schema::meta_key;
 
 /// 一篇成功索引的笔记要写库的东西。
 ///
-/// `body_ascii` / `body_tokens` 是**派生数据**（从正文算出来的 token 流），
-/// 不是原文副本：原文永远只在磁盘上（公理 A1）。
+/// `body_ascii` / `body_bigram` / `body_tokens` 是**派生数据**（从正文算出来的
+/// token 流），不是原文副本：原文永远只在磁盘上（公理 A1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedNote {
     /// Vault 相对路径（POSIX）。
@@ -38,6 +38,8 @@ pub struct IndexedNote {
     pub mtime: i64,
     /// 通道 A：ASCII 投影后的文本。
     pub body_ascii: String,
+    /// 通道 A'：ASCII 投影的**词内 bigram**（`rust` → `ru us st`）。
+    pub body_bigram: String,
     /// 通道 B：中文 bigram，空格连接。
     pub body_tokens: String,
 }
@@ -165,8 +167,8 @@ impl IndexDb {
 
     /// 写入（或覆盖）一篇成功索引的笔记，返回它的 rowid。
     ///
-    /// 两张 FTS 表都是 contentless：**不能 UPDATE**，内容变了只能删了重插。
-    /// 这也是为什么这里是一个事务而不是三条独立语句——中间崩掉会留下
+    /// 三张 FTS 表都是 contentless：**不能 UPDATE**，内容变了只能删了重插。
+    /// 这也是为什么这里是一个事务而不是四条独立语句——中间崩掉会留下
     /// 「note 有了、FTS 没有」的行，那正是体检里 [`RowCountMismatch`] 要抓的
     /// 状态，虽然能自愈，但不该由我们主动制造。
     ///
@@ -276,12 +278,21 @@ impl IndexDb {
         inner(self.conn()).map_err(|e| index_err(self.path(), &e))
     }
 
-    /// 通道 A（ASCII 投影）查询。`expr` 必须是**已经拼好的 FTS5 表达式**，
-    /// 语法由 `ki-search::plan` 负责生成。
+    /// 通道 A（ASCII 投影）查询：**词首前缀**语义。`expr` 必须是**已经拼好的
+    /// FTS5 表达式**，语法由 `ki-search::plan` 负责生成。
     ///
     /// 空表达式直接返回空集：`MATCH ''` 会抛 `fts5: syntax error`。
     pub fn match_ascii(&self, expr: &str, limit: usize) -> Result<Vec<Candidate>, KiError> {
         self.match_fts("note_fts", expr, limit)
+    }
+
+    /// 通道 A'（ASCII 词内 bigram）查询：**子串**语义。
+    ///
+    /// `expr` 是若干 bigram 的 AND（`"us"`、`"ru" AND "us" AND "st"`）。
+    /// 候选是「字面子串命中」的超集——|Q| ≥ 3 时可能多出「bigram 都在、
+    /// 但原串不在」的篇，由 `NoteLocator` 过滤。|Q| = 2 时二者相等。
+    pub fn match_ascii_infix(&self, expr: &str, limit: usize) -> Result<Vec<Candidate>, KiError> {
+        self.match_fts("note_fts_ascii_bi", expr, limit)
     }
 
     /// 通道 B（中文 bigram）查询。
@@ -299,7 +310,7 @@ impl IndexDb {
             expr: &str,
             limit: usize,
         ) -> rusqlite::Result<Vec<Candidate>> {
-            // `table` 只可能是本文件里写死的两个常量。**绝不允许**把它换成参数：
+            // `table` 只可能是本文件里写死的三个常量。**绝不允许**把它换成参数：
             // SQLite 的表名不能参数化，而这个 `format!` 是唯一能注入的位置。
             //
             // 另外注意这里用的是真表名而不是别名：FTS5 的 `MATCH` 与 `bm25()`
@@ -422,6 +433,7 @@ fn upsert_ok_sql(conn: &Connection, note: &IndexedNote, now: i64) -> rusqlite::R
                 params![id, note.name_lower, size_of(note.size), note.mtime, now],
             )?;
             conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
+            conn.execute("DELETE FROM note_fts_ascii_bi WHERE rowid = ?1", [id])?;
             conn.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
             id
         }
@@ -444,6 +456,10 @@ fn upsert_ok_sql(conn: &Connection, note: &IndexedNote, now: i64) -> rusqlite::R
     conn.execute(
         "INSERT INTO note_fts(rowid, body_ascii) VALUES(?1, ?2)",
         params![id, note.body_ascii],
+    )?;
+    conn.execute(
+        "INSERT INTO note_fts_ascii_bi(rowid, body_bigram) VALUES(?1, ?2)",
+        params![id, note.body_bigram],
     )?;
     conn.execute(
         "INSERT INTO note_fts_zh(rowid, body_tokens) VALUES(?1, ?2)",
@@ -475,6 +491,7 @@ fn upsert_skipped_sql(conn: &Connection, note: &SkippedNote, now: i64) -> rusqli
                 ],
             )?;
             conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
+            conn.execute("DELETE FROM note_fts_ascii_bi WHERE rowid = ?1", [id])?;
             conn.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
             id
         }
@@ -505,6 +522,7 @@ fn delete_by_path_sql(conn: &Connection, path: &str) -> rusqlite::Result<bool> {
         return Ok(false);
     };
     conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
+    conn.execute("DELETE FROM note_fts_ascii_bi WHERE rowid = ?1", [id])?;
     conn.execute("DELETE FROM note_fts_zh WHERE rowid = ?1", [id])?;
     conn.execute("DELETE FROM note WHERE id = ?1", [id])?;
     Ok(true)
@@ -551,7 +569,12 @@ mod tests {
         let (_dir, mut db) = opened_vault();
         let id = db
             .upsert_ok(
-                &indexed("notes/rust.md", "the rust book", "the ru us st bo oo ok"),
+                &indexed(
+                    "notes/rust.md",
+                    "the rust book",
+                    "th he ru us st bo oo ok",
+                    "the ru us st bo oo ok",
+                ),
                 NOW,
             )
             .expect("写入");
@@ -567,17 +590,88 @@ mod tests {
         assert_eq!(zh[0].path, "notes/rust.md");
     }
 
+    /// 通道 A'（词内 bigram）：`us` 命中 `rust` 的**中间**两个字符。
+    ///
+    /// 这条用例同时钉住两件事：新表真的被写进去了，且它与通道 A 的语义
+    /// 不同——`"us"*` 是「以 us 开头的词」，`"us"` 是「词里有 us 这个相邻对」。
+    #[test]
+    fn infix_channel_matches_inside_a_word() {
+        let (_dir, mut db) = opened_vault();
+        let id = db
+            .upsert_ok(
+                &indexed(
+                    "notes/rust.md",
+                    "the rust book",
+                    "th he ru us st bo oo ok",
+                    "",
+                ),
+                NOW,
+            )
+            .expect("写入");
+
+        let infix = db.match_ascii_infix("\"us\"", 10).expect("查子串");
+        assert_eq!(infix.len(), 1);
+        assert_eq!(infix[0].id, id);
+
+        assert!(
+            db.match_ascii("\"us\"*", 10).expect("查前缀").is_empty(),
+            "前缀通道本来就不该命中词中子串——两个通道必须真的是两张表"
+        );
+
+        // |Q| ≥ 3：bigram 的 AND。`ru`+`us`+`st` 都在。
+        assert_eq!(
+            db.match_ascii_infix("\"ru\" AND \"us\" AND \"st\"", 10)
+                .expect("查三个 bigram")
+                .len(),
+            1
+        );
+        // 缺一个 bigram 就不命中：这正是「不漏」的反面（多一个条件是收窄）。
+        assert!(db
+            .match_ascii_infix("\"ru\" AND \"zz\"", 10)
+            .expect("查不存在的 bigram")
+            .is_empty());
+    }
+
     /// 覆盖同一路径时必须把旧 token 删干净（contentless 表不能 UPDATE）。
     #[test]
     fn upsert_overwrites_old_tokens() {
         let (_dir, mut db) = opened_vault();
-        db.upsert_ok(&indexed("a.md", "alpha bravo", "al lp ph ha"), NOW)
-            .expect("首次写入");
-        db.upsert_ok(&indexed("a.md", "charlie delta", "ch ha ar"), NOW)
-            .expect("覆盖写入");
+        db.upsert_ok(
+            &indexed(
+                "a.md",
+                "alpha bravo",
+                "al lp ph ha br ra av vo",
+                "al lp ph ha",
+            ),
+            NOW,
+        )
+        .expect("首次写入");
+        db.upsert_ok(
+            &indexed(
+                "a.md",
+                "charlie delta",
+                "ch ha ar rl li ie de el lt ta",
+                "ch ha ar",
+            ),
+            NOW,
+        )
+        .expect("覆盖写入");
 
         assert!(db.match_ascii("\"alpha\"", 10).expect("查旧词").is_empty());
         assert_eq!(db.match_ascii("\"charlie\"", 10).expect("查新词").len(), 1);
+        // 通道 A' 同样要删干净，否则旧 bigram 会继续命中
+        assert!(
+            db.match_ascii_infix("\"al\"", 10)
+                .expect("查旧 bigram")
+                .is_empty(),
+            "覆盖写入之后旧的 bigram 必须消失"
+        );
+        assert_eq!(
+            db.match_ascii_infix("\"ch\"", 10)
+                .expect("查新 bigram")
+                .len(),
+            1
+        );
         // 同一个路径不能变成两行
         assert_eq!(db.load_state().expect("读状态").len(), 1);
     }
@@ -587,7 +681,7 @@ mod tests {
     #[test]
     fn upsert_skipped_drops_previous_tokens() {
         let (_dir, mut db) = opened_vault();
-        db.upsert_ok(&indexed("big.md", "alpha", "al lp"), NOW)
+        db.upsert_ok(&indexed("big.md", "alpha", "al lp ph ha", "al lp"), NOW)
             .expect("先成功索引");
 
         let skipped = SkippedNote {
@@ -603,19 +697,26 @@ mod tests {
             db.match_ascii("\"alpha\"", 10).expect("查旧词").is_empty(),
             "跳过之后不该还能搜到正文"
         );
+        assert!(
+            db.match_ascii_infix("\"al\"", 10)
+                .expect("查旧 bigram")
+                .is_empty(),
+            "跳过之后不该还能搜到词内 bigram"
+        );
         let counts = db.counts().expect("读计数");
         assert_eq!((counts.ok, counts.skipped), (0, 1));
     }
 
-    /// 删除要同时清掉 note 行与两张 FTS 表里的行，否则行数体检会一直失败。
+    /// 删除要同时清掉 note 行与三张 FTS 表里的行，否则行数体检会一直失败。
     #[test]
-    fn delete_by_path_removes_from_both_fts() {
+    fn delete_by_path_removes_from_every_fts() {
         let (_dir, mut db) = opened_vault();
-        db.upsert_ok(&indexed("a.md", "alpha", "al lp"), NOW)
+        db.upsert_ok(&indexed("a.md", "alpha", "al lp ph ha", "al lp"), NOW)
             .expect("写入");
 
         assert!(db.delete_by_path("a.md").expect("删除"));
         assert!(db.match_ascii("\"alpha\"", 10).expect("查").is_empty());
+        assert!(db.match_ascii_infix("\"al\"", 10).expect("查").is_empty());
         assert!(db.match_zh("\"al\"", 10).expect("查").is_empty());
         assert!(db.load_state().expect("读状态").is_empty());
         assert_eq!(db.counts().expect("读计数"), Counts::default());
@@ -629,7 +730,7 @@ mod tests {
     #[test]
     fn load_state_reports_skip_status() {
         let (_dir, mut db) = opened_vault();
-        db.upsert_ok(&indexed("a.md", "alpha", "al lp"), NOW)
+        db.upsert_ok(&indexed("a.md", "alpha", "al lp ph ha", "al lp"), NOW)
             .expect("写成功行");
         db.upsert_skipped(
             &SkippedNote {
@@ -655,12 +756,14 @@ mod tests {
     #[test]
     fn match_name_escapes_like_wildcards() {
         let (_dir, mut db) = opened_vault();
-        db.upsert_ok(&indexed("a/100%.md", "", ""), NOW)
+        db.upsert_ok(&indexed("a/100%.md", "", "", ""), NOW)
             .expect("写");
-        db.upsert_ok(&indexed("a/1000.md", "", ""), NOW)
+        db.upsert_ok(&indexed("a/1000.md", "", "", ""), NOW)
             .expect("写");
-        db.upsert_ok(&indexed("a/a_b.md", "", ""), NOW).expect("写");
-        db.upsert_ok(&indexed("a/axb.md", "", ""), NOW).expect("写");
+        db.upsert_ok(&indexed("a/a_b.md", "", "", ""), NOW)
+            .expect("写");
+        db.upsert_ok(&indexed("a/axb.md", "", "", ""), NOW)
+            .expect("写");
 
         let hit = db.match_name("100%", 10).expect("查 %");
         assert_eq!(hit.len(), 1, "`%` 必须当字面字符，不能当通配符");
@@ -675,7 +778,7 @@ mod tests {
     #[test]
     fn empty_expr_returns_empty_set() {
         let (_dir, mut db) = opened_vault();
-        db.upsert_ok(&indexed("a.md", "alpha", "al lp"), NOW)
+        db.upsert_ok(&indexed("a.md", "alpha", "al lp ph ha", "al lp"), NOW)
             .expect("写");
         assert!(db.match_ascii("", 10).expect("空表达式").is_empty());
         assert!(db.match_zh("", 10).expect("空表达式").is_empty());
@@ -714,7 +817,7 @@ mod tests {
     fn batch_writes_many_rows_in_one_transaction() {
         let (_dir, mut db) = opened_vault();
         let notes: Vec<IndexedNote> = (0..8)
-            .map(|i| indexed(&format!("n{i}.md"), "alpha", "al lp"))
+            .map(|i| indexed(&format!("n{i}.md"), "alpha", "al lp ph ha", "al lp"))
             .collect();
 
         db.batch(|batch| {
@@ -738,8 +841,8 @@ mod tests {
         let (_dir, mut db) = opened_vault();
 
         let result: Result<(), KiError> = db.batch(|batch| {
-            batch.upsert_ok(&indexed("a.md", "alpha", "al lp"), NOW)?;
-            batch.upsert_ok(&indexed("b.md", "bravo", "br ra"), NOW)?;
+            batch.upsert_ok(&indexed("a.md", "alpha", "al lp ph ha", "al lp"), NOW)?;
+            batch.upsert_ok(&indexed("b.md", "bravo", "br ra av vo", "br ra"), NOW)?;
             Err(KiError::Index {
                 path: "simulated".to_string(),
                 message: "模拟第 3 篇读取失败".to_string(),

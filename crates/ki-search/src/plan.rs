@@ -14,7 +14,8 @@
 //! | [`Mode::Empty`] | 空查询 / 含换行 | 直接返回空结果 |
 //! | [`Mode::FullScan`] | ASCII 单字、纯标点、emoji、含 CJK 但切不出 token | 逐篇字面扫描 |
 //! | [`Mode::Cjk`] | 查询里有 CJK 且切得出 token（**含单个 CJK 字**） | `note_fts_zh` |
-//! | [`Mode::Ascii`] | 查询里只有 ASCII 词 | `note_fts` |
+//! | [`Mode::Ascii`] | 查询里只有 ASCII，且（多词 或 单词单字符） | `note_fts`（词首前缀） |
+//! | [`Mode::AsciiInfix`] | 查询是**单个** ≥2 字符的 ASCII 词 | `note_fts_ascii_bi`（词内 bigram） |
 //!
 //! # 全扫不是兜底，是正确性要求
 //!
@@ -25,6 +26,17 @@
 //! 今天还留在全扫这一列的只有三类：ASCII 单字（ASCII 投影是**词首对齐**的，
 //! `"a"*` 查不到 `Rust` 里的 `a`）、纯 emoji / 纯标点（没有 token）、
 //! 以及 `🙂的` / `A 的` 这种「有 CJK 但切不出 token」的查询。
+//!
+//! # 子串查询为什么不是「一种新查询类型」
+//!
+//! [`Mode::AsciiInfix`] 只影响**走哪张表 + 什么表达式**：它和 `Ascii` 共用
+//! `indexed_search` 的同一条流水线（一次 MATCH → 文件名通道 → RRF → 池子
+//! 预算 → 定位器），只是多一个 `match_*` 调用。没有第二条融合路径、没有
+//! 第二套池子规则、没有第二个 `total` 语义。
+//!
+//! 范围刻意收窄：**只接管「单个 ≥2 字符的 ASCII 词」**。多词查询
+//! （`rust-ownership`）仍走词首前缀——把每个词都换成子串会改变它们的候选集，
+//! 而那不是本刀要修的东西（`rust` 是 `rust-ownership` 的词首前缀，本来就能中）。
 //!
 //! # CJK 单字为什么能走索引
 //!
@@ -48,6 +60,8 @@ pub enum Mode {
     FullScan,
     /// 通道 A：ASCII 词的前缀匹配。
     Ascii,
+    /// 通道 A'：**单个** ≥2 字符 ASCII 词的词内 bigram（子串语义）。
+    AsciiInfix,
     /// 通道 B：CJK bigram 的 AND；单字查询是一条前缀（`"记"*`）。
     Cjk,
 }
@@ -58,6 +72,12 @@ pub enum Mode {
 /// 的解析舒适区。截断**只放宽候选**（少 AND 几个条件），不会漏召回——
 /// 定位层仍然拿完整原串做字面判定。
 pub const MAX_CJK_TOKENS: usize = 64;
+
+/// 子串通道的 bigram 上限。理由同上：截断只放宽候选，不漏召回。
+///
+/// 一个 200 字符的「词」（base64 串、压缩过的路径）会产出 199 个 bigram，
+/// 拼出来是一条约 1.2 KB 的表达式。64 个足够把任何真实标识符钉死。
+pub const MAX_INFIX_BIGRAMS: usize = 64;
 
 /// ASCII 词的截断上限。理由同上。
 pub const MAX_ASCII_WORDS: usize = 16;
@@ -83,7 +103,7 @@ impl Plan {
 
     /// 是否需要真的去查 FTS。`false` 表示由调用方决定「全扫」或「直接返回空」。
     pub fn needs_match(&self) -> bool {
-        matches!(self.mode, Mode::Ascii | Mode::Cjk)
+        matches!(self.mode, Mode::Ascii | Mode::AsciiInfix | Mode::Cjk)
     }
 }
 
@@ -138,19 +158,47 @@ pub fn plan(query: &str) -> Plan {
         return Plan::bare(Mode::FullScan);
     }
 
-    // 6. ASCII 词前缀。
+    // 6. 纯 ASCII。
     //
     //    注意这里**不**把 ASCII 词与 CJK bigram AND 在一起（第 4 步就直接返回了）：
     //    `xRust的所有权` 的 ASCII 投影是 `xrust`，再加 `"rust"*` 会造成假阴性
     //    （文档里是 `Rust`，前缀 `xrust` 不匹配）。CJK bigram 已经足够窄，
     //    ASCII 部分交给定位器过滤。
-    let words = dedup_truncate(
-        ascii::project(needle)
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect(),
-        MAX_ASCII_WORDS,
-    );
+    let projected = ascii::project(needle);
+    let words: Vec<String> = projected.split_whitespace().map(str::to_owned).collect();
+
+    // 6a. 单个 ≥2 字符的词 → 词内 bigram（子串语义）。
+    //
+    //     `us` 在 `rust` 的**中间**，词首前缀永远够不着它；`"us"` 这个 token
+    //     却在 `body_bigram` 里（`rust` → `ru us st`）。召回证明见
+    //     [`ascii::bigrams`]。
+    //
+    //     只有**单个**词才接管：多词查询（`rust-ownership`）的每个词今天都是
+    //     词首前缀，换成子串会改变它们的候选集，而那不在本刀范围内。
+    if words.len() == 1 && words[0].chars().count() >= 2 {
+        let pairs = dedup_truncate(
+            ascii::bigrams(&projected)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            MAX_INFIX_BIGRAMS,
+        );
+        // 长度 ≥2 的词至少产出一个 bigram；真出了空集说明 `bigrams` 坏了，
+        // 而拿空表达式去 MATCH 会抛 `fts5: syntax error`。
+        debug_assert!(!pairs.is_empty(), "{:?} 没有 bigram", words[0]);
+        if !pairs.is_empty() {
+            return Plan {
+                mode: Mode::AsciiInfix,
+                // 子串查询**不带**星号：`"us"` 是精确 token，`"us"*` 会多出
+                // `user`/`usb` 这类以 `us` 开头的词——那是前缀语义，不是子串。
+                expr: and_expr(pairs.iter().map(|p| quote(p))),
+                ascii_words: words,
+            };
+        }
+    }
+
+    // 6b. 多词，或单词但只有一个字符 → 词首前缀（与改前逐字相同）。
+    let words = dedup_truncate(words, MAX_ASCII_WORDS);
     if !words.is_empty() {
         return Plan {
             mode: Mode::Ascii,
@@ -219,7 +267,7 @@ mod tests {
         assert_eq!(plan("a\nb").mode, Mode::Empty);
         assert_eq!(plan("a\r\nb").mode, Mode::Empty);
         // 首尾换行被 trim 掉之后就不含换行了
-        assert_eq!(plan("\nrust\n").mode, Mode::Ascii);
+        assert_eq!(plan("\nrust\n").mode, Mode::AsciiInfix);
     }
 
     /// CJK 单字走前缀通道：`"c"*`，模式仍是 `Cjk`（不是新查询类型）。
@@ -270,12 +318,67 @@ mod tests {
         assert_eq!(p.ascii_words, ["rust", "book"]);
     }
 
+    /// 单个 ≥2 字符的 ASCII 词走**子串**通道：词内 bigram 的 AND，不带星号。
+    ///
+    /// `us` 是那个经典例子：它是 `rust` 的中间两个字符，词首前缀永远够不着。
+    #[test]
+    fn single_ascii_word_uses_the_infix_channel() {
+        for (query, expr) in [
+            ("us", r#""us""#),
+            ("ow", r#""ow""#),
+            ("ru", r#""ru""#),
+            ("rus", r#""ru" AND "us""#),
+            ("rust", r#""ru" AND "us" AND "st""#),
+            ("RUST", r#""ru" AND "us" AND "st""#),
+            ("api", r#""ap" AND "pi""#),
+        ] {
+            let p = plan(query);
+            assert_eq!(p.mode, Mode::AsciiInfix, "{query:?}");
+            assert_eq!(p.expr, expr, "{query:?}");
+            assert!(p.needs_match(), "{query:?}");
+            assert!(!p.expr.contains('*'), "{query:?} 子串查询不许带星号");
+        }
+    }
+
+    /// 子串通道**只**接管「单个词」。多词查询的每个词今天都是词首前缀，
+    /// 换成子串会改变它们的候选集——`rust` 是 `rust-ownership` 的前缀，本来就能中。
+    #[test]
+    fn multi_word_ascii_stays_on_the_prefix_channel() {
+        for query in ["rust book", "rust-ownership", "snake_case", "a b", "e_c"] {
+            let p = plan(query);
+            assert_eq!(p.mode, Mode::Ascii, "{query:?}");
+            assert!(
+                p.expr.split(" AND ").all(|part| part.ends_with("\"*")),
+                "{query:?} → {}",
+                p.expr
+            );
+        }
+    }
+
     /// 星号必须在引号外。写进引号里会被当成字面 token（`rust*` 找不到 `rust`）。
     #[test]
     fn prefix_star_is_outside_the_quotes() {
-        let p = plan("rust");
+        let p = plan("rust book");
         assert!(p.expr.ends_with("\"*"), "{}", p.expr);
         assert!(!p.expr.contains("*\""));
+    }
+
+    /// 超长的「词」截断 bigram：只放宽候选，不改变模式。
+    ///
+    /// 构造一个有 71 个**互不相同** bigram 的 72 字符词：第 `i` 个字符对是
+    /// `(i, i+18) mod 36`，词内相邻对差 18，跨对边界差 1——两组不可能相等。
+    /// 这样「截到 64 个」才是一个可断言的数，而不是「大概会截断」。
+    #[test]
+    fn long_infix_words_are_truncated() {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let long: String = (0..36)
+            .flat_map(|i| [ALPHABET[i] as char, ALPHABET[(i + 18) % 36] as char])
+            .collect();
+        let p = plan(&long);
+        assert_eq!(p.mode, Mode::AsciiInfix);
+        assert_eq!(p.expr.split(" AND ").count(), MAX_INFIX_BIGRAMS);
+        // 截断保留前 64 个，所以第一个分量必须是词的首个 bigram。
+        assert_eq!(p.expr.split(" AND ").next(), Some(r#""as""#));
     }
 
     /// 含 CJK 但切不出 bigram 时必须全扫，不能拿空表达式去 MATCH。

@@ -30,17 +30,25 @@ pub const SCHEMA_VERSION: i32 = 1;
 /// |---|---|
 /// | `bigram-v1/ascii-proj-v1` | 初始：CJK 重叠 bigram + 跨脚本边界 bigram |
 /// | `bigram-v2/ascii-proj-v1` | 每个 CJK run 多一个**末字符的单字 token**（覆盖 token）。单字查询从全扫改成 `"c"*` 前缀通道。老库必须整库重建：v1 的库里没有单字 token，单字查询会**静默搜不到** |
-pub const TOKENIZER_VERSION: &str = "bigram-v2/ascii-proj-v1";
+/// | `bigram-v2/ascii-proj-v2` | 通道 A 多一张**词内 bigram** 表（`note_fts_ascii_bi`），`us` 这类词中子串从全扫/漏召回变成 `"us"` 精确命中。投影规则本身没变，但**通道 A 的索引内容**变了，所以照样整库重建 |
+///
+/// # 为什么没有独立的 `ASCII_INDEX_VERSION`
+///
+/// 两条通道的版本语义**完全相同**：都表示「这个库里的 token 不是当前规则
+/// 算出来的」。处置动作也完全相同：整库重建。拆成两个 key 只会让
+/// [`crate::db::inspect`] 多一次比较、多一条「一个版本对了另一个没对」的
+/// 中间态，而没有任何动作会因此不同。
+pub const TOKENIZER_VERSION: &str = "bigram-v2/ascii-proj-v2";
 
 /// 索引库文件名（放在 `<vault>/.knowisle/` 下）。
 pub const DB_FILE: &str = "index.sqlite";
 
 /// 建库 DDL。
 ///
-/// `note.id` 是 `INTEGER PRIMARY KEY`，也就是 rowid——两张 FTS 表的 `rowid`
+/// `note.id` 是 `INTEGER PRIMARY KEY`，也就是 rowid——三张 FTS 表的 `rowid`
 /// 直接等于它，不需要映射表，也不需要 `content_rowid`（那是外部内容表才有的）。
 ///
-/// 两张 FTS 表都是 `content=''`（不存原文，守住公理 A1）：
+/// 三张 FTS 表都是 `content=''`（不存原文，守住公理 A1）：
 /// - 普通 `content=''` **不支持** `DELETE`（会报 `cannot DELETE from contentless
 ///   fts5 table`），所以必须带 `contentless_delete=1`（SQLite ≥ 3.43）。
 /// - `contentless_delete=1` 与 `columnsize=0` **互斥**，一起写建表直接报错。
@@ -67,6 +75,18 @@ CREATE INDEX IF NOT EXISTS note_status ON note(status);
 -- 通道 A：ASCII 投影，服务英文与代码标识符（词首前缀匹配）
 CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
   body_ascii,
+  content='',
+  contentless_delete=1,
+  tokenize='unicode61 remove_diacritics 0'
+);
+
+-- 通道 A'：ASCII 投影的**词内 bigram**（子串匹配：`us` 命中 `rust`）
+--
+-- 只装 ASCII 投影。**不许**顺手把原文或中文 token 也索引进来：这张表按
+-- 「每个相邻字符对一个 token」写，中文正文会让它按字符数爆炸（一份 10k
+-- 真实语料夹具上，ASCII 只占全部 token 的 12.9%）。
+CREATE VIRTUAL TABLE IF NOT EXISTS note_fts_ascii_bi USING fts5(
+  body_bigram,
   content='',
   contentless_delete=1,
   tokenize='unicode61 remove_diacritics 0'

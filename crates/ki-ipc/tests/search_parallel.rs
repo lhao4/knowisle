@@ -166,7 +166,9 @@ fn expected(files: &[(String, String)], query: &str) -> usize {
 
 /// 一条命中的可比形态。`SearchHit` 不 derive `PartialEq`，而这里要的是
 /// **逐字段**相同，不是「条数与首条相同」。
-fn shape(hit: &SearchHit) -> (String, u32, u32, u32, u32, u32, String, bool) {
+type Shape = (String, u32, u32, u32, u32, u32, String, bool);
+
+fn shape(hit: &SearchHit) -> Shape {
     (
         hit.path.clone(),
         hit.line,
@@ -179,7 +181,7 @@ fn shape(hit: &SearchHit) -> (String, u32, u32, u32, u32, u32, String, bool) {
     )
 }
 
-fn shapes(hits: &[SearchHit]) -> Vec<(String, u32, u32, u32, u32, u32, String, bool)> {
+fn shapes(hits: &[SearchHit]) -> Vec<Shape> {
     hits.iter().map(shape).collect()
 }
 

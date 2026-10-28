@@ -49,7 +49,7 @@ use std::sync::PoisonError;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ki_core::{IndexState, KiError, ScanResult, SearchHit, SearchResult};
-use ki_search::{fuse, plan, project, token_stream, Mode, Plan};
+use ki_search::{bigrams, fuse, plan, project, token_stream, Mode, Plan};
 use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
 };
@@ -730,7 +730,9 @@ pub fn search(root: &Path, query: &str, refresh: Option<&str>) -> Result<SearchR
             // 那时由 `locate_all` 自己把它降级成下界。
             locate_all(&root, &pool, &needles, counts, false)
         }
-        Mode::Ascii | Mode::Cjk => indexed_search(db, &root, &needles, &qplan, counts)?,
+        Mode::Ascii | Mode::AsciiInfix | Mode::Cjk => {
+            indexed_search(db, &root, &needles, &qplan, counts)?
+        }
     };
 
     result.index_ms = pending_ms + open_ms;
@@ -769,8 +771,11 @@ fn indexed_search(
     let limit = POOL_EXACT_MAX + 1;
     let channel = match qplan.mode {
         Mode::Ascii => db.match_ascii(&qplan.expr, limit)?,
+        // 通道 A'：单个 ≥2 字符 ASCII 词的**词内 bigram**。多一个 `match_*` 调用，
+        // 别的什么都不变——同一个池子预算、同一套 RRF、同一个定位器。
+        Mode::AsciiInfix => db.match_ascii_infix(&qplan.expr, limit)?,
         Mode::Cjk => db.match_zh(&qplan.expr, limit)?,
-        _ => unreachable!("indexed_search 只处理 Ascii / Cjk"),
+        _ => unreachable!("indexed_search 只处理 Ascii / AsciiInfix / Cjk"),
     };
 
     // 文件名通道与 FTS 通道互不替代：`name_hit` 是排序契约的第一键，
@@ -996,12 +1001,7 @@ fn locate_all(
 
     // 两条让 `total` 变成下界的路合成一个信号：池子被预算截断，或池里有篇
     // 读不到。`|=` 是跨线程汇总 `failed` 的全部实现——不需要锁。
-    finish(
-        part.hits,
-        part.lines,
-        counts,
-        pool_saturated || part.failed,
-    )
+    finish(part.hits, part.lines, counts, pool_saturated || part.failed)
 }
 
 /// 排序、截断、填诊断字段。
@@ -1173,12 +1173,17 @@ fn refresh_path(db: &mut IndexDb, root: &Path, path: &str) -> Result<(), KiError
 
 /// 正文 → 待写库的行。同步与刷新共用，保证两边算出来的 token 完全一致。
 fn indexed_note(note: &ki_core::NoteContent) -> IndexedNote {
+    // 投影只算一次：`body_bigram` 是投影的**派生**，不是原文的派生。
+    // 从原文直接算 bigram 会得到同一份结果（`bigrams` 会自己断开非 ASCII），
+    // 但那是两条路径，改了一边忘了另一边就静默分叉。
+    let ascii = project(&note.content);
     IndexedNote {
         path: note.path.clone(),
         name_lower: name_lower_for_path(&note.path),
         size: note.size,
         mtime: note.mtime,
-        body_ascii: project(&note.content),
+        body_bigram: bigrams(&ascii),
+        body_ascii: ascii,
         body_tokens: token_stream(&note.content),
     }
 }
@@ -1203,7 +1208,10 @@ mod tests {
     /// 下界必须**小于**预算，否则「截断」比「全取」还贵。
     #[test]
     fn scan_cap_is_much_smaller_than_the_exact_budget() {
-        assert!(POOL_SCAN_MAX < POOL_EXACT_MAX);
+        // 编译期断言：两个操作数都是常量，`assert!` 在这里恒为真，clippy 的
+        // `assertions_on_constants` 会指出这一点。判据不变——改小
+        // `POOL_EXACT_MAX` 或改大 `POOL_SCAN_MAX` 都编不过。
+        const _: () = assert!(POOL_SCAN_MAX < POOL_EXACT_MAX);
         assert_eq!(POOL_SCAN_MAX, MAX_HITS, "截断时刚好够填满结果列表");
     }
 }

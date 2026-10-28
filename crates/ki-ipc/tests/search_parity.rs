@@ -158,6 +158,11 @@ fn indexed_queries_match_the_legacy_engine() {
         "ownership",
         "knowisle",
         "the",
+        // ASCII 词中子串（M7 第七刀之前这些**不保证**命中，所以刻意不在这里）
+        "us",
+        "ow",
+        "ship",
+        "ners",
         // CJK bigram
         "知识库",
         "所有权",
@@ -243,44 +248,47 @@ fn recall_completeness_for_random_cjk_substrings() {
     }
 }
 
-/// **显式记录已知收窄**：ASCII 词中子串不再保证命中。
+/// **词中子串的回归**：ASCII 词中子串必须与旧引擎（整库字面匹配）逐字相同。
 ///
-/// 旧引擎是整库子串匹配，`us` 能搜到正文里的 `Rust`；新引擎的通道 A 只做
-/// 词首前缀，所以搜不到。这是用「索引体积与内存」换来的——旧引擎常驻约两倍
-/// 正文，新引擎不存原文。
+/// 这条用例以前叫 `known_divergence_ascii_infix_is_documented`，断言的是
+/// 「`us` **不**命中 `c-mixed.md` 里的 `Rust`」——即收窄本身。M7 第七刀把
+/// 通道 A' （词内 bigram）接上之后，它按自己的注释变成了「必须命中」。
 ///
 /// # 为什么拿 `c-mixed.md` 而不是 `a/rust-ownership.md`
 ///
 /// 因为文件名通道是**字面子串**匹配（`name_lower LIKE %us%`），
 /// `rust-ownership` 里就有 `us`，那篇会经文件名进池、再由定位器在正文里
-/// 找到 `us`——于是收窄根本不显现。这不是漏洞：文件名通道与定位器都还是
-/// 字面语义，只有**正文**的 ASCII 匹配从「子串」收窄成了「词首前缀」。
+/// 找到 `us`——于是通道 A' 修没修都看不出来。`c-mixed.md` 的文件名里
+/// 没有 `us`，命中只可能来自**正文**的索引通道。
 ///
-/// 这条断言的作用不是"验证 bug 存在"，而是**防止有人以为对拍已经覆盖了它**：
-/// 对拍用例刻意没有这种词中子串查询，因为两条路径在那里必然不同。
-/// 哪天补了 `trigram` 第三通道，这条测试会红，那时把它改成"必须命中"即可。
+/// 三件事一起钉住：
+/// 1. 词中子串命中（`us` → `Rust` 的 `us`）；
+/// 2. 词首前缀不退化（`ru` / `rus` / `rust` 照旧命中）；
+/// 3. 与旧引擎逐字对拍——包括 `total` 与每一条 `hits` 的 `from/to/text`。
 #[test]
-fn known_divergence_ascii_infix_is_documented() {
+fn ascii_infix_matches_the_legacy_engine() {
     let dir = indexed_corpus();
 
-    let old = legacy::query(dir.path(), "us", None).expect("旧引擎");
-    assert!(
-        old.hits.iter().any(|hit| hit.path == "c-mixed.md"),
-        "旧引擎的子串匹配应当能命中 c-mixed.md 正文里 Rust 的 us"
-    );
-
-    let new = service::search(dir.path(), "us", None).expect("新引擎");
-    assert!(
-        !new.hits.iter().any(|hit| hit.path == "c-mixed.md"),
-        "新引擎的通道 A 只做词首前缀，正文里的词中子串不保证——若这里变红，\
-         说明收窄已被修复，请把本条测试改成「必须命中」并更新 ADR-007"
-    );
-
-    // 词首前缀仍然命中：`ru` / `rus` / `rust` 都能搜到。
-    for query in ["ru", "rus", "rust"] {
-        let hit = service::search(dir.path(), query, None).expect("新引擎");
+    // 词中子串：`us` 在 `Rust` 中间、`ow` 在 `knowisle` 中间、`ners` 在
+    // `Ownership` 中间。三者的文件名里都没有对应的串，命中只可能来自正文。
+    for query in ["us", "ow", "ners", "ship"] {
+        assert_parity(dir.path(), query, false);
+    }
+    for query in ["us", "ow"] {
+        let new = service::search(dir.path(), query, None).expect("新引擎");
         assert!(
-            hit.hits.iter().any(|h| h.path == "c-mixed.md"),
+            new.hits.iter().any(|hit| hit.path == "c-mixed.md"),
+            "{query:?} 必须命中 c-mixed.md 正文里的词中子串"
+        );
+    }
+
+    // 词首前缀不退化：`ru` / `rus` / `rust` 本来就能命中，现在仍要命中，
+    // 且与旧引擎逐字相同。
+    for query in ["ru", "rus", "rust"] {
+        assert_parity(dir.path(), query, false);
+        let new = service::search(dir.path(), query, None).expect("新引擎");
+        assert!(
+            new.hits.iter().any(|hit| hit.path == "c-mixed.md"),
             "{query:?} 作为词首前缀必须命中"
         );
     }

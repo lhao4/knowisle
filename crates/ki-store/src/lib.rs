@@ -52,7 +52,15 @@ pub(crate) mod testing {
 
     /// 造一篇「已算好 token」的笔记。这里不关心 token 怎么来的（那是
     /// `ki-search` 的事），只关心它能不能被原样存进去、原样查出来。
-    pub(crate) fn indexed(path: &str, body_ascii: &str, body_tokens: &str) -> IndexedNote {
+    ///
+    /// 四个字符串都是**手写的**，刻意不调用 `ki-search`：单元测试要断言
+    /// 「存什么查什么」，让夹具跟着分词器走会把这条判据变成同义反复。
+    pub(crate) fn indexed(
+        path: &str,
+        body_ascii: &str,
+        body_bigram: &str,
+        body_tokens: &str,
+    ) -> IndexedNote {
         IndexedNote {
             path: path.to_string(),
             name_lower: Path::new(path)
@@ -62,6 +70,7 @@ pub(crate) mod testing {
             size: body_ascii.len() as u64,
             mtime: 1_700_000_000,
             body_ascii: body_ascii.to_string(),
+            body_bigram: body_bigram.to_string(),
             body_tokens: body_tokens.to_string(),
         }
     }

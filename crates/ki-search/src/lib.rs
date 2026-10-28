@@ -5,7 +5,8 @@
 //!
 //! 1. 一段正文该被切成哪些 token（[`bigram`]、[`ascii`]）；注意**查询侧与
 //!    索引侧不是同一份 token**——索引侧多一组覆盖 token，让单字查询也能走
-//!    前缀通道（见 [`bigram::index_tokens`]）；
+//!    前缀通道（见 [`bigram::index_tokens`]）；ASCII 侧多一张词内 bigram 表，
+//!    让词中子串（`us`）也能走索引（见 [`ascii::bigrams`]）；
 //! 2. 一个查询该被翻成什么样的 FTS5 表达式、或者干脆走全扫（[`plan`]）；
 //! 3. 多路候选该怎么合并成一条有序列表（[`rrf`]）。
 //!
@@ -30,7 +31,7 @@ pub mod bigram;
 pub mod plan;
 pub mod rrf;
 
-pub use ascii::project;
+pub use ascii::{bigrams, project};
 pub use bigram::{index_tokens, is_cjk, token_stream, tokens};
 pub use plan::{plan, Mode, Plan};
 pub use rrf::{fuse, Fused, RRF_K};

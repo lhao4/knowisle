@@ -64,8 +64,13 @@ pub enum RebuildReason {
     TokenizerVersion { found: Option<String> },
     /// 这个索引库属于另一个 Vault（`.knowisle/` 被整目录复制过来的典型后果）。
     VaultRoot { found: Option<String> },
-    /// `note(status='ok')` 与两张 FTS 表的行数对不上，说明上次同步中途崩了。
-    RowCountMismatch { notes: i64, ascii: i64, zh: i64 },
+    /// `note(status='ok')` 与三张 FTS 表的行数对不上，说明上次同步中途崩了。
+    RowCountMismatch {
+        notes: i64,
+        ascii: i64,
+        bigram: i64,
+        zh: i64,
+    },
 }
 
 impl RebuildReason {
@@ -253,19 +258,25 @@ fn inspect(conn: &Connection, root: &Path) -> rusqlite::Result<Verdict> {
         return Ok(Verdict::Rebuild(RebuildReason::VaultRoot { found: vault }));
     }
 
-    // 6. 三张表的行数必须相等。不等说明上次同步在「写了 note 还没写 FTS」
+    // 6. 四张表的行数必须相等。不等说明上次同步在「写了 note 还没写 FTS」
     //    或者「删了 FTS 没删 note」的半路上崩了，增量逻辑会从此算错。
-    let (notes, ascii, zh) = conn.query_row(
+    //
+    //    三张 FTS 表都在这里对账，而不是只对两张：`note_fts_ascii_bi` 漏一行
+    //    的表现是「某个子串查询少一篇」，不报错、不可见——正是最该被体检抓到的
+    //    那种失败。
+    let (notes, ascii, bigram, zh) = conn.query_row(
         "SELECT (SELECT count(*) FROM note WHERE status = 'ok'),
                 (SELECT count(*) FROM note_fts),
+                (SELECT count(*) FROM note_fts_ascii_bi),
                 (SELECT count(*) FROM note_fts_zh)",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    if notes != ascii || notes != zh {
+    if notes != ascii || notes != bigram || notes != zh {
         return Ok(Verdict::Rebuild(RebuildReason::RowCountMismatch {
             notes,
             ascii,
+            bigram,
             zh,
         }));
     }
@@ -617,7 +628,50 @@ mod tests {
             OpenOutcome::Rebuilt(RebuildReason::RowCountMismatch {
                 notes: 1,
                 ascii: 0,
+                bigram: 0,
                 zh: 0
+            })
+        );
+    }
+
+    /// 只有 `note_fts_ascii_bi` 少行也要重建。
+    ///
+    /// 这是本刀新增的那张表，漏一行的表现是「某个子串查询少一篇」——不报错、
+    /// 不可见。三张表一起对账，才让这条失败模式在打开库时就被抓住。
+    #[test]
+    fn ascii_bigram_row_count_mismatch_rebuilds() {
+        let dir = vault();
+        let (db, _) = IndexDb::open(dir.path()).expect("首次打开");
+        db.conn()
+            .execute(
+                "INSERT INTO note(path, name_lower, size, mtime, status, indexed_at)
+                 VALUES('ghost.md', 'ghost', 1, 1, 'ok', 1)",
+                [],
+            )
+            .expect("插入笔记行");
+        db.conn()
+            .execute(
+                "INSERT INTO note_fts(rowid, body_ascii) VALUES(1, 'ghost')",
+                [],
+            )
+            .expect("写通道 A");
+        db.conn()
+            .execute(
+                "INSERT INTO note_fts_zh(rowid, body_tokens) VALUES(1, 'gh')",
+                [],
+            )
+            .expect("写通道 B");
+        // 通道 A' 刻意不写。
+        drop(db);
+
+        let (_db, outcome) = IndexDb::open(dir.path()).expect("再次打开");
+        assert_eq!(
+            outcome,
+            OpenOutcome::Rebuilt(RebuildReason::RowCountMismatch {
+                notes: 1,
+                ascii: 1,
+                bigram: 0,
+                zh: 1
             })
         );
     }
