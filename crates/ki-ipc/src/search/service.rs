@@ -874,15 +874,97 @@ fn locate_serial(root: &Path, pool: &[String], query: &QueryNeedles) -> LocatePa
     part
 }
 
+/// 并行定位：`threads` 个 worker，第 `i` 个处理 `pool[i], pool[i+threads], …`。
+///
+/// # 为什么是「跨步 worker」而不是「每批 threads 篇、每批现开线程」
+///
+/// 后者每 1000 篇要开 1000 个线程，且每批一次 `join` 屏障——一批的耗时等于
+/// 那批里最慢的一篇。同一份夹具上实测：每批现开 8 线程只有 **2.00×**，
+/// 跨步 worker 是 **3.27×**。差的那 1.27× 全是建线程与屏障。
+///
+/// 两者在途内存上界相同：每个 worker 一次只持有一篇正文（读一篇 → 定位 →
+/// 丢掉 → 读下一篇），所以**同时**在途的永远是 `threads` 篇。
+fn locate_parallel(
+    root: &Path,
+    pool: &[String],
+    query: &QueryNeedles,
+    threads: usize,
+) -> LocatePart {
+    let mut parts: Vec<LocatePart> = Vec::with_capacity(threads);
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(threads);
+        for worker in 0..threads {
+            workers.push(scope.spawn(move || {
+                let mut part = LocatePart::default();
+                let mut index = worker;
+                while index < pool.len() {
+                    match locate_one(root, &pool[index], query) {
+                        Some(located) => {
+                            part.lines += located.lines;
+                            part.hits.extend(located.hits);
+                        }
+                        None => part.failed = true,
+                    }
+                    index += threads;
+                }
+                part
+            }));
+        }
+
+        for worker in workers {
+            match worker.join() {
+                Ok(part) => parts.push(part),
+                // 定位器里的 panic 是 bug，不是「这一篇读不到」。折成
+                // `failed` 会变成一次静默的少结果——那是本模块最反对的
+                // 失败模式，所以原样抛回去。
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+    });
+
+    let mut merged = LocatePart::default();
+    for part in parts {
+        merged.lines += part.lines;
+        merged.failed |= part.failed;
+        merged.hits.extend(part.hits);
+    }
+    merged
+}
+
 /// 对候选池逐篇定位，产出最终结果。
 ///
 /// 读不到的文件静默跳过：它可能在扫描与搜索之间被删掉了。**不要**因此把
 /// 整次搜索变成错误——一篇被删的笔记不该让用户搜不了整个库。但它确实让
 /// `total` 少算了一篇的命中，所以结果要降级成「下界」（`truncated = true`）。
 ///
-/// 逐篇的那一步被抽成 [`locate_one`]、整段被抽成 [`locate_serial`]：并行的
-/// 版本要复用同一个「读一篇 → 定位 → 攒命中」单元，否则两条路的判定逻辑会
-/// 分叉。本提交只做这次抽取，行为逐字节不变。
+/// # 为什么要并行
+///
+/// contentless 的 FTS 表不存正文，`total` 要准就必须把每一篇读回来。单篇的
+/// 成本几乎全是 `CreateFileW`（ADR-007 实测 619 µs，`read_to_end` 只加
+/// 76 µs）——那是内核往返与过滤驱动的等待，不是 CPU，串行做等于让磁盘一次
+/// 只服务一个请求。
+///
+/// 实测（1000 篇 pool、release、杀软实时保护开着、5 次取中位数、端到端
+/// `service::search`）：1/2/4/8 线程 = 1695 / 859 / 541 / **454** ms，即
+/// **3.73×**。只量 `read_note + NoteLocator::new` 的探针是 3.27×（端到端还
+/// 摊掉了索引查询那段不随线程数变的固定开销）。1200 篇的精确上界因此从约
+/// 2.5 s 落到约 0.7 s。
+///
+/// # 结果与线程数无关
+///
+/// 线程只负责「把命中攒起来」，**不排序、不截断**。最终顺序由 [`finish`] 的
+/// 全序（`name_hit → path → line`，`path + line` 唯一）决定，所以任何线程数
+/// 下的 `hits` 逐元素相同——`tests/search_parallel.rs` 钉住这一条。
+///
+/// 也正因为不截断，最坏情况的收集量是「1200 篇 × 3 条 = 3600 条 `SearchHit`」，
+/// 与线程数无关。
+///
+/// # 一条池，两个入口
+///
+/// `Mode::FullScan` 与 `indexed_search` 都走这里，不写两份：前者的 pool 是
+/// 全库（10k 篇），后者最多 1200 篇。并行对前者的收益最大（16.6 s → 4.4 s），
+/// 而跨步 worker 保证它不会把 10k 篇正文一次性读进内存。
 fn locate_all(
     root: &Path,
     pool: &[String],
@@ -890,10 +972,15 @@ fn locate_all(
     counts: Counts,
     pool_saturated: bool,
 ) -> SearchResult {
-    let part = locate_serial(root, pool, query);
+    let threads = locate_threads(pool.len());
+    let part = if threads <= 1 {
+        locate_serial(root, pool, query)
+    } else {
+        locate_parallel(root, pool, query, threads)
+    };
 
     // 两条让 `total` 变成下界的路合成一个信号：池子被预算截断，或池里有篇
-    // 读不到。
+    // 读不到。`|=` 是跨线程汇总 `failed` 的全部实现——不需要锁。
     finish(
         part.hits,
         part.lines,
