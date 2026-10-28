@@ -171,6 +171,58 @@ fn ascii_infix_cost() {
     );
 }
 
+/// 第七刀的**延迟账单**：候选面涨了之后，精确路径的 p50 到底是多少。
+///
+/// ```sh
+/// cargo test -p ki-ipc --release --test ascii_infix_cost -- --ignored --nocapture latency_bill
+/// ```
+///
+/// # 为什么这笔账要单独记
+///
+/// 通道 A' 把 `us` / `own` / `ru` / `ow` 这类词中子串从「全扫或漏召回」
+/// 变成「索引命中」，代价是**候选面暴涨**：`us` 298 → 1163 篇、`own`
+/// 77 → 890 篇。而精确路径（`total` 要准）必须逐篇读盘核对命中行，
+/// 所以这不是免费的。
+///
+/// 上一刀报了「候选面变大」，没报「一次查询要多久」——那是不完整的账。
+/// 这条用例把四个查询的候选面与 p50 打在同一行里，下一个人要判断
+/// 「还能不能再宽一点」时，看的就是这张表。
+#[test]
+#[ignore = "10k 夹具 + 全量建库，显式跑"]
+fn exact_path_latency_bill() {
+    let _fixture = fixture_lock();
+    let root = fixture_root();
+    common::ensure_fixture(&root, FILES, DIRS);
+    common::reset_index(&root);
+    let scan = scan_vault(&root, &ScanOptions::default()).expect("扫描");
+    sync_after_scan(&root, &scan).expect("同步");
+
+    let notes = common::load_notes(&root);
+    let lower: Vec<String> = notes.iter().map(|(_, t)| t.to_lowercase()).collect();
+
+    println!("\n查询  候选篇数  total  truncated      p50      max");
+    for query in ["us", "own", "ru", "ow"] {
+        let (face, _) = faces(&lower, query);
+        // 预热：第一次会打开索引库（体检 + 建连接）。
+        let warm = service::search(&root, query, None).expect("搜索");
+
+        let mut samples = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let started = Instant::now();
+            let result = service::search(&root, query, None).expect("搜索");
+            samples.push(started.elapsed());
+            assert_eq!(result.total, warm.total, "{query} 的 total 在采样期间变了");
+        }
+        println!(
+            "{query:<6} {face:>8}  {:>6}  {:>9}  {:>7.1}ms  {:>7.1}ms",
+            warm.total,
+            warm.truncated,
+            median(&samples),
+            samples.iter().max().unwrap().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 /// 逐查询指纹：用来做**改前 / 改后**的对账（本文件里只打印，不断言）。
 ///
 /// ```sh
