@@ -15,15 +15,18 @@ import { useSidebar } from './hooks/useSidebar'
 import { useTrash } from './hooks/useTrash'
 import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
+import { revalidate } from './lib/revalidate'
 import { useTheme } from './lib/theme'
 import {
   appPing,
   describeError,
+  isMissingFile,
   noteCreate,
   noteDelete,
   noteEdit,
   noteFlush,
   noteRead,
+  noteRebase,
   noteRename,
   noteStatus,
   noteTranscodeToUtf8,
@@ -96,6 +99,26 @@ export default function App() {
   const [runtime, setRuntime] = useState<string>('')
   /** 手动保存的回执，`null` 表示没有正在显示的提示。 */
   const [flash, setFlash] = useState<string | null>(null)
+  /**
+   * 一次「磁盘与屏幕分叉」的提示。`null` 表示没有正在提示的分歧。
+   *
+   * 它是**提示**，不是自动动作：外部改动只弹横幅，换不换由用户点。
+   * 自动重载会吞掉他没保存的字——那比「看到旧内容」严重得多。
+   */
+  const [divergence, setDivergence] = useState<Divergence | null>(null)
+  /** 「保留我的」记住的那一版。同一篇、同一版不再重复问。 */
+  const dismissed = useRef<{ path: string; mtime: number | null } | null>(null)
+  /**
+   * 一次校验在飞。
+   *
+   * 两个作用，缺一个都会出问题：① focus 会被连按的 Tab / Alt+Tab 打成一片，
+   * 叠着跑就是几次读盘 + 几次 setState；② `StrictMode` 下监听器会「挂载 →
+   * 清理 → 再挂载」，万一清理没跑完就有一次 focus 进来，这道闸门保证
+   * 同一次聚焦只问一次。
+   */
+  const checking = useRef(false)
+  /** 有未保存改动时的「重新加载」要二次确认（复用 ConfirmDialog）。 */
+  const [reloadConfirm, setReloadConfirm] = useState(false)
   const flashTimer = useRef<number | null>(null)
   const editorRef = useRef<NoteEditorHandle>(null)
   /**
@@ -236,6 +259,9 @@ export default function App() {
         setActiveNote(note)
         setSaveState(null)
         setError(null)
+        // 换了一篇，上一篇的分歧提示与「保留我的」记忆都不再适用。
+        setDivergence(null)
+        dismissed.current = null
         return true
       } catch (err) {
         setError(describeError(err))
@@ -765,8 +791,218 @@ export default function App() {
     }
   }, [vault, activeNote])
 
+  /**
+   * 窗口重新获得焦点时，核对当前这篇在磁盘上还是不是我们以为的那一版。
+   *
+   * # 为什么是「聚焦时校验」而不是 watcher
+   *
+   * MVP-SCOPE §3.6 砍掉了 `notify`：三平台的事件语义各不相同（Windows 的
+   * 「先删后建」、macOS 的 FSEvents 合并、Linux 的 inotify 上限），每套都要
+   * 单独调试，而 MVP 阶段外部编辑是低频事件。见 ADR-011。
+   *
+   * # 为什么先问 `noteStatus` 再读盘
+   *
+   * 基线不能用 `saveState` 里那份：它靠 500ms 轮询刷新，落盘之后最多滞后
+   * 半秒，而「刚保存完又敲一个字」恰好落在这个窗口里——用旧基线去比，
+   * 用户自己的输入会被判成外部改动。`noteStatus` 是槽位的真值，2ms。
+   *
+   * # 为什么脏改动要把编辑器缓冲也算进来
+   *
+   * 按键到 `noteEdit` 之间有 300ms 的合并窗口。这段时间槽位是干净的，
+   * 编辑器却已经多了几个字。只信槽位，「打完字立刻切窗再回来」就会被
+   * 提示「文件已在外部修改」。
+   */
+  const checkExternalChange = useCallback(async () => {
+    if (!vault || !activeNote || checking.current) return
+    checking.current = true
+    try {
+      const { root } = vault
+      const path = activeNote.path
+      const status = await noteStatus(root, path).catch(() => null)
+      const isDirty = status?.dirty === true || editorRef.current?.hasPending() === true
+
+      let disk: NoteContent
+      try {
+        disk = await noteRead(root, path)
+      } catch (err) {
+        // 读不了有两种：文件没了（要提示），以及权限/占用（不归这里管，
+        // 保存链路会用一句人话报出来）。这里只认前者，别把噪音变成横幅。
+        if (!isMissingFile(err)) return
+        if (sameDivergence(dismissed.current, path, null)) return
+        setDivergence({ kind: 'deleted', path, dirty: isDirty })
+        return
+      }
+
+      const verdict = revalidate({
+        editorContent: editorRef.current?.getContent() ?? '',
+        diskContent: disk.content,
+        diskMtime: disk.mtime,
+        baselineMtime: status?.lastSavedMtime ?? activeNote.mtime,
+        dirty: isDirty,
+      })
+
+      if (verdict.kind === 'noop') return
+
+      if (verdict.kind === 'adopt-baseline') {
+        // 两边都要推：前端这份决定**下一次校验**的基线，Rust 槽位那份决定
+        // **下一次保存**的乐观锁。只推一边 = 下一次保存假冲突，或者下一次
+        // 聚焦把同一件事再判一遍。
+        setActiveNote((prev) =>
+          prev !== null && prev.path === disk.path
+            ? { ...prev, mtime: disk.mtime, size: disk.size }
+            : prev,
+        )
+        setSaveState((prev) => ({
+          dirty: prev?.dirty ?? false,
+          lastSavedMtime: disk.mtime,
+          lastError: null,
+        }))
+        await noteRebase(root, disk.path, disk.mtime, false).catch(() => false)
+        return
+      }
+
+      if (sameDivergence(dismissed.current, path, disk.mtime)) return
+      setDivergence({ kind: 'modified', path, note: disk, dirty: verdict.dirty })
+    } finally {
+      checking.current = false
+    }
+  }, [vault, activeNote])
+
+  /**
+   * 把最新的校验函数放进 ref，监听器只注册一次。
+   *
+   * 直接依赖 `checkExternalChange` 的话，`activeNote` 每变一次就要拆装一次
+   * 监听器；focus 恰好落在拆与装之间时，那一次校验就丢了。
+   */
+  const checkRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    checkRef.current = () => {
+      void checkExternalChange()
+    }
+  })
+
+  useEffect(() => {
+    // `window` 的 focus 是 CDP 能可靠派发的那个事件（`Page.bringToFront`
+    // 不会）。`visibilitychange` 补的是「最小化再还原」：部分 WebView2
+    // 版本上它不伴随 window focus。
+    const run = () => checkRef.current()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') run()
+    }
+    window.addEventListener('focus', run)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.removeEventListener('focus', run)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [])
+
+  /**
+   * 接受磁盘上的版本（横幅上的「重新加载」）。
+   *
+   * # 顺序是红线：不许 flush，先丢缓冲
+   *
+   * `flushActiveNote` 会把编辑器里的旧内容写回磁盘——正好覆盖掉用户刚刚
+   * 同意接受的那一版。这是本功能最容易写出的「看起来能用」的错：横幅消失了、
+   * 内容也换了，而对方那一版已经被悄悄盖掉。
+   *
+   * # `docId + 1` 是唯一能让编辑器换内容的手段
+   *
+   * `NoteEditor` 的重建依赖数组是 `[docId]`，`note.content` 不是。只
+   * `setActiveNote` 的话屏幕不会变，用例会红得让人以为读盘错了。
+   * 它同时清空撤销栈——**那正是想要的语义**：撤销不该回到被丢弃的那一版。
+   */
+  const applyReloaded = useCallback(
+    async (note: NoteContent) => {
+      if (!vault) return
+      // 1) 前端缓冲先丢：它本来会在 300ms 后发出去。
+      editorRef.current?.discardPending()
+      // 2) Rust 槽位对齐：压着的旧内容一起丢，基线推到磁盘真值。
+      //    少了这一步，1.5 秒后 worker 会拿新基线把旧内容写下去。
+      await noteRebase(vault.root, note.path, note.mtime, true).catch(() => false)
+      // 3) 最后才换文档。
+      setOutline([])
+      setDocId((id) => id + 1)
+      setActiveNote(note)
+      setSaveState({ dirty: false, lastSavedMtime: note.mtime, lastError: null })
+      setError(null)
+      setDivergence(null)
+      dismissed.current = null
+    },
+    [vault],
+  )
+
+  /** 横幅上的「重新加载」。外部删除时再读一次，仍然没有就留在原地。 */
+  const reloadFromDisk = useCallback(async (): Promise<string | null> => {
+    const target = divergence
+    if (target === null) return null
+    if (target.kind === 'modified') {
+      await applyReloaded(target.note)
+      return null
+    }
+    if (!vault) return null
+    try {
+      const note = await noteRead(vault.root, target.path)
+      await applyReloaded(note)
+      return null
+    } catch (err) {
+      // 文件没了不该报「错误」：横幅已经说清楚了。刷一句回执，免得用户
+      // 以为按钮坏了。
+      if (isMissingFile(err)) {
+        showFlash('磁盘上仍然没有这篇笔记')
+        return null
+      }
+      return describeError(err)
+    }
+  }, [divergence, vault, applyReloaded, showFlash])
+
+  /**
+   * 「保留我的」：记住这一版，同一篇同一版不再问。
+   *
+   * 没有这条记忆的话，用户每切一次窗口就被问一次——而他的回答每次都一样。
+   * 记忆在**保存成功**之后失效（那时磁盘上已经是我们的版本了），见下面
+   * 那个 effect。
+   */
+  const keepMine = useCallback(() => {
+    if (divergence !== null) {
+      dismissed.current = {
+        path: divergence.path,
+        mtime: divergence.kind === 'modified' ? divergence.note.mtime : null,
+      }
+    }
+    setDivergence(null)
+  }, [divergence])
+
+  /** 「重新加载」入口：有没保存的字时先二次确认。 */
+  const requestReload = useCallback(() => {
+    if (divergence === null) return
+    const unsaved = divergence.dirty || dirty || editorRef.current?.hasPending() === true
+    if (unsaved) {
+      setReloadConfirm(true)
+      return
+    }
+    void reloadFromDisk()
+  }, [divergence, dirty, reloadFromDisk])
+
+  // 「保留我的」的记忆只在保存成功之后失效：那时磁盘上的那一版已经是我们的，
+  // 再问一次「要不要重新加载」就是骚扰。判据是**基线越过了被记住的那一版**，
+  // 而不是「dirty 变 false」——后者在一次无关的轮询里也会成立。
+  useEffect(() => {
+    const known = dismissed.current
+    if (known === null || saveState === null) return
+    if (saveState.dirty || saveState.lastError !== null) return
+    if (known.mtime === null || (saveState.lastSavedMtime ?? 0) > known.mtime) {
+      dismissed.current = null
+    }
+  }, [saveState])
+
   const conflict = saveState?.lastError?.code === 'CONFLICT'
   const saveLabel = flash ?? describeSaveState(saveState)
+  // 换了笔记 / 关了库之后，上一条分歧提示就不该再挂在屏幕上。
+  const externalChange =
+    divergence !== null && activeNote !== null && divergence.path === activeNote.path
+      ? divergence
+      : null
 
   return (
     <div className={`app${sidebarOpen ? '' : ' app--sidebar-collapsed'}`}>
@@ -827,6 +1063,35 @@ export default function App() {
           <button type="button" className="btn btn--small" onClick={forceSave}>
             用我的版本覆盖
           </button>
+        </div>
+      )}
+
+      {/*
+        外部改动的提示。**只提示，不自动换内容**：自动重载会吞掉用户没保存
+        的字，而那比「看到旧内容」严重得多。
+
+        它与上面那条冲突横幅可以同时出现，且刻意不合并：冲突横幅说的是
+        「你的保存失败了」，只有「覆盖」一条路；这一条说的是「屏幕上的不是
+        磁盘上的」，出口是「重新加载 / 保留我的」。B-09 缺的正是后者——
+        冲突时用户只能覆盖，不能接受对方的版本。
+      */}
+      {externalChange !== null && (
+        <div className="banner banner--warn" role="alert">
+          <span>
+            {externalChange.kind === 'deleted'
+              ? `${noteName(externalChange.path)} 已经不在磁盘上了（可能被其它程序删除或改名）。你可以继续编辑；保存时会提示冲突。`
+              : `${noteName(externalChange.path)} 已在外部被修改，编辑器里还是旧内容。${
+                  externalChange.dirty ? '你的改动还没保存，重新加载会丢弃它们。' : ''
+                }`}
+          </span>
+          <span className="banner__actions">
+            <button type="button" className="btn btn--small" onClick={requestReload}>
+              重新加载
+            </button>
+            <button type="button" className="btn btn--small" onClick={keepMine}>
+              保留我的
+            </button>
+          </span>
         </div>
       )}
 
@@ -1096,6 +1361,31 @@ export default function App() {
       )}
 
       {/*
+        「重新加载」在有未保存改动时的二次确认。
+
+        复用 `ConfirmDialog` 而不是 `window.confirm`：后者在 WebView2 里会
+        阻塞渲染线程，且样式不可控——这一条动作会**丢字**，必须和删除同一个
+        量级地对待（红色确认按钮、默认焦点在取消）。
+      */}
+      {reloadConfirm && externalChange !== null && (
+        <ConfirmDialog
+          title="丢弃未保存的改动，重新加载？"
+          confirmLabel="丢弃并重新加载"
+          onSubmit={() => reloadFromDisk()}
+          onClose={() => setReloadConfirm(false)}
+        >
+          <p>
+            <span className="confirm__name">{noteName(externalChange.path)}</span>{' '}
+            在磁盘上已经是另一版，而你的改动还没保存。
+          </p>
+          <p className="confirm__note">
+            重新加载会丢弃你刚敲的字，换成磁盘上那一版。磁盘上的文件不会被改动——
+            被丢弃的只有屏幕上的这一份。
+          </p>
+        </ConfirmDialog>
+      )}
+
+      {/*
         删除的二次确认。文案必须把三件事说全：移到哪里、**不是**永久删除、
         以及**怎么找回来**。少说最后一句，"移到回收站"会被理解成
         "随时能撤销"——而清空之后它确实撤销不了，两句话都要说。
@@ -1186,6 +1476,35 @@ export default function App() {
       )}
     </div>
   )
+}
+
+/**
+ * 一次「磁盘与屏幕分叉」。
+ *
+ * 只有两种，因为用户在两种处境下的下一步不同：修改是「换不换这一版」，
+ * 删除是「这篇已经不在了，你还要不要继续写」。
+ */
+type Divergence =
+  | { kind: 'modified'; path: string; note: NoteContent; dirty: boolean }
+  | { kind: 'deleted'; path: string; dirty: boolean }
+
+/**
+ * 「保留我的」记住的是哪一版。
+ *
+ * `mtime` 为 `null` 表示「这一篇在磁盘上没了」——删除没有版本号，
+ * 同一路径的删除只提示一次。
+ */
+function sameDivergence(
+  known: { path: string; mtime: number | null } | null,
+  path: string,
+  mtime: number | null,
+): boolean {
+  return known !== null && known.path === path && known.mtime === mtime
+}
+
+/** 路径末段。横幅里说「a.md」比说「notes/sub/a.md」更容易对上眼睛看到的东西。 */
+function noteName(path: string): string {
+  return path.split('/').pop() ?? path
 }
 
 /** 把保存状态翻成一句人话。空串表示还没开始编辑，不显示。 */

@@ -230,6 +230,19 @@ export interface NoteEditorHandle {
    * 清空缓冲之后，cleanup 里的 `content !== null` 判断为假，它自然什么都不做。
    */
   discardPending: () => void
+  /**
+   * 合并窗口里还有没有没发给 Rust 的字符。
+   *
+   * # 为什么需要它
+   *
+   * 聚焦校验要判断「编辑器里的内容与磁盘不一样」是不是用户自己敲的。
+   * `noteStatus().dirty` 只反映 **Rust 槽位**，而按键到 `noteEdit` 之间有
+   * 300ms 的合并窗口：这段时间里槽位是干净的，编辑器却已经多了几个字。
+   * 少了这一半，用户「打完字立刻切窗再回来」就会被提示「文件已在外部修改」。
+   *
+   * 它只回答「有没有」，不回答「是什么」——内容仍然走 `getContent()`。
+   */
+  hasPending: () => boolean
 }
 
 /**
@@ -400,6 +413,7 @@ export function NoteEditor({
           timerRef.current = null
         }
       },
+      hasPending: () => pendingRef.current !== null,
     }),
     [],
   )

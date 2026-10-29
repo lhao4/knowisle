@@ -435,6 +435,77 @@ pub fn rebase_after_transcode(root: &Path, path: &str, note: &ki_core::NoteConte
     }
 }
 
+/// 聚焦校验 / 重新加载之后，把槽位对齐到「当前打开的这一篇 + 磁盘真值」。
+///
+/// # 为什么前端做不到（这一条决定了它必须是一个 IPC）
+///
+/// [`submit`] 的 `base_mtime` **只在切换文档时采信一次**：同一篇的后续调用
+/// 读的是 `slot.baseline`，而基线只在**成功落盘**时前进。而「外部把文件原样
+/// 重写了一遍」「用户点了重新加载」这两种情形都是**没有落盘、磁盘却换了
+/// mtime**——前端无论怎么传 `base_mtime` 都推不动基线，下一次保存必然
+/// `CONFLICT`。那个冲突是假的，用户看到的是「我什么都没改，它说我冲突了」。
+///
+/// 与 [`rebase_after_transcode`] 是同一件事（都是「磁盘变了、槽位要跟上」），
+/// 区别只在它不需要新字节，所以也不需要一份 `NoteContent`。
+///
+/// # 槽位停在别的文档上时**接管**它
+///
+/// 「打开 B 但一个字都没敲」时槽位的键还停在上一篇 A（切换只在
+/// `submit` 里发生）。此时若不接管，用户敲下第一个字会走「切换文档」分支，
+/// 采信编辑器**挂载时**捕获的旧 mtime——外部改动刚换掉的正是它。
+/// 接管是安全的，但有两个前提：槽位里没有待写内容、也没有 worker 在跑。
+/// 少判任何一个，接管都会把另一篇的字（或一次正在进行的写盘结果）算到
+/// 这一篇头上。
+///
+/// # `drop_pending` 的两种语义
+///
+/// - `true`：用户点了「重新加载」，等于明确丢弃自己那一版。压着的内容必须
+///   **一起丢**——只推基线、留着 pending 的话，1.5 秒后 worker 会拿新基线
+///   把旧内容写下去，正好盖掉他刚刚同意接受的那一版。
+/// - `false`：只推基线（内容相同、mtime 变了）。此时若槽位里还有待写内容，
+///   **什么都不做**：那份内容会带着新基线写下去，把别人的版本盖掉。
+///   宁可不推，让下一次保存照常冲突——冲突横幅至少是用户看得见、能选择的。
+///
+/// # 返回值
+///
+/// `false` = 槽位里压着**另一篇**的待写内容（或正有一篇在写），不能接管；
+/// 或者 `drop_pending = false` 而这一篇自己还有真正不同的待写内容。
+/// 两种都不需要调用方补救。
+///
+/// # 一个已知的窄竞态
+///
+/// worker 已经取走作业、正在 `write_note_checked` 里时，它的失败会把
+/// `pending` 与 `last_error` 放回槽位，覆盖本函数刚清掉的状态。窗口是
+/// 一次写盘的时长（毫秒级），后果只是横幅多挂一会儿——下一次 `submit`
+/// 会用新基线覆盖 pending，内容不会丢。为它加代际计数不划算。
+pub fn rebase(root: &Path, path: &str, mtime: i64, drop_pending: bool) -> bool {
+    let target = (root.to_path_buf(), path.to_owned());
+    let mut slot = lock();
+
+    if slot.key.as_ref() != Some(&target) {
+        // 接管空槽位（或停在别处、且那篇没有任何在途工作的槽位）。
+        if slot.pending.is_some() || slot.worker_running {
+            return false;
+        }
+        slot.key = Some(target);
+        slot.throttle.reset();
+    } else if drop_pending {
+        slot.pending = None;
+    } else if slot.pending.is_some() {
+        return false;
+    }
+
+    slot.baseline = Some(mtime);
+    slot.last_saved_mtime = Some(mtime);
+    // 回执里的 size 与 mtime 都过期了，而 `note_flush` 在没有待写内容时
+    // 会把它当成「磁盘现状」交出去。清掉比交一份假的强。
+    slot.last_saved = None;
+    // 上一次的冲突/编码错误已经随着这次对齐过期了，留着会让横幅挂在一个
+    // 不存在的分歧上。
+    slot.last_error = None;
+    true
+}
+
 /// 删除成功之后，把槽位**清空**（不是搬到别的键上）。
 ///
 /// # 这是整条删除路径上唯一防「文件复活」的硬防线

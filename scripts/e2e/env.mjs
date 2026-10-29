@@ -43,6 +43,16 @@ export const THEME_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-theme')
  */
 export const ENCODING_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-encoding')
 
+/**
+ * 外部改动（B-09 第十刀）的夹具库。
+ *
+ * 单独一个库，理由与 `ENCODING_VAULT` 相同：这个脚本会**从 Node 侧直接改磁盘**
+ * （写正文、写 GBK 字节、删文件），而它的判据全是「编辑器里的字 vs 磁盘上的
+ * 字节」。与别的脚本共用库，会让「打开时磁盘上是什么」依赖上一个脚本跑没跑过
+ * （B-32）。
+ */
+export const EXTERNAL_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-external')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 

@@ -264,6 +264,32 @@ export const commands = {
 	 */
 	noteStatus: (root: string, path: string) => __TAURI_INVOKE<SaveState>("note_status", { root, path }),
 	/**
+	 *  把自动保存槽位的乐观锁基线对齐到磁盘上的新 mtime。**不写盘。**
+	 * 
+	 *  两个调用点，都是「磁盘变了、但没有一次属于我们的落盘」：
+	 * 
+	 *  1. **聚焦校验的 `adopt-baseline`**：外部工具原样重存了一遍（内容没变、
+	 *     mtime 变了）。不弹横幅，但基线必须前进，否则下一次保存撞一个假冲突。
+	 *  2. **「重新加载」**：用户接受了磁盘上的版本。此时 `drop_pending` 为真，
+	 *     槽位里压着的旧内容一并丢弃——不丢的话它会在 1.5 秒后被写下去，
+	 *     正好盖掉用户刚刚接受的那一版。
+	 * 
+	 *  # 为什么前端做不到，非得加一个命令
+	 * 
+	 *  `note_edit` 的 `base_mtime` 只在**切换文档**时被采信一次（见
+	 *  [`crate::autosave::submit`]）。同一篇的后续调用读的是槽位里的基线，
+	 *  而基线只在成功落盘时前进。前端没有任何参数能让它前进。
+	 * 
+	 *  # 返回 `false` 的两种情形
+	 * 
+	 *  槽位里不是这一篇（不需要补救：下次 `note_edit` 会按切换采信前端传的
+	 *  `base_mtime`）；或者 `drop_pending = false` 而槽位里还有真正不同的待写
+	 *  内容（拒绝推进——否则那份内容会带着新基线把别人的版本盖掉）。
+	 * 
+	 *  两种都不抛错：这不是失败，是「这里不需要/不应该动」。
+	 */
+	noteRebase: (root: string, path: string, mtime: number, dropPending: boolean) => __TAURI_INVOKE<boolean>("note_rebase", { root, path, mtime, dropPending }),
+	/**
 	 *  健康检查：前端启动时用它确认 IPC 通道是通的。
 	 * 
 	 *  返回 `AppInfo` 而不是 `serde_json::Value`：后者对 specta 是不可描述的，

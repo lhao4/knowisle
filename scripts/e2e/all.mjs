@@ -26,6 +26,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
  * - `encoding` 插在 `theme` 之后、`trash-page` 之前：它要一个干净的夹具库，
  *   但**不能**跟在 `trash-page` 后面——那一步结尾会 `killApp()`，收尾的
  *   kill 会让后面脚本的 `--restart` 撞上一个正在退出的进程。
+ * - `external` 紧随 `encoding`：同一条约束（要干净夹具库、不能排在
+ *   `trash-page` 之后），且它自己也从 Node 侧改磁盘，与编码那条互不影响。
  * - 其余各自一个夹具库，互不干扰。
  */
 const STEPS = [
@@ -36,6 +38,7 @@ const STEPS = [
   ['e2e:keys', 'cdp-keys.mjs', '快捷键：新建 / 保存 / 加粗 / 斜体'],
   ['e2e:theme', 'cdp-theme.mjs', '主题：三态切换 / 对比度 / 闪烁'],
   ['e2e:encoding', 'cdp-encoding.mjs', '编码：转存为 UTF-8'],
+  ['e2e:external', 'cdp-external-change.mjs', '外部改动：聚焦校验 / 重新加载 / 保留我的'],
   ['e2e:trash-page', 'cdp-trash-page.mjs', '回收站：10k 条分页'],
 ]
 

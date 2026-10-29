@@ -410,6 +410,20 @@ body {
   gap: 16px;
 }
 
+/*
+ * 横幅上的动作区。
+ *
+ * 两个按钮必须挨在一起：`space-between` 会把它们分别贴到左右两端，而
+ * 「重新加载 / 保留我的」是一对互斥选择，分开摆会让人以为它们属于两件事。
+ * `flex: 0 0 auto` 保证长文案换行时按钮不会被压扁。
+ */
+.banner__actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .btn--small {
   flex: 0 0 auto;
   padding: 3px 10px;

@@ -49,6 +49,25 @@ function describeIo(detail: IoDetail): string {
   void _exhaustive
 }
 
+/**
+ * 这个错误是不是「文件已经不在磁盘上」。
+ *
+ * 两条来源，同一个处境：
+ *
+ * - `noteRead` 抛 `IO { kind: 'NOT_FOUND' }`——聚焦校验发现文件被外部删除；
+ * - 保存时抛 `CONFLICT { diskMtime: null }`——我们拿着 mtime 的承诺去写，
+ *   文件却没了（`write_note_checked` 把「不存在」也算冲突，不许当新建写出去）。
+ *
+ * 单独成函数而不是在调用点比字符串：这两个形状是契约的一部分，
+ * 形状变了应该编译失败，而不是让 UI 静默走进「这不是删除」的分支。
+ */
+export function isMissingFile(error: unknown): boolean {
+  if (!isKiError(error)) return false
+  if (error.code === 'IO') return error.detail.kind === 'NOT_FOUND'
+  if (error.code === 'CONFLICT') return error.detail.diskMtime === null
+  return false
+}
+
 /** 把任意异常翻译成一句人话。UI 只该展示这个结果。 */
 export function describeError(error: unknown): string {
   if (!isKiError(error)) {

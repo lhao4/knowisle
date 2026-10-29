@@ -246,6 +246,28 @@ export const noteFlush = commands.noteFlush
 export const noteStatus = commands.noteStatus
 
 /**
+ * 把自动保存的乐观锁基线对齐到磁盘上的新 mtime。**不写盘。**
+ *
+ * 两个调用点，都是「磁盘变了、但没有一次属于我们的落盘」：
+ *
+ * - 聚焦校验判出 `adopt-baseline`（外部工具原样重存：内容没变、mtime 变了）；
+ * - 用户点了「重新加载」（此时 `dropPending` 为真，槽位里压着的旧内容一并丢弃）。
+ *
+ * # 为什么必须有一个 IPC
+ *
+ * {@link noteEdit} 的 `baseMtime` **只在切换文档时被采信一次**（见
+ * `ki-ipc/src/autosave.rs` 的 `submit`）。同一篇的后续调用读的是槽位里的基线，
+ * 而基线只在成功落盘时前进。前端没有任何参数能让它前进——所以「重新加载」
+ * 之后不调这个，下一次保存必然撞一个假的 `CONFLICT`。
+ *
+ * # 返回 `false` 不是错误
+ *
+ * 槽位里不是这一篇（不需要补救），或者 `dropPending = false` 而槽位里还有
+ * 真正不同的待写内容（拒绝推进——否则那份内容会带着新基线盖掉别人的版本）。
+ */
+export const noteRebase = commands.noteRebase
+
+/**
  * 健康检查：确认 Rust 侧真的起来了。
  *
  * 启动时先 ping 一次。如果这一句失败，后面所有按钮都会失败，
@@ -253,5 +275,5 @@ export const noteStatus = commands.noteStatus
  */
 export const appPing = commands.appPing
 
-export { describeError, isKiError } from './errors'
+export { describeError, isKiError, isMissingFile } from './errors'
 export { pickFolder } from './dialog'

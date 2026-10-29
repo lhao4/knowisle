@@ -20,7 +20,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use ki_core::KiError;
-use ki_ipc::{autosave, note_edit, note_flush, note_save};
+use ki_ipc::{autosave, note_edit, note_flush, note_read, note_save};
 use tempfile::TempDir;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -458,6 +458,171 @@ fn flush_slot_swallows_a_conflict_without_overwriting() {
     autosave::flush_slot();
 
     assert_eq!(disk(&vault, "a.md"), "THEIRS", "冲突时绝不能覆盖外部内容");
+}
+
+/* ───────────────────── 槽位对齐（聚焦校验 / 重新加载） ───────────────────── */
+
+/// 外部**原样重存**之后，`rebase` 把基线推到新 mtime，下一次保存不该再冲突。
+///
+/// 这条锁的是 `adopt-baseline` 的兑现：内容相同、mtime 变了，前端不该弹横幅，
+/// 但基线必须前进。没有 `rebase` 的话，用户会看到「我什么都没改，它说我冲突了」——
+/// 一个他完全无法理解的假冲突，而唯一的出口是「用我的版本覆盖」（覆盖的是
+/// 他自己都没改过的内容）。
+#[test]
+fn rebase_adopts_the_new_mtime_so_the_next_save_does_not_conflict() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let opened = seed(&root, "a.md", "SAME");
+
+    edit(&root, "a.md", "SAME", Some(opened.mtime));
+    block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+
+    // 外部工具原样重存：内容不变、mtime 变。
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(vault.path().join("a.md"), "SAME").unwrap();
+    let reread = block_on(note_read(root.clone(), "a.md".to_owned())).unwrap();
+    assert_ne!(
+        reread.mtime, opened.mtime,
+        "夹具没换 mtime：这条用例什么都没验"
+    );
+
+    assert!(
+        autosave::rebase(Path::new(&root), "a.md", reread.mtime, false),
+        "槽位就是这一篇、又没有待写内容，基线必须推得动"
+    );
+
+    edit(&root, "a.md", "SAME + 1", None);
+    let saved = block_on(note_flush(root.clone(), "a.md".to_owned(), false))
+        .expect("基线已经对齐，这次保存不该冲突");
+    assert!(saved.is_some(), "应该有内容真的被写下去");
+    assert_eq!(disk(&vault, "a.md"), "SAME + 1");
+}
+
+/// 槽位里还有**真正不同的**待写内容时，`rebase` 必须拒绝推基线。
+///
+/// 推了会怎样：那份内容带着新基线写下去，把别人刚保存的版本静默盖掉——
+/// 而这正是整个 B-09 要消灭的事故。宁可让下一次保存照常冲突：
+/// 冲突横幅是用户看得见、能选择的。
+#[test]
+fn rebase_refuses_to_advance_over_pending_content() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let opened = seed(&root, "a.md", "MINE");
+
+    // 第一笔立刻落盘（首次编辑不节流），第二笔才会在 1.5 秒的节流窗口里
+    // 压成 pending。只 edit 一次的话，worker 会在我们制造外部改动之前就写完了。
+    edit(&root, "a.md", "MINE-1", Some(opened.mtime));
+    block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+    edit(&root, "a.md", "MINE-2", None);
+
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(vault.path().join("a.md"), "THEIRS").unwrap();
+    let reread = block_on(note_read(root.clone(), "a.md".to_owned())).unwrap();
+
+    assert!(
+        !autosave::rebase(Path::new(&root), "a.md", reread.mtime, false),
+        "有待写内容时不许推基线"
+    );
+
+    let err = block_on(note_flush(root.clone(), "a.md".to_owned(), false))
+        .expect_err("基线没推，保存必须仍然冲突");
+    assert!(matches!(err, KiError::Conflict { .. }), "实际 {err:?}");
+    assert_eq!(disk(&vault, "a.md"), "THEIRS", "对方的内容一个字节都不能动");
+}
+
+/// `drop_pending = true`（用户点了「重新加载」）：槽位里那一版**一起丢**。
+///
+/// 只推基线、留着 pending 的话，1.5 秒后 worker 会拿新基线把旧内容写下去，
+/// 正好盖掉用户刚刚同意接受的那一版——「重新加载」变成了「稍后覆盖」。
+#[test]
+fn rebase_with_drop_pending_discards_the_unsaved_content() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let opened = seed(&root, "a.md", "MINE");
+
+    // 同 rebase_refuses_to_advance_over_pending_content：要两笔，
+    // 第二笔才会真的压在槽位里。
+    edit(&root, "a.md", "MINE-1", Some(opened.mtime));
+    block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+    edit(&root, "a.md", "MINE-2", None);
+
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(vault.path().join("a.md"), "THEIRS").unwrap();
+    let reread = block_on(note_read(root.clone(), "a.md".to_owned())).unwrap();
+
+    assert!(autosave::rebase(
+        Path::new(&root),
+        "a.md",
+        reread.mtime,
+        true
+    ));
+
+    let flushed = block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+    assert!(flushed.is_none(), "丢弃之后槽位里不该还有内容");
+    assert_eq!(disk(&vault, "a.md"), "THEIRS", "重新加载之后磁盘不该被改写");
+
+    // 对齐之后的正常编辑仍然要能存下去——否则「重新加载」等于把这篇弄坏了。
+    edit(&root, "a.md", "THEIRS + 1", None);
+    block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+    assert_eq!(disk(&vault, "a.md"), "THEIRS + 1");
+}
+
+/// 槽位停在别的文档上（或还是空的）时，`rebase` **接管**它。
+///
+/// 「打开 B 但一个字都没敲」时槽位的键还停在上一篇 A：切换只在 `submit` 里
+/// 发生。此时不接管的话，用户敲下的第一个字会走「切换文档」分支，采信编辑器
+/// **挂载时**捕获的旧 mtime——而外部改动刚换掉的正是它。
+#[test]
+fn rebase_takes_over_a_slot_that_still_points_at_another_note() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    seed(&root, "a.md", "A");
+    let b = seed(&root, "b.md", "B");
+
+    assert!(
+        autosave::rebase(Path::new(&root), "b.md", b.mtime, false),
+        "槽位空着、也没有在途写盘，应该接管"
+    );
+    // 接管之后 `note_status` 认这一篇，且报的就是新基线。
+    let status = autosave::status(Path::new(&root), "b.md");
+    assert_eq!(status.last_saved_mtime, Some(b.mtime));
+    assert!(!status.dirty);
+
+    // 第一笔编辑按同一篇处理（不再是「切换文档」），基线是刚对齐的那个。
+    edit(&root, "b.md", "B + 1", None);
+    let saved = block_on(note_flush(root.clone(), "b.md".to_owned(), false)).unwrap();
+    assert!(saved.is_some());
+    assert_eq!(disk(&vault, "b.md"), "B + 1");
+}
+
+/// 槽位里压着**另一篇**的字时，`rebase` 不许接管。
+///
+/// 接管等于把那篇的待写内容连键一起换掉：用户会看到「在 A 里敲的字，
+/// 打开 B 之后没了」。宁可这次不推，让 A 的保存照常走它自己的路径。
+#[test]
+fn rebase_refuses_to_steal_another_documents_pending() {
+    let _guard = serial();
+    let vault = TempDir::new().unwrap();
+    let root = root_of(&vault);
+    let a = seed(&root, "a.md", "A");
+    seed(&root, "b.md", "B");
+
+    // 两笔：第一笔立刻落盘，第二笔压在 1.5 秒的节流窗口里。
+    edit(&root, "a.md", "A-1", Some(a.mtime));
+    block_on(note_flush(root.clone(), "a.md".to_owned(), false)).unwrap();
+    edit(&root, "a.md", "A-2", None);
+
+    assert!(
+        !autosave::rebase(Path::new(&root), "b.md", a.mtime + 1, true),
+        "槽位里压着 a.md 的字，不该被 b.md 接管"
+    );
+    // a.md 的待写内容还在，且仍然属于 a.md。
+    let status = autosave::status(Path::new(&root), "a.md");
+    assert!(status.dirty, "a.md 的待写内容被弄丢了");
 }
 
 /* ───────────────────── 路径边界 ───────────────────── */

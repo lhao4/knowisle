@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { IoKind, KiError } from './bindings'
-import { describeError, isKiError } from './errors'
+import { describeError, isKiError, isMissingFile } from './errors'
 
 /**
  * `errors.ts` 的行为契约。
@@ -212,5 +212,42 @@ describe('describeError · 非 KiError 的输入', () => {
 
   it('普通对象不抛，退化成 `[object Object]`', () => {
     expect(describeError({ message: 'x' })).toBe('[object Object]')
+  })
+})
+
+describe('isMissingFile · 「文件已经不在磁盘上」', () => {
+  it('noteRead 的 IO / NOT_FOUND → true', () => {
+    expect(
+      isMissingFile({
+        code: 'IO',
+        detail: { path: 'a.md', kind: 'NOT_FOUND', message: 'os error 2' },
+      }),
+    ).toBe(true)
+  })
+
+  it('保存时的 CONFLICT（diskMtime 为 null）→ true：同一个处境，不同的来源', () => {
+    expect(
+      isMissingFile({
+        code: 'CONFLICT',
+        detail: { path: 'a.md', expectedMtime: 1, diskMtime: null },
+      }),
+    ).toBe(true)
+  })
+
+  it('权限不足、占用、以及普通的冲突都不是「没了」——它们的下一步完全不同', () => {
+    expect(
+      isMissingFile({ code: 'IO', detail: { path: 'a.md', kind: 'PERMISSION_DENIED', message: 'x' } }),
+    ).toBe(false)
+    expect(
+      isMissingFile({ code: 'IO', detail: { path: 'a.md', kind: 'BUSY', message: 'x' } }),
+    ).toBe(false)
+    expect(
+      isMissingFile({
+        code: 'CONFLICT',
+        detail: { path: 'a.md', expectedMtime: 1, diskMtime: 2 },
+      }),
+    ).toBe(false)
+    expect(isMissingFile(new Error('boom'))).toBe(false)
+    expect(isMissingFile(null)).toBe(false)
   })
 })
