@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContextMenu } from './components/ContextMenu'
+import { EncodingPanel } from './components/EncodingPanel'
 import { TreeNode } from './components/FileTree'
 import { NamePrompt } from './components/NamePrompt'
 import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
@@ -10,6 +11,7 @@ import { QuickOpen } from './components/QuickOpen'
 import { SearchOverlay } from './components/SearchOverlay'
 import { ThemeToggle } from './components/ThemeToggle'
 import { TrashPanel } from './components/TrashPanel'
+import { useEncoding } from './hooks/useEncoding'
 import { useSearch } from './hooks/useSearch'
 import { useSidebar } from './hooks/useSidebar'
 import { useTrash } from './hooks/useTrash'
@@ -373,6 +375,70 @@ export default function App() {
   } = useSearch({ hasVault, trashOpen, editorRef, openNote, flushActiveNote })
 
   /**
+   * 批量转存之后，把「当前打开的那一篇」对齐到磁盘。
+   *
+   * # 为什么只处理当前那一篇
+   *
+   * 其余篇不在编辑器里，它们的正文没有任何地方缓存着——下一次打开自然会读到
+   * UTF-8。而当前这一篇的 `decodedFrom` 还挂着旧值：不刷新的话，顶部那行
+   * 「已按 GBK 解码」会一直显示，而磁盘上已经是 UTF-8 了。
+   *
+   * # 为什么不动 `docId`
+   *
+   * 转存不改正文（它只是把同一段文字换一种字节写法），所以编辑器不需要重建、
+   * 撤销栈不该清空。这与单篇转存 `submitTranscode` 的做法一致：
+   * 只替换 `activeNote`，让 `size` / `mtime` / `decodedFrom` 跟上磁盘。
+   */
+  const onTranscoded = useCallback(
+    async (paths: string[]) => {
+      if (!vault || activeNote === null) return
+      if (!paths.includes(activeNote.path)) return
+      try {
+        const fresh = await noteRead(vault.root, activeNote.path)
+        setActiveNote(fresh)
+        setSaveState(await noteStatus(vault.root, activeNote.path).catch(() => null))
+      } catch (err) {
+        setError(describeError(err))
+      }
+    },
+    [vault, activeNote],
+  )
+
+  /**
+   * 编码域：库级「N 篇不是 UTF-8」+ 批量转存。
+   *
+   * 它是**第四个域**，判据与另外三个一致：读的是索引库、写的是磁盘编码，
+   * 两件事都不属于侧栏 / 检索 / 回收站。跨域的那两步（先落盘、转完刷新
+   * 当前那篇）通过参数与回调拿，不塞进 hook。
+   */
+  const {
+    stats: encodingStats,
+    visible: encodingVisible,
+    open: encodingOpen,
+    confirmOpen: encodingConfirmOpen,
+    running: encodingRunning,
+    progress: encodingProgress,
+    result: encodingResult,
+    error: encodingError,
+    cancelling: encodingCancelling,
+    panelRef: encodingPanelRef,
+    refresh: refreshEncoding,
+    reset: resetEncoding,
+    openPanel: openEncoding,
+    closePanel: closeEncoding,
+    requestStart: requestEncoding,
+    closeConfirm: closeEncodingConfirm,
+    start: startEncoding,
+    cancel: cancelEncoding,
+  } = useEncoding({
+    vault,
+    beforeStart: async () => {
+      await flushActiveNote()
+    },
+    onTranscoded,
+  })
+
+  /**
    * 安装一次扫描结果：树进 state，扁平候选表进搜索域，回收站条数跟着重读。
    *
    * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
@@ -394,11 +460,15 @@ export default function App() {
       syncCandidates(result)
       if (result === null) {
         resetTrash()
+        resetEncoding()
         return
       }
+      // 编码统计跟着扫描走：入口上的那个数字必须与刚扫过的这份磁盘一致。
+      // 索引还在建时它是 0，`useEncoding` 会自己接着问（见 `BUILDING_POLL_MS`）。
+      void refreshEncoding(result.root)
       if (options?.keepTrash !== true) void refreshTrash(result.root)
     },
-    [syncCandidates, resetTrash, refreshTrash],
+    [syncCandidates, resetTrash, refreshTrash, resetEncoding, refreshEncoding],
   )
 
   /**
@@ -1150,6 +1220,30 @@ export default function App() {
                 条数只在非零时显示——常驻一个「0」会让它看起来像坏了。
               */}
               <div className="sidebar__foot">
+                {/*
+                  待转存入口。**只在真的有时才出现**：0 篇时挂一句
+                  「0 篇不是 UTF-8」等于常驻一条无意义的警告，用户会学着忽略它。
+
+                  转存进行中时它变成进度条（`转存中 320/1000`）：面板可以关掉，
+                  批次继续跑，用户得有个地方看它跑到哪了、并且能再点回去取消。
+                */}
+                {(encodingVisible || encodingRunning) && (
+                  <button
+                    type="button"
+                    className="encoding-link"
+                    onClick={openEncoding}
+                    title="库里有些笔记在磁盘上不是 UTF-8，点开查看并批量转存"
+                  >
+                    <span>
+                      {encodingRunning
+                        ? `转存中 ${encodingProgress?.done ?? 0}/${encodingProgress?.total ?? 0}`
+                        : `${encodingStats?.total ?? 0} 篇不是 UTF-8`}
+                    </span>
+                    {!encodingRunning && (
+                      <span className="encoding-link__count">{encodingStats?.total ?? 0}</span>
+                    )}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="trash-link"
@@ -1427,6 +1521,54 @@ export default function App() {
             原文件会先逐字节备份到 <code className="confirm__path">.knowisle/history/</code>
             ，后悔了可以从那里拿回来。转存之后这篇笔记在别的工具里也是 UTF-8，
             而撤销（Ctrl/Cmd+Z）不会把编码改回去。
+          </p>
+        </ConfirmDialog>
+      )}
+
+      {/*
+        待转存面板。与回收站同级、互斥（都是 z-index 100 的模态），
+        所以不会互相遮盖；二次确认叠在它上面。
+      */}
+      {encodingOpen && (
+        <EncodingPanel
+          panelRef={encodingPanelRef}
+          stats={encodingStats}
+          running={encodingRunning}
+          progress={encodingProgress}
+          result={encodingResult}
+          error={encodingError}
+          cancelling={encodingCancelling}
+          onStart={requestEncoding}
+          onCancel={() => void cancelEncoding()}
+          onClose={closeEncoding}
+        />
+      )}
+
+      {/*
+        批量转存的二次确认。与单篇那个是**两个**框：单篇说的是「这一篇」，
+        批量说的是「这一批 N 篇」。合成一个会让用户在批量里看不到总数。
+
+        文案必须说全三件事：磁盘上的编码会变、原文件已经备份到哪里、
+        以及这件事不能靠撤销回退。批量还多一条：中途失败不会回滚已成功的。
+      */}
+      {encodingConfirmOpen && encodingStats !== null && (
+        <ConfirmDialog
+          title={`把这 ${encodingStats.total} 篇转存为 UTF-8？`}
+          confirmLabel="转存"
+          onSubmit={() => {
+            void startEncoding()
+            return Promise.resolve(null)
+          }}
+          onClose={closeEncodingConfirm}
+        >
+          <p>
+            这些笔记在磁盘上不是 UTF-8（清单里有各自的编码名）。转存会把
+            <strong>文件本身</strong>改写成 UTF-8。
+          </p>
+          <p className="confirm__note">
+            每一篇的原文件都会先逐字节备份到{' '}
+            <code className="confirm__path">.knowisle/history/</code>，后悔了可以从那里拿回来。
+            中途失败不会中断，也不会回滚已经转好的那些；撤销（Ctrl/Cmd+Z）不会把编码改回去。
           </p>
         </ConfirmDialog>
       )}

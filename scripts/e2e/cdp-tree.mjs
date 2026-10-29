@@ -850,6 +850,17 @@ consoleErrors.length = 0 // 重载之前的错误不算
   const hit = await search(marker)
   check('12a 删除前搜得到（基线，footer 显示建索引 1 次）', hit !== null && hit.items.some((p) => p.includes('notes/note-0012.md')), hit)
 
+  // `builds` 断的是**增量**，不是绝对值。
+  //
+  // 它是「本进程为这个 Vault 开了几次索引库」的累计值，`invalidate` 之后
+  // 谁先碰到索引库谁就 +1。第十一刀之前只有 `vault_search` 会碰它，所以
+  // 绝对值恰好是 2（删前一次、删后一次）；第十一刀加了
+  // `vault_encoding_stats`（ADR-012），它在每次重扫后都会开一次，绝对值
+  // 于是随重扫次数变化。写死 2 等于把这条用例绑在「只有搜索会开索引库」
+  // 这个与它无关的实现细节上——而用例要说的是「重扫恰好让它 +1 次」。
+  const beforeDelete = await ipc('vault_search', { root: rootShown, query: marker, refreshPath: null })
+  const buildsBefore = beforeDelete.ok === true ? beforeDelete.value.builds : null
+
   await fastDelete('notes/note-0012.md')
   await waitConfirmClosed()
   await sleep(300)
@@ -857,10 +868,17 @@ consoleErrors.length = 0 // 重载之前的错误不算
   // 0 命中时 footer 只显示「没有匹配的行」（`summaryOf` 的 early return），
   // 读不到 builds / indexMs，所以诊断数字走 IPC——它和前端调的是同一条命令。
   const after = await ipc('vault_search', { root: rootShown, query: marker, refreshPath: null })
+  const delta = after.ok === true && buildsBefore !== null ? after.value.builds - buildsBefore : null
   check(
     '12b 删掉之后不再命中，且重扫后恰好重建 1 次索引',
-    after.ok === true && after.value.total === 0 && after.value.builds === 2 && after.value.indexMs > 0,
-    { total: after.value?.total, builds: after.value?.builds, indexMs: after.value?.indexMs },
+    after.ok === true && after.value.total === 0 && delta === 1 && after.value.indexMs > 0,
+    {
+      total: after.value?.total,
+      builds: after.value?.builds,
+      buildsBefore,
+      delta,
+      indexMs: after.value?.indexMs,
+    },
   )
 
   const miss = await search(marker)

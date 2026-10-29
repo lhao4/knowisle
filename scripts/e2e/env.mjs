@@ -44,6 +44,17 @@ export const THEME_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-theme')
 export const ENCODING_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-encoding')
 
 /**
+ * 库级「N 篇不是 UTF-8」+ 批量转存（B-39 第十一刀）的夹具库。
+ *
+ * 单独一个库，理由与上面两条相同：这个脚本会造 1000+ 篇夹具、把其中一批
+ * 写成 GBK、还会在中途**从 Node 侧删文件**（造「列出来之后磁盘变了」）。
+ * 与 `ENCODING_VAULT` 共用会让「转存前磁盘上是什么字节」依赖上一个脚本
+ * 跑没跑过（B-32）。规模也必须独立：980 + 20 是「不打开任何一篇就数出 20」
+ * 那条判据的口径，别的脚本改不动它。
+ */
+export const ENCODING_BATCH_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-encoding-batch')
+
+/**
  * 外部改动（B-09 第十刀）的夹具库。
  *
  * 单独一个库，理由与 `ENCODING_VAULT` 相同：这个脚本会**从 Node 侧直接改磁盘**

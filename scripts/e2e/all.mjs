@@ -38,6 +38,7 @@ const STEPS = [
   ['e2e:keys', 'cdp-keys.mjs', '快捷键：新建 / 保存 / 加粗 / 斜体'],
   ['e2e:theme', 'cdp-theme.mjs', '主题：三态切换 / 对比度 / 闪烁'],
   ['e2e:encoding', 'cdp-encoding.mjs', '编码：转存为 UTF-8'],
+  ['e2e:encoding-batch', 'cdp-encoding-batch.mjs', '编码：库级清单 + 批量转存'],
   ['e2e:external', 'cdp-external-change.mjs', '外部改动：聚焦校验 / 重新加载 / 保留我的'],
   ['e2e:trash-page', 'cdp-trash-page.mjs', '回收站：10k 条分页'],
 ]

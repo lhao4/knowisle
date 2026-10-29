@@ -25,6 +25,7 @@
     "e2e:outline": "node scripts/e2e/cdp-outline.mjs",
     "e2e:keys": "node scripts/e2e/cdp-keys.mjs",
     "e2e:theme": "node scripts/e2e/cdp-theme.mjs",
+    "e2e:encoding-batch": "node scripts/e2e/cdp-encoding-batch.mjs",
     "e2e:external": "node scripts/e2e/cdp-external-change.mjs",
     "e2e:all": "node scripts/e2e/all.mjs"
   }

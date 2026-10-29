@@ -19,6 +19,8 @@ export { commands }
 
 export type {
   AppInfo,
+  EncodingEntry,
+  EncodingStats,
   Fallback,
   FileNode,
   IndexState,
@@ -33,6 +35,9 @@ export type {
   SearchHit,
   SearchResult,
   TrashCursor,
+  TranscodeBatch,
+  TranscodeFailure,
+  TranscodeProgress,
   TrashEntry,
   TrashPage,
 } from './bindings'
@@ -135,6 +140,51 @@ export const noteTranscodeToUtf8 = commands.noteTranscodeToUtf8
  * 撞名返回 `NAME_TAKEN`，原文件一个字节都不动。
  */
 export const noteCreate = commands.noteCreate
+
+/**
+ * 库级编码统计：**不打开任何一篇**就知道库里有多少篇不是 UTF-8。
+ *
+ * 数据来自索引库的 `note.src_encoding` 列（索引器读正文时顺手记的），
+ * 所以这条命令不扫盘、不读正文。
+ *
+ * # `truncated` 与 `total` 的分工
+ *
+ * `total` 永远是**精确**的待转存篇数；`truncated` 只说明 `nonUtf8` 清单被截到
+ * 了前 1000 条。别把清单长度当总数。
+ *
+ * # `indexState` 必须看
+ *
+ * 索引在后台建，建到一半时 `total` 只是「目前为止数到的」。前端要据此
+ * 继续等（`state === 'building'`），而不是把 0 当成「库里没有非 UTF-8」——
+ * 那会让入口永远不出现。
+ */
+export const vaultEncodingStats = commands.vaultEncodingStats
+
+/**
+ * 批量转存：把一批非 UTF-8 的笔记逐篇改写成 UTF-8。
+ *
+ * 每一篇都走 `note_transcode_to_utf8` 背后那条实现（备份 → 原子写 → 重读），
+ * **没有第二份批量实现**。
+ *
+ * # 三条语义
+ *
+ * 1. **失败不中断**：单篇失败记进 `failed` 继续跑，结果逐条带路径与原因。
+ * 2. **可取消**：`token` 由前端生成（单调递增），取消命令靠它定位批次。
+ *    取消后已转好的**不回滚**。
+ * 3. **幂等**：已经是 UTF-8 的篇返回成功、不写盘、不留备份。
+ *
+ * # 进度
+ *
+ * 每跑完一篇 Rust 侧更新一次真实进度，前端按 `token` 轮询
+ * `noteTranscodeProgress`。不许按「发了几个请求」猜。
+ */
+export const noteTranscodeBatch = commands.noteTranscodeBatch
+
+/** 查一批转存的当前进度。`null` = 这一批已经结束（不是「进度归零」）。 */
+export const noteTranscodeProgress = commands.noteTranscodeProgress
+
+/** 请求取消一批转存。粒度是「篇与篇之间」，幂等。 */
+export const noteTranscodeCancel = commands.noteTranscodeCancel
 
 /**
  * 重命名一篇笔记（同目录内改名，不移动、不删除），返回新的相对路径。
