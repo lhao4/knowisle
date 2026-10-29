@@ -19,7 +19,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use ki_core::KiError;
+use ki_core::{EncodingEntry, KiError};
 
 use crate::db::{index_err, IndexDb};
 use crate::schema::meta_key;
@@ -42,6 +42,16 @@ pub struct IndexedNote {
     pub body_bigram: String,
     /// 通道 B：中文 bigram，空格连接。
     pub body_tokens: String,
+    /// 源文件在磁盘上的编码名（`GBK` / `Big5` / `UTF-16LE` …）。
+    ///
+    /// `None` = 磁盘上本来就是 UTF-8（**含带 BOM 的 UTF-8**，见
+    /// `ki_vault::encoding::Encoding::is_utf8`）。所以这一列非空的那些行，
+    /// 就是「待转存集合」的全部成员——不需要再扫一遍盘。
+    ///
+    /// 它**不是**派生数据：读一遍正文才知道，而索引器恰好读过了
+    /// （`read_note_in` 返回的 `NoteContent.decoded_from`）。丢了它，用户
+    /// 就只能一篇篇打开看提示行——ADR-012 的全部动机。
+    pub src_encoding: Option<String>,
 }
 
 /// 一篇索引失败的笔记。仍然写进 `note` 表，让计数与「为什么跳过」可见，
@@ -112,6 +122,20 @@ pub struct Counts {
     pub skipped: usize,
 }
 
+/// 一次「待转存清单」查询的原始结果。
+///
+/// 与 [`ki_core::EncodingStats`] 的差别只有一处：这里没有 `index_state`。
+/// 索引状态是进程级缓存里的事实，不在库里；由调用方（`ki-ipc`）补上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodingScan {
+    /// 待转存篇数，**精确**（`count(*)`）。
+    pub total: usize,
+    /// 按路径升序的清单，最多 `limit` 条。
+    pub non_utf8: Vec<EncodingEntry>,
+    /// 清单被截断（`non_utf8` 只是前 `limit` 条）。
+    pub truncated: bool,
+}
+
 /// 一次增量同步的统计。全部是诊断字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncStats {
@@ -167,6 +191,61 @@ impl IndexDb {
             )
         }
         inner(self.conn()).map_err(|e| index_err(self.path(), &e))
+    }
+
+    /// 库里的编码分布：待转存清单 + 精确篇数。
+    ///
+    /// # 为什么这条查询住在这里
+    ///
+    /// 「哪些篇不是 UTF-8」是索引库里的事实（`src_encoding` 列），不是磁盘上的
+    /// 事实——磁盘上的事实要读每一篇的字节才知道，那是 9.9 秒（B-27）。
+    /// 放到扫描层就必然要读正文，而扫描的 500ms 预算是 M0 的硬约束。
+    ///
+    /// # 返回 [`EncodingScan`] 而不是 `ki_core::EncodingStats`
+    ///
+    /// 那个结构体还带一个 `index_state`（索引建到哪了），而索引状态属于
+    /// 进程级缓存，不在这张表里。硬塞进来只能填一个假的 `Idle`——一个
+    /// 「看起来有值、其实没人算过」的字段，比多一层映射坏得多。
+    ///
+    /// # 截断
+    ///
+    /// `limit` 是**清单**上限，不影响 `total`：`count(*)` 是常数级查询，
+    /// 没有理由让它变成下界。多取一条来判断「有没有被截断」，而不是拿
+    /// `rows.len() == limit` 猜——恰好 `limit` 条时那种猜法会误报。
+    pub fn encoding_scan(&self, limit: usize) -> Result<EncodingScan, KiError> {
+        fn inner(conn: &Connection, limit: usize) -> rusqlite::Result<EncodingScan> {
+            let total: i64 = conn.query_row(
+                "SELECT count(*) FROM note WHERE src_encoding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+
+            // 排序键是 `path` 的字节序，不是 `name_lower`：清单要给的是
+            // 「哪一篇」，路径才是身份。同名不同目录的两篇在 `name_lower` 上
+            // 无法区分，且顺序会随目录变化。
+            let mut stmt = conn.prepare_cached(
+                "SELECT path, src_encoding FROM note
+                 WHERE src_encoding IS NOT NULL
+                 ORDER BY path
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([size_of_usize(limit) + 1], |r| {
+                Ok(EncodingEntry {
+                    path: r.get(0)?,
+                    encoding: r.get(1)?,
+                })
+            })?;
+            let mut non_utf8: Vec<EncodingEntry> = rows.collect::<rusqlite::Result<_>>()?;
+            let truncated = non_utf8.len() > limit;
+            non_utf8.truncate(limit);
+
+            Ok(EncodingScan {
+                total: usize::try_from(total).unwrap_or(usize::MAX),
+                non_utf8,
+                truncated,
+            })
+        }
+        inner(self.conn(), limit).map_err(|e| index_err(self.path(), &e))
     }
 
     /// 写入（或覆盖）一篇成功索引的笔记，返回它的 rowid。
@@ -432,9 +511,17 @@ fn upsert_ok_sql(conn: &Connection, note: &IndexedNote, now: i64) -> rusqlite::R
         Some(id) => {
             conn.execute(
                 "UPDATE note SET name_lower = ?2, size = ?3, mtime = ?4,
-                                 status = 'ok', skip_reason = NULL, indexed_at = ?5
+                                 status = 'ok', skip_reason = NULL, indexed_at = ?5,
+                                 src_encoding = ?6
                  WHERE id = ?1",
-                params![id, note.name_lower, size_of(note.size), note.mtime, now],
+                params![
+                    id,
+                    note.name_lower,
+                    size_of(note.size),
+                    note.mtime,
+                    now,
+                    note.src_encoding
+                ],
             )?;
             conn.execute("DELETE FROM note_fts WHERE rowid = ?1", [id])?;
             conn.execute("DELETE FROM note_fts_ascii_bi WHERE rowid = ?1", [id])?;
@@ -443,14 +530,15 @@ fn upsert_ok_sql(conn: &Connection, note: &IndexedNote, now: i64) -> rusqlite::R
         }
         None => {
             conn.execute(
-                "INSERT INTO note(path, name_lower, size, mtime, status, indexed_at)
-                 VALUES(?1, ?2, ?3, ?4, 'ok', ?5)",
+                "INSERT INTO note(path, name_lower, size, mtime, status, indexed_at, src_encoding)
+                 VALUES(?1, ?2, ?3, ?4, 'ok', ?5, ?6)",
                 params![
                     note.path,
                     note.name_lower,
                     size_of(note.size),
                     note.mtime,
-                    now
+                    now,
+                    note.src_encoding
                 ],
             )?;
             conn.last_insert_rowid()
@@ -483,7 +571,8 @@ fn upsert_skipped_sql(conn: &Connection, note: &SkippedNote, now: i64) -> rusqli
         Some(id) => {
             conn.execute(
                 "UPDATE note SET name_lower = ?2, size = ?3, mtime = ?4,
-                                 status = 'skipped', skip_reason = ?5, indexed_at = ?6
+                                 status = 'skipped', skip_reason = ?5, indexed_at = ?6,
+                                 src_encoding = NULL
                  WHERE id = ?1",
                 params![
                     id,
@@ -563,7 +652,7 @@ fn escape_like(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{indexed, opened_vault};
+    use crate::testing::{indexed, indexed_gbk, opened_vault};
 
     const NOW: i64 = 1_700_000_100;
 
@@ -834,6 +923,70 @@ mod tests {
 
         assert_eq!(db.counts().expect("读计数").ok, 8);
         assert_eq!(db.match_ascii("\"alpha\"", 100).expect("查").len(), 8);
+    }
+
+    /// 待转存清单：按路径升序、只列非 UTF-8、清单可截断而 `total` 精确。
+    #[test]
+    fn encoding_scan_sorts_truncates_and_counts_exactly() {
+        let (_dir, mut db) = opened_vault();
+
+        // 故意乱序写入：清单的顺序必须由查询给（`ORDER BY path`），
+        // 不能是「碰巧按插入顺序」。
+        for path in ["c.md", "a.md", "e.md", "b.md", "d.md"] {
+            db.upsert_ok(&indexed_gbk(path, "alpha", "al lp ph ha", "al lp"), NOW)
+                .expect("写 GBK 行");
+        }
+        db.upsert_ok(&indexed("f.md", "alpha", "al lp ph ha", "al lp"), NOW)
+            .expect("写 UTF-8 行");
+
+        let all = db.encoding_scan(10).expect("清单");
+        assert_eq!(all.total, 5, "只有 5 篇不是 UTF-8");
+        assert!(!all.truncated);
+        let paths: Vec<&str> = all.non_utf8.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md", "b.md", "c.md", "d.md", "e.md"]);
+        assert!(all.non_utf8.iter().all(|e| e.encoding == "GBK"));
+
+        // 截断：清单只给前 2 条，`total` 仍然精确。
+        // 多取一条（LIMIT 3）来判断「有没有被截断」——拿 `len == limit` 猜
+        // 会在恰好 limit 条时误报。
+        let cut = db.encoding_scan(2).expect("清单");
+        assert_eq!(cut.total, 5, "截断不许影响 total");
+        assert!(cut.truncated);
+        assert_eq!(cut.non_utf8.len(), 2);
+
+        let exact = db.encoding_scan(5).expect("清单");
+        assert!(!exact.truncated, "恰好 5 条不是截断");
+    }
+
+    /// 一篇从「成功索引」变成「跳过」时，必须把 `src_encoding` 清掉。
+    ///
+    /// 不清的话，它会一直挂在待转存清单里——而 `status='skipped'` 的篇根本
+    /// 读不出来，转存必然失败。红线里那条「不许把待转存和 skipped 混成一个数」
+    /// 在数据层的落地就是这一条。
+    #[test]
+    fn skipping_a_note_removes_it_from_the_pending_list() {
+        let (_dir, mut db) = opened_vault();
+        db.upsert_ok(&indexed_gbk("a.md", "alpha", "al lp ph ha", "al lp"), NOW)
+            .expect("先成功索引");
+        assert_eq!(db.encoding_scan(10).expect("清单").total, 1);
+
+        db.upsert_skipped(
+            &SkippedNote {
+                path: "a.md".to_string(),
+                name_lower: "a".to_string(),
+                size: 3 * 1024 * 1024,
+                mtime: NOW,
+                reason: SkipReason::TooLarge,
+            },
+            NOW,
+        )
+        .expect("改成跳过");
+
+        assert_eq!(
+            db.encoding_scan(10).expect("清单").total,
+            0,
+            "跳过的篇不许留在待转存清单里"
+        );
     }
 
     /// 批次里任一条失败 → 整批回滚，不留半批。

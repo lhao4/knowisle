@@ -53,6 +53,26 @@ export const commands = {
 	 *  让搜索报错——用户会以为"搜不了"。
 	 */
 	vaultSearch: (root: string, query: string, refreshPath: string | null) => __TAURI_INVOKE<SearchResult>("vault_search", { root, query, refreshPath }),
+	/**
+	 *  库级编码统计：**不打开任何一篇**就知道库里有多少篇不是 UTF-8。
+	 * 
+	 *  # 数据从哪来
+	 * 
+	 *  索引库的 `note.src_encoding` 列——索引器读正文时顺手记下的（ADR-012）。
+	 *  这条命令**不扫盘、不读正文**：扫描的 500ms 预算不许被它花掉，而「哪几篇
+	 *  不是 UTF-8」这个事实本来就要读每一篇才知道（10k 篇 9.9 秒）。
+	 * 
+	 *  # `truncated` 与 `total` 的分工
+	 * 
+	 *  `total` 永远是**精确**的待转存篇数；`truncated` 只说明 `non_utf8` 清单
+	 *  被截到了前 `ENCODING_LIST_MAX` 条。别把清单长度当总数——那是两件事。
+	 * 
+	 *  # 索引在建时
+	 * 
+	 *  返回 `indexState: building`，`total` 是「目前为止数到的」。前端必须
+	 *  继续等，而不是把 0 当成「库里没有非 UTF-8」。
+	 */
+	vaultEncodingStats: (root: string) => __TAURI_INVOKE<EncodingStats>("vault_encoding_stats", { root }),
 	/**  读取单篇笔记。`path` 必须是 `vault_scan` 返回过的 POSIX 相对路径。 */
 	noteRead: (root: string, path: string) => __TAURI_INVOKE<NoteContent>("note_read", { root, path }),
 	/**
@@ -72,7 +92,8 @@ export const commands = {
 	 * 
 	 *  这是 ADR-010「保存写回原编码」那条红线的**唯一例外**，所以它只能被
 	 *  一个明确的用户动作触发（入口按钮 + 二次确认）。没有「打开就转」
-	 *  「保存就转」「后台批量转」——用户没同意过的事我们不做。
+	 *  「保存就转」「自动转」——批量入口（[`note_transcode_batch`]）同样是
+	 *  用户点了一次确认才跑，只是把确认的粒度从一篇变成一批。
 	 * 
 	 *  # 三条硬约束（都在 `ki_vault::transcode_to_utf8` 里兑现）
 	 * 
@@ -100,6 +121,56 @@ export const commands = {
 	 *  「转存之后保存坏了」。
 	 */
 	noteTranscodeToUtf8: (root: string, path: string, expectedMtime: number | null) => __TAURI_INVOKE<NoteContent>("note_transcode_to_utf8", { root, path, expectedMtime }),
+	/**
+	 *  批量转存：把一批非 UTF-8 的笔记逐篇改写成 UTF-8。
+	 * 
+	 *  # 逐篇调同一份实现
+	 * 
+	 *  每一篇都走 [`note_transcode_to_utf8`] 背后那条 `ki_vault::transcode_to_utf8`
+	 *  （备份 → 原子写 → 重读）。**没有第二份批量实现**——多一份就多一处
+	 *  fsync / 备份 / 原子写的逻辑，而那三件事出错都是数据丢失。
+	 * 
+	 *  # 参数
+	 * 
+	 *  - `paths`：要转存的 Vault 相对路径。通常是 `vault_encoding_stats` 的
+	 *    `nonUtf8` 原样传回；也可以只传其中一部分（用户在清单里勾选）。
+	 *  - `token`：本次批量的标识，由**前端**生成。取消命令靠它定位批次；
+	 *    进度事件也带它，前端据此忽略上一轮的残留事件。
+	 * 
+	 *  # 失败不中断
+	 * 
+	 *  单篇失败记进 `failed` 继续跑。一篇只读目录下的笔记不该让剩下 999 篇
+	 *  都转不了——那正是这一刀要消灭的「一篇篇点」。
+	 * 
+	 *  # 可取消
+	 * 
+	 *  见 [`note_transcode_cancel`]。取消后已转好的**不回滚**（`history/` 里有
+	 *  备份，转存本身幂等）。
+	 * 
+	 *  # 进度
+	 * 
+	 *  每跑完一篇，Rust 侧更新一次真实进度；前端按 `token` 轮询
+	 *  [`note_transcode_progress`]。**不许**按「发了几个请求」猜进度：
+	 *  一次 IPC 调用跑完 1000 篇，中间没有任何可观测的点。
+	 */
+	noteTranscodeBatch: (root: string, paths: string[], token: number) => __TAURI_INVOKE<TranscodeBatch>("note_transcode_batch", { root, paths, token }),
+	/**
+	 *  查一批转存的当前进度。批次还没开始或已经结束时返回 `null`。
+	 * 
+	 *  返回 `null` **不是**「进度归零」：批量的最终事实由
+	 *  [`note_transcode_batch`] 的返回值给出，这条命令只服务「正在跑」那一段。
+	 */
+	noteTranscodeProgress: (token: number) => __TAURI_INVOKE<TranscodeProgress | null>("note_transcode_progress", { token }),
+	/**
+	 *  请求取消一个正在跑的批量转存。
+	 * 
+	 *  粒度是「篇与篇之间」：当前这一篇会跑完（≤20ms），然后停下。
+	 *  已转好的保持已转、未转的仍是原编码——**不回滚**，理由见
+	 *  [`note_transcode_batch`]。
+	 * 
+	 *  幂等：token 不存在、批次已经自己跑完，都是空操作。
+	 */
+	noteTranscodeCancel: (token: number) => __TAURI_INVOKE<null>("note_transcode_cancel", { token }),
 	/**
 	 *  新建一篇**空**笔记，返回它的 Vault 相对路径。
 	 * 
@@ -313,6 +384,71 @@ export type AppInfo = {
 	version: string,
 	/**  进程号。用来在"起了两个实例"时确认前端连的是哪一个。 */
 	pid: number,
+};
+
+/**
+ *  待转存清单里的一条。
+ * 
+ *  `encoding` 是**显示名**（`GBK` / `Big5` / `UTF-16LE`），由
+ *  `ki_vault::encoding::Encoding` 给出，与编辑器顶部那行「已按 X 解码」
+ *  用的是同一个来源。两处必须一致：用户在清单里看到 `GBK`，点开那篇
+ *  也必须是 `GBK`。
+ */
+export type EncodingEntry = {
+	/**  Vault 相对路径（POSIX）。 */
+	path: string,
+	/**  磁盘上实际的编码名。 */
+	encoding: string,
+};
+
+/**
+ *  库级编码统计：**不打开任何一篇**就能知道库里有多少篇不是 UTF-8。
+ * 
+ *  # `total` 是精确值，`truncated` 只描述清单
+ * 
+ *  检索那边的 `truncated` 表示「`total` 是下界」，因为候选池按预算截断后
+ *  不再逐篇数。这里不一样：`count(*)` 是索引上的常数级查询，**永远精确**，
+ *  没有理由让它变成下界。所以：
+ * 
+ *  | 字段 | 含义 |
+ *  |---|---|
+ *  | `total` | 待转存的篇数，**精确** |
+ *  | `non_utf8` | 按路径排序的清单，最多 `limit` 条 |
+ *  | `truncated` | 清单被截断了（`non_utf8` 只是前 `limit` 条） |
+ * 
+ *  两者共有的语义只有一条：**`truncated` 为真时，别把清单长度当成全部**。
+ *  UI 因此可以一直显示精确的「N 篇不是 UTF-8」，同时在清单底部说
+ *  「只列出前 N 篇」。
+ * 
+ *  # 为什么不给「UTF-8 篇数」
+ * 
+ *  前端要的句子是「N 篇不是 UTF-8」。分母（库里一共几篇）侧栏已经有
+ *  （扫描结果），再给一个会在两次刷新之间与树对不上。
+ */
+export type EncodingStats = {
+	/**  待转存篇数（精确）。 */
+	total: number,
+	/**  待转存清单，按路径升序。最多 `ENCODING_LIST_MAX` 条。 */
+	nonUtf8: EncodingEntry[],
+	/**  清单是否被截断。 */
+	truncated: boolean,
+	/**
+	 *  这份统计**依据的那份索引**建到哪了。
+	 * 
+	 *  # 为什么必须有这个字段
+	 * 
+	 *  数字来自索引。索引在后台建（10k 篇 10–108 秒），建到一半时 `total`
+	 *  是「目前为止看到的篇数」——它会被读成「库里只有 5 篇不是 UTF-8」。
+	 *  而索引库刚被重建（schema 升级、换库、库损坏）时更糟：那一刻 `total`
+	 *  是 0，而用户的库里明明躺着几百篇 GBK。
+	 * 
+	 *  有了它，前端能说「索引还在建，这个数会长」并继续等，而不是把
+	 *  「还没数到」当成「没有」——后者会让入口**永远不出现**。
+	 * 
+	 *  复用检索那边同一个 [`IndexState`]：同一件事（索引建到哪）不该有
+	 *  第二套枚举。
+	 */
+	indexState: IndexState,
 };
 
 /**
@@ -898,6 +1034,60 @@ export type SearchResult = {
 	 *  索引在后台写。前端必须把这件事说出来（见 [`IndexState`] 的说明）。
 	 */
 	indexState: IndexState,
+};
+
+/**
+ *  一次批量转存的结果。
+ * 
+ *  # 三件事必须分开说
+ * 
+ *  - `ok`：真的被改写成 UTF-8 的篇（**不含**本来就是 UTF-8 的幂等篇——
+ *    它们根本不会进清单，见 `EncodingStats`）；
+ *  - `failed`：逐条带路径与原因，**不是**一个总数；
+ *  - `cancelled`：用户中途点了取消。已转好的**不回滚**（`history/` 里有备份，
+ *    且转存是幂等的），所以 `ok` 仍然要如实给出。
+ */
+export type TranscodeBatch = {
+	ok: string[],
+	failed: TranscodeFailure[],
+	/**  是否被用户取消。取消后 `ok + failed` 只覆盖跑过的那一段。 */
+	cancelled: boolean,
+};
+
+/**
+ *  批量转存里的一篇失败。
+ * 
+ *  `error` 是完整的 [`KiError`]，不是一句拼好的文案：前端已经有
+ *  `describeError`（13 个变体逐个分支，末尾 `never` 兜底），在这里再拼一遍
+ *  等于把错误模型抄第二份，且抄漏的那一支会静默落到「未知错误」。
+ */
+export type TranscodeFailure = {
+	path: string,
+	error: KiError,
+};
+
+/**
+ *  批量转存的进度事件载荷。
+ * 
+ *  # 为什么进度从 Rust 来
+ * 
+ *  前端按「发了几个请求」猜进度是不准的：一次 IPC 调用跑完 1000 篇，
+ *  中间没有任何可观测的点。逐篇 emit 是唯一能反映**真实**进度的做法
+ *  （也顺带让「卡在第 3 篇」这种失败可见）。
+ * 
+ *  事件名见 `ki_ipc::commands::TRANSCODE_PROGRESS_EVENT`。
+ */
+export type TranscodeProgress = {
+	/**  本次批量的标识。前端拿它过滤掉上一轮（或别的窗口）的事件。 */
+	token: number,
+	/**  已经处理完的篇数（含失败）。 */
+	done: number,
+	/**  本次要处理的总篇数。 */
+	total: number,
+	/**  刚处理完的那一篇。 */
+	path: string,
+	/**  到目前为止失败的篇数。 */
+	failed: number,
 };
 
 /**

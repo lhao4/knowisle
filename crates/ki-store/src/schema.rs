@@ -13,7 +13,20 @@
 //! 同时引入 refinery 与从 v1 起的基线迁移——那时重建不再是无损操作。
 
 /// 当前 schema 版本，写进 `PRAGMA user_version`。
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// # 版本史
+///
+/// | 版本 | 改了什么 |
+/// |---|---|
+/// | 1 | 初始：`note` + 三张 FTS5 表 |
+/// | 2 | `note` 多一列 `src_encoding TEXT NULL`（源文件不是 UTF-8 时记编码名）。加列只能整库重建——见下 |
+///
+/// **没有 `ALTER TABLE` 迁移**，v1 的库在打开时被判成
+/// [`crate::RebuildReason::SchemaVersion`](crate::RebuildReason)，整库重建。
+/// 这不是偷懒：加一列要重读每一篇才能填上（`src_encoding` 的值来自正文解码），
+/// 而「重读每一篇」与「重建整个库」是同一件事——迁移只会多写一遍
+/// `UPDATE note SET src_encoding = ...`，还得先扫盘算出该填什么。
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// 分词与投影规则的版本。
 ///
@@ -68,10 +81,18 @@ CREATE TABLE IF NOT EXISTS note (
   mtime       INTEGER NOT NULL,
   status      TEXT    NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','skipped')),
   skip_reason TEXT,
-  indexed_at  INTEGER NOT NULL
+  indexed_at  INTEGER NOT NULL,
+  src_encoding TEXT
 );
 
 CREATE INDEX IF NOT EXISTS note_status ON note(status);
+
+-- 待转存集合的扫描入口：只索引「不是 UTF-8」的那一小撮行。
+--
+-- 部分索引而不是全列索引：10k 篇里通常只有几十篇非 UTF-8，全列索引会为
+-- 9900 个 NULL 各写一条记录，而查询永远只问 `IS NOT NULL` 那一侧。
+CREATE INDEX IF NOT EXISTS note_src_encoding ON note(src_encoding)
+  WHERE src_encoding IS NOT NULL;
 
 -- 通道 A：ASCII 投影，服务英文与代码标识符（词首前缀匹配）
 CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(

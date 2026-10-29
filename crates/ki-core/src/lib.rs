@@ -13,11 +13,13 @@
 //! 而两套契约迟早会不一致。`specta` 是纯类型反射库，不带 IO、不带 tauri，
 //! 因此没有违反 A2。
 
+pub mod encoding;
 pub mod error;
 pub mod node;
 pub mod search;
 pub mod trash;
 
+pub use encoding::{EncodingEntry, EncodingStats, TranscodeBatch, TranscodeFailure, TranscodeProgress};
 pub use error::{IoKind, KiError};
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{IndexState, SearchHit, SearchResult};

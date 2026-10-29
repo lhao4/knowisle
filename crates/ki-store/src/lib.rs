@@ -72,6 +72,23 @@ pub(crate) mod testing {
             body_ascii: body_ascii.to_string(),
             body_bigram: body_bigram.to_string(),
             body_tokens: body_tokens.to_string(),
+            src_encoding: None,
+        }
+    }
+
+    /// 同上，但记成「磁盘上不是 UTF-8」。
+    ///
+    /// 单独一个构造函数而不是给 `indexed` 加参数：调用点有二十几处，
+    /// 加参数会让每一处都多一个 `None`，而其中只有两处关心编码。
+    pub(crate) fn indexed_gbk(
+        path: &str,
+        body_ascii: &str,
+        body_bigram: &str,
+        body_tokens: &str,
+    ) -> IndexedNote {
+        IndexedNote {
+            src_encoding: Some("GBK".to_string()),
+            ..indexed(path, body_ascii, body_bigram, body_tokens)
         }
     }
 }

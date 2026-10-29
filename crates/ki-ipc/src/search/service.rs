@@ -48,7 +48,7 @@ use std::sync::atomic::Ordering;
 use std::sync::PoisonError;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ki_core::{IndexState, KiError, ScanResult, SearchHit, SearchResult};
+use ki_core::{EncodingStats, IndexState, KiError, ScanResult, SearchHit, SearchResult};
 use ki_search::{bigrams, fuse, plan, project, token_stream, Mode, Plan};
 use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
@@ -1105,6 +1105,58 @@ pub fn reindex(root: &Path, rel: &str) -> Result<(), KiError> {
     Ok(())
 }
 
+/// 待转存清单一次最多返回多少条。
+///
+/// 与检索那边的 200 条不是一个数：那是**命中行**的返回上限（一屏用不完），
+/// 这里是**清单**上限，而清单要能被「一次确认全部转存」消费。1000 篇 GBK
+/// 的库是这一刀的目标规模（批量转存 1000 篇约十几秒），所以上限就取它。
+///
+/// 超过时 `truncated` 为真，UI 必须说「只列出前 N 篇」而不是把 1000 当全部。
+pub const ENCODING_LIST_MAX: usize = 1000;
+
+/// 库级编码统计：哪些篇不是 UTF-8、各有几篇。
+///
+/// # 为什么不开新连接、不自己扫盘
+///
+/// 走 [`lock`] 与 [`ensure_root`] 的既有纪律：与检索共用同一个连接，
+/// 也就与「切库时释放连接」共用同一条生命周期。自己 `IndexDb::open` 一份
+/// 会让体检（`quick_check` 扫全页结构）在每次调用时重做一遍。
+///
+/// # 索引在建时**让路**
+///
+/// 后台建库期间这里不新开连接（那会在 Windows 上抢写锁），而是把
+/// 「正在建到 N/M」如实回报给前端——前端据此继续等，而不是把 0 当成
+/// 「库里没有非 UTF-8」。让路这条判据与 [`search`] 的自愈路径完全一致。
+pub fn encoding_stats(root: &Path) -> Result<EncodingStats, KiError> {
+    let root = canonical_root(root)?;
+    let mut cache = lock();
+    ensure_root(&mut cache, &root);
+
+    // 状态必须在**读库之前**取：反过来的话，后台在两次调用之间刚好写完，
+    // 我们会拿「完整的结果」配一个 `Building`（保守，无害）；而现在这个
+    // 顺序只可能把「已建完」说成「在建」的另一种形态，同样无害。真正要
+    // 避免的是拿「部分结果」配 `Ready`——那才是骗人。
+    let index_state = state_for(&root);
+
+    if cache.store.is_none() {
+        if matches!(index_state, IndexState::Building { .. }) {
+            return Ok(EncodingStats::empty(index_state));
+        }
+        let (db, _) = IndexDb::open(&root)?;
+        cache.store = Some(db);
+        cache.builds += 1;
+    }
+    let db = cache.store.as_mut().expect("上面刚保证过 store 非空");
+
+    let scan = db.encoding_scan(ENCODING_LIST_MAX)?;
+    Ok(EncodingStats {
+        total: scan.total,
+        non_utf8: scan.non_utf8,
+        truncated: scan.truncated,
+        index_state,
+    })
+}
+
 /// 把「当前正在编辑的那一篇」重新索引一次。
 ///
 /// 每次搜索只重读一个文件，换来的是「刚打的字立刻能搜到」。若改成整库重建，
@@ -1193,6 +1245,13 @@ fn indexed_note(note: &ki_core::NoteContent) -> IndexedNote {
         body_bigram: bigrams(&ascii),
         body_ascii: ascii,
         body_tokens: token_stream(&note.content),
+        // 索引器**顺手**知道这件事：`read_note_in` 刚解过码。丢掉它就等于
+        // 让用户一篇篇打开看提示行（ADR-012）。
+        //
+        // `None` 严格等价于「磁盘本来就是 UTF-8（含 BOM）」：`is_utf8()` 把
+        // `Utf8Bom` 算作 UTF-8，所以带 BOM 的篇**不会**进待转存集合——
+        // 剥 BOM 是另一件事，不是编码转换。
+        src_encoding: note.decoded_from.clone(),
     }
 }
 

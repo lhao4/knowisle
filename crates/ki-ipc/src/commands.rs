@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use ki_core::{
-    AppInfo, KiError, NoteContent, PurgeResult, RestoreResult, SaveResult, SaveState, ScanResult,
-    SearchResult, TrashCursor, TrashPage,
+    AppInfo, EncodingStats, KiError, NoteContent, PurgeResult, RestoreResult, SaveResult, SaveState,
+    ScanResult, SearchResult, TranscodeBatch, TranscodeProgress, TrashCursor, TrashPage,
 };
 use ki_vault::trash as trash_ops;
 use ki_vault::{
@@ -116,7 +116,8 @@ pub async fn note_save(root: String, path: String, content: String) -> Result<Sa
 ///
 /// 这是 ADR-010「保存写回原编码」那条红线的**唯一例外**，所以它只能被
 /// 一个明确的用户动作触发（入口按钮 + 二次确认）。没有「打开就转」
-/// 「保存就转」「后台批量转」——用户没同意过的事我们不做。
+/// 「保存就转」「自动转」——批量入口（[`note_transcode_batch`]）同样是
+/// 用户点了一次确认才跑，只是把确认的粒度从一篇变成一批。
 ///
 /// # 三条硬约束（都在 `ki_vault::transcode_to_utf8` 里兑现）
 ///
@@ -156,6 +157,93 @@ pub async fn note_transcode_to_utf8(
         Ok(note)
     })
     .await
+}
+
+/// 库级编码统计：**不打开任何一篇**就知道库里有多少篇不是 UTF-8。
+///
+/// # 数据从哪来
+///
+/// 索引库的 `note.src_encoding` 列——索引器读正文时顺手记下的（ADR-012）。
+/// 这条命令**不扫盘、不读正文**：扫描的 500ms 预算不许被它花掉，而「哪几篇
+/// 不是 UTF-8」这个事实本来就要读每一篇才知道（10k 篇 9.9 秒）。
+///
+/// # `truncated` 与 `total` 的分工
+///
+/// `total` 永远是**精确**的待转存篇数；`truncated` 只说明 `non_utf8` 清单
+/// 被截到了前 `ENCODING_LIST_MAX` 条。别把清单长度当总数——那是两件事。
+///
+/// # 索引在建时
+///
+/// 返回 `indexState: building`，`total` 是「目前为止数到的」。前端必须
+/// 继续等，而不是把 0 当成「库里没有非 UTF-8」。
+#[tauri::command]
+#[specta::specta]
+pub async fn vault_encoding_stats(root: String) -> Result<EncodingStats, KiError> {
+    run_blocking(move || search::encoding_stats(Path::new(&root))).await
+}
+
+/// 批量转存：把一批非 UTF-8 的笔记逐篇改写成 UTF-8。
+///
+/// # 逐篇调同一份实现
+///
+/// 每一篇都走 [`note_transcode_to_utf8`] 背后那条 `ki_vault::transcode_to_utf8`
+/// （备份 → 原子写 → 重读）。**没有第二份批量实现**——多一份就多一处
+/// fsync / 备份 / 原子写的逻辑，而那三件事出错都是数据丢失。
+///
+/// # 参数
+///
+/// - `paths`：要转存的 Vault 相对路径。通常是 `vault_encoding_stats` 的
+///   `nonUtf8` 原样传回；也可以只传其中一部分（用户在清单里勾选）。
+/// - `token`：本次批量的标识，由**前端**生成。取消命令靠它定位批次；
+///   进度事件也带它，前端据此忽略上一轮的残留事件。
+///
+/// # 失败不中断
+///
+/// 单篇失败记进 `failed` 继续跑。一篇只读目录下的笔记不该让剩下 999 篇
+/// 都转不了——那正是这一刀要消灭的「一篇篇点」。
+///
+/// # 可取消
+///
+/// 见 [`note_transcode_cancel`]。取消后已转好的**不回滚**（`history/` 里有
+/// 备份，转存本身幂等）。
+///
+/// # 进度
+///
+/// 每跑完一篇，Rust 侧更新一次真实进度；前端按 `token` 轮询
+/// [`note_transcode_progress`]。**不许**按「发了几个请求」猜进度：
+/// 一次 IPC 调用跑完 1000 篇，中间没有任何可观测的点。
+#[tauri::command]
+#[specta::specta]
+pub async fn note_transcode_batch(
+    root: String,
+    paths: Vec<String>,
+    token: u64,
+) -> Result<TranscodeBatch, KiError> {
+    run_blocking(move || Ok(crate::transcode::run_batch(&PathBuf::from(root), paths, token))).await
+}
+
+/// 查一批转存的当前进度。批次还没开始或已经结束时返回 `null`。
+///
+/// 返回 `null` **不是**「进度归零」：批量的最终事实由
+/// [`note_transcode_batch`] 的返回值给出，这条命令只服务「正在跑」那一段。
+#[tauri::command]
+#[specta::specta]
+pub async fn note_transcode_progress(token: u64) -> Result<Option<TranscodeProgress>, KiError> {
+    Ok(crate::transcode::progress(token))
+}
+
+/// 请求取消一个正在跑的批量转存。
+///
+/// 粒度是「篇与篇之间」：当前这一篇会跑完（≤20ms），然后停下。
+/// 已转好的保持已转、未转的仍是原编码——**不回滚**，理由见
+/// [`note_transcode_batch`]。
+///
+/// 幂等：token 不存在、批次已经自己跑完，都是空操作。
+#[tauri::command]
+#[specta::specta]
+pub async fn note_transcode_cancel(token: u64) -> Result<(), KiError> {
+    crate::transcode::cancel(token);
+    Ok(())
 }
 
 /// 新建一篇**空**笔记，返回它的 Vault 相对路径。
