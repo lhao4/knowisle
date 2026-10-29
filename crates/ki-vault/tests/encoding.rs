@@ -330,6 +330,65 @@ fn gbk_edit_keeps_the_rest_of_the_note() {
     assert_eq!(disk_bytes(root, "gbk.md"), gbk_bytes(&edited));
 }
 
+/* ───────────────── B-38 的病灶（characterization test） ───────────────── */
+
+/// **这条记录的是 B-38 的病灶，不是期望行为。**
+///
+/// GBK 笔记里加一个 emoji，保存被拒——而且应用内没有任何出路：用户要么去
+/// 外部编辑器另存为 UTF-8，要么删掉自己想写的那个字。判据不只是「报错」，
+/// 还有「重新读一遍，那个字确实不在磁盘上」：拒绝保存是正确的一半，
+/// 另一半是它把用户堵在死胡同里。
+///
+/// 转存为 UTF-8 落地之后，这条会被翻成「转存之后能存」。
+#[test]
+fn b38_symptom_gbk_note_cannot_keep_an_emoji_the_user_typed() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let original = gbk_bytes("中文笔记\n");
+    fs::write(root.join("gbk.md"), &original).unwrap();
+
+    let note = read_note(root, "gbk.md").unwrap();
+    let wanted = format!("{}😀", note.content);
+    let err = write_note(root, "gbk.md", &wanted).expect_err("GBK 装不下 emoji");
+    assert!(
+        format!("{err:?}").contains("EncodingNotWritable"),
+        "实际 {err:?}"
+    );
+
+    // 病灶的第二半：想写的字在磁盘上没有落点，而界面只能再说一次「保存失败」。
+    let after = read_note(root, "gbk.md").unwrap();
+    assert_eq!(after.content, note.content, "那个 emoji 没能留在磁盘上");
+    assert!(!after.content.contains('😀'));
+    assert_eq!(disk_bytes(root, "gbk.md"), original);
+}
+
+/// **这条记录的是 B-38 的病灶，不是期望行为。**
+///
+/// Big5 的重复映射（`A2 A4` 与 `F9 F9` 都是「═」）让往返不无损，于是这类
+/// 文件连「改一个错别字」都做不到——每一次保存都被拒，与改了什么无关。
+///
+/// 转存为 UTF-8 落地之后，这条会被翻成 `…_is_editable_after_transcode`。
+#[test]
+fn b38_symptom_big5_note_cannot_fix_a_typo() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // 「中文筆記」+ 重复映射的「═」
+    let original = [0xA4, 0xA4, 0xA4, 0xE5, 0xB5, 0xA7, 0xB0, 0x4F, 0xA2, 0xA4];
+    fs::write(root.join("big5.md"), original).unwrap();
+
+    let note = read_note(root, "big5.md").unwrap();
+    assert_eq!(note.content, "中文筆記═");
+
+    // 「改一个错别字」：把「文」改成「字」，两个都在 Big5 里，装得下。
+    let edited = note.content.replace('文', "字");
+    let err = write_note(root, "big5.md", &edited).expect_err("往返不无损时任何保存都被拒");
+    assert!(
+        format!("{err:?}").contains("EncodingNotWritable"),
+        "实际 {err:?}"
+    );
+    assert_eq!(disk_bytes(root, "big5.md"), original, "拒绝保存时磁盘不许动");
+}
+
 /// 用 `iconv` 生成 GBK 字节：**不拿自己的编码器当夹具的裁判**。
 fn gbk_bytes(text: &str) -> Vec<u8> {
     use std::io::Write;
