@@ -68,6 +68,39 @@ export const commands = {
 	 */
 	noteSave: (root: string, path: string, content: string) => __TAURI_INVOKE<SaveResult>("note_save", { root, path, content }),
 	/**
+	 *  把一篇非 UTF-8 的笔记**显式地**转存为 UTF-8，返回转存后的正文。
+	 * 
+	 *  这是 ADR-010「保存写回原编码」那条红线的**唯一例外**，所以它只能被
+	 *  一个明确的用户动作触发（入口按钮 + 二次确认）。没有「打开就转」
+	 *  「保存就转」「后台批量转」——用户没同意过的事我们不做。
+	 * 
+	 *  # 三条硬约束（都在 `ki_vault::transcode_to_utf8` 里兑现）
+	 * 
+	 *  1. **先备份**：原字节逐字节进 `.knowisle/history/<path>/<unix_ms>.md`。
+	 *     备份写不进去就整个失败——没有备份的转存不可撤销。
+	 *  2. **原子写**：`tmp → fsync → rename`，与保存共用同一条路径。
+	 *  3. **幂等**：磁盘上本来就是 UTF-8 时不写盘、不动 mtime、不留备份。
+	 * 
+	 *  # 参数
+	 * 
+	 *  - `expected_mtime`：打开这篇时 `note_read` 给出的 mtime（或最近一次成功
+	 *    落盘的 mtime）。与 `note_save` 的乐观锁同一判据：过期返回 `CONFLICT`，
+	 *    此时磁盘一个字节都没动，`history/` 下也没有残留。
+	 * 
+	 *  # 返回值为什么是 `NoteContent` 而不是回执
+	 * 
+	 *  `size` 与 `mtime` 都变了，前端必须拿这份**重读**的结果替换 `activeNote`
+	 *  ——只改本地 state 会让下一次自动保存拿着旧 mtime 撞 `CONFLICT`。
+	 *  同时 `decoded_from` 变成 `null`，顶部那行「已按 GBK 解码」随之消失。
+	 * 
+	 *  # 槽位对齐
+	 * 
+	 *  转存之后顺手把自动保存的基线推到新 mtime（[`autosave::rebase_after_transcode`]）。
+	 *  不做这一步的话，磁盘变了而基线没变，下一次保存必然冲突——看起来像
+	 *  「转存之后保存坏了」。
+	 */
+	noteTranscodeToUtf8: (root: string, path: string, expectedMtime: number | null) => __TAURI_INVOKE<NoteContent>("note_transcode_to_utf8", { root, path, expectedMtime }),
+	/**
 	 *  新建一篇**空**笔记，返回它的 Vault 相对路径。
 	 * 
 	 *  # 参数

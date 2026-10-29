@@ -26,6 +26,7 @@ import {
   noteRead,
   noteRename,
   noteStatus,
+  noteTranscodeToUtf8,
   pickFolder,
   vaultScan,
   type FileNode,
@@ -581,6 +582,68 @@ export default function App() {
     [],
   )
 
+  /**
+   * 「转存为 UTF-8」的二次确认。
+   *
+   * # 为什么它留在这里，不进 hook
+   *
+   * 它写三个域的状态：`activeNote`（换成重读的结果）、`saveState`（基线变了）、
+   * `flash`（一句回执）。按「读写都在一个域才进 hook」的判据，它没有归属。
+   *
+   * # 为什么不用 `window.confirm`
+   *
+   * WebView2 里那是原生对话框，CDP 点不到——e2e 会表现成「点了按钮什么都
+   * 没发生」。回收站清空用的 `ConfirmDialog`（`role="alertdialog"`）已经
+   * 证明可驱动，二次确认必须复用它。
+   */
+  const [transcodeOpen, setTranscodeOpen] = useState(false)
+  const requestTranscode = useCallback(() => setTranscodeOpen(true), [])
+  const closeTranscode = useCallback(() => setTranscodeOpen(false), [])
+
+  /**
+   * 执行转存。失败原因原样返回给 `ConfirmDialog`（它负责显示）。
+   *
+   * # 顺序里两条不能省的
+   *
+   * 1. **先尽力冲刷，但不因失败而中止。** GBK 里打的那个 emoji 正是转存的
+   *    理由，而它当初存不进去——要求「先保存成功才能转存」等于把出口锁死。
+   * 2. **转存之后再冲一次。** 磁盘现在是 UTF-8 了，编辑器里压着的那几个字
+   *    终于存得下去。不做这一步，用户要等 1.5 秒的自动保存才看到结果。
+   *
+   * # `expectedMtime` 取哪一个
+   *
+   * 不是 `activeNote.mtime`：那是**打开时**的 mtime，自动保存成功过几次之后
+   * 它已经过期，拿它去比对必然 `CONFLICT`。最近一次成功落盘的 mtime 才是
+   * 磁盘现状（`noteStatus` 的 `lastSavedMtime`），没有就退回打开时那个。
+   */
+  const submitTranscode = useCallback(async (): Promise<string | null> => {
+    if (!vault || !activeNote) return '没有打开的笔记'
+    const path = activeNote.path
+
+    await flushActiveNote()
+    const state = await noteStatus(vault.root, path).catch(() => null)
+    const expected = state?.lastSavedMtime ?? activeNote.mtime
+
+    try {
+      const note = await noteTranscodeToUtf8(vault.root, path, expected)
+      // 必须用返回值替换：`size` 与 `mtime` 都变了，只改本地 state 会让下一次
+      // 自动保存拿着旧 mtime 撞 CONFLICT。`decodedFrom` 也变成 null，
+      // 上面那行提示随之消失。
+      setActiveNote(note)
+      setError(null)
+      setSaveState(await noteStatus(vault.root, path).catch(() => null))
+
+      if (editorRef.current?.getContent() !== note.content) {
+        await flushActiveNote()
+        setSaveState(await noteStatus(vault.root, path).catch(() => null))
+      }
+      showFlash('已转存为 UTF-8')
+      return null
+    } catch (err) {
+      return describeError(err)
+    }
+  }, [vault, activeNote, flushActiveNote, showFlash])
+
   // 启动时 ping 一次：确认 Rust 侧真的起来了。
   // 如果这一句失败，后面所有按钮都会失败，报错信息会误导排查方向。
   useEffect(() => {
@@ -869,11 +932,28 @@ export default function App() {
                  *
                  * 保存不受它影响：写回哪个编码由 Rust 在写盘前重新探测磁盘，
                  * 前端说了不算。
+                 *
+                 * # 那个按钮为什么在这里
+                 *
+                 * 只描述困境不给出口，等于让用户自己去外部编辑器另存。GBK 里
+                 * 加 emoji、Big5 的重复映射这两类笔记在应用内**没有任何出路**，
+                 * 而这一行恰好是它们唯一的「我认得这篇的编码」的落点。
+                 *
+                 * 动作必须显式（按钮 + 二次确认）：改磁盘编码是 ADR-010 那条
+                 * 红线的唯一例外，不许自动发生。文案与确认框在文件末尾。
                  */}
                 {activeNote.decodedFrom !== null && (
-                  <p className="viewer__encoding" role="status">
-                    已按 {activeNote.decodedFrom} 解码
-                  </p>
+                  <div className="viewer__encoding">
+                    <span role="status">已按 {activeNote.decodedFrom} 解码</span>
+                    <button
+                      type="button"
+                      className="viewer__encoding-action"
+                      onClick={requestTranscode}
+                      title="把磁盘上的这篇笔记改写成 UTF-8（原文件会先备份到 .knowisle/history/）"
+                    >
+                      转存为 UTF-8
+                    </button>
+                  </div>
                 )}
 
                 <NoteEditor
@@ -1033,6 +1113,30 @@ export default function App() {
           </p>
           <p className="confirm__note">
             不是永久删除：侧栏底部的「回收站」里可以恢复回原目录。清空回收站才会真正删掉文件。
+          </p>
+        </ConfirmDialog>
+      )}
+
+      {/*
+        转存的二次确认。文案必须把三件事说全：磁盘上的编码**会变**、
+        原文件**已经备份**到哪里、以及这件事不能靠「撤销」回退。
+        少说最后一句，用户会以为可以 Cmd+Z 回到 GBK——那是不可能的。
+      */}
+      {transcodeOpen && activeNote !== null && activeNote.decodedFrom !== null && (
+        <ConfirmDialog
+          title="转存为 UTF-8？"
+          confirmLabel="转存"
+          onSubmit={submitTranscode}
+          onClose={closeTranscode}
+        >
+          <p>
+            这篇笔记在磁盘上是 <span className="confirm__name">{activeNote.decodedFrom}</span>
+            。转存会把文件本身改写成 UTF-8。
+          </p>
+          <p className="confirm__note">
+            原文件会先逐字节备份到 <code className="confirm__path">.knowisle/history/</code>
+            ，后悔了可以从那里拿回来。转存之后这篇笔记在别的工具里也是 UTF-8，
+            而撤销（Ctrl/Cmd+Z）不会把编码改回去。
           </p>
         </ConfirmDialog>
       )}

@@ -23,6 +23,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
  * - `trash-page` 排最后：它每轮都要 `cargo test` 重造 10k 条夹具，是所有步骤里
  *   最慢的一步，而且它自己结尾会 `killApp()`（清空 1 万条之后那个进程里的
  *   索引缓存已经没有意义）。放最后，前面六步的快速反馈不必等它。
+ * - `encoding` 插在 `theme` 之后、`trash-page` 之前：它要一个干净的夹具库，
+ *   但**不能**跟在 `trash-page` 后面——那一步结尾会 `killApp()`，收尾的
+ *   kill 会让后面脚本的 `--restart` 撞上一个正在退出的进程。
  * - 其余各自一个夹具库，互不干扰。
  */
 const STEPS = [
@@ -32,6 +35,7 @@ const STEPS = [
   ['e2e:outline', 'cdp-outline.mjs', '大纲：跟随光标 / 折叠 / 计数'],
   ['e2e:keys', 'cdp-keys.mjs', '快捷键：新建 / 保存 / 加粗 / 斜体'],
   ['e2e:theme', 'cdp-theme.mjs', '主题：三态切换 / 对比度 / 闪烁'],
+  ['e2e:encoding', 'cdp-encoding.mjs', '编码：转存为 UTF-8'],
   ['e2e:trash-page', 'cdp-trash-page.mjs', '回收站：10k 条分页'],
 ]
 

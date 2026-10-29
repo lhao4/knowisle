@@ -16,14 +16,19 @@
 //! 读对了不算完：用户改一个字再保存，磁盘上必须还是原来那个编码。
 //! 那几条用例在文件末尾，判据是**磁盘字节**，不是 `read_note` 读回来的正文
 //! ——用后者验前者是拿自己的解码器证明自己的编码器。
+//!
+//! # 转存（B-38）是这条契约的唯一例外
+//!
+//! 最后一段是 [`ki_vault::transcode_to_utf8`] 的验收：显式、先备份、原子写、
+//! 幂等。判据同样看磁盘字节——「转存成功」这句话只能由字节证明。
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use ki_core::KiError;
 use ki_vault::scan::{flatten_files, read_note, scan_vault, ScanOptions};
-use ki_vault::write_note;
+use ki_vault::{transcode_to_utf8, write_note};
 
 /// 一份夹具：文件名、磁盘字节、期望读到的正文与探测到的编码。
 struct Fixture {
@@ -288,9 +293,14 @@ fn new_note_is_plain_utf8() {
 }
 
 /// Big5 有重复映射：`A2 A4` 与 `F9 F9` 都是「═」。这种文件写回去必然改字节，
-/// 所以只读——§3 的「不可逆就退化成只读」在这里有真实触发点。
+/// 所以在转存之前它是**只读**的——§3 的「不可逆就退化成只读」在这里有真实
+/// 触发点。转存（B-38）之后它自然解锁：磁盘上的字节变成 UTF-8，往返闸
+/// 不再适用。
+///
+/// 这条用例同时钉住两半：**转存前确实存不了**（否则这一刀在解决一个
+/// 不存在的问题），以及**转存后改一个字能存**。
 #[test]
-fn big5_duplicate_mapping_is_read_only() {
+fn big5_duplicate_mapping_is_editable_after_transcode() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     // 「中文筆記」+ 一个重复映射的「═」
@@ -301,6 +311,7 @@ fn big5_duplicate_mapping_is_read_only() {
     assert_eq!(note.content, "中文筆記═");
     assert_eq!(note.decoded_from.as_deref(), Some("Big5"));
 
+    // 转存之前：任何保存都被拒，磁盘一个字节都不动。
     let err = write_note(root, "big5.md", &note.content).expect_err("往返不无损时必须拒绝保存");
     assert!(
         format!("{err:?}").contains("EncodingNotWritable"),
@@ -311,6 +322,20 @@ fn big5_duplicate_mapping_is_read_only() {
         original,
         "拒绝保存时磁盘不许动"
     );
+
+    // 转存之后：改一个字能存，磁盘是 UTF-8。
+    let transcoded = transcode_to_utf8(root, "big5.md", Some(note.mtime)).expect("转存应当成功");
+    assert_eq!(transcoded.content, "中文筆記═");
+    assert_eq!(transcoded.decoded_from, None, "转存之后不再是转码");
+    assert_eq!(
+        disk_bytes(root, "big5.md"),
+        "中文筆記═".as_bytes(),
+        "磁盘上必须是 UTF-8，不带 BOM"
+    );
+
+    let edited = transcoded.content.replace('文', "字");
+    write_note(root, "big5.md", &edited).expect("转存之后应当能存");
+    assert_eq!(disk_bytes(root, "big5.md"), edited.as_bytes());
 }
 
 /// 改一个字之后正文里的其他字符没被吃掉（防「只写回编码、内容却丢字」）。
@@ -330,18 +355,16 @@ fn gbk_edit_keeps_the_rest_of_the_note() {
     assert_eq!(disk_bytes(root, "gbk.md"), gbk_bytes(&edited));
 }
 
-/* ───────────────── B-38 的病灶（characterization test） ───────────────── */
+/* ───────────────── 转存为 UTF-8（B-38，ADR-010 的唯一例外） ───────────────── */
 
-/// **这条记录的是 B-38 的病灶，不是期望行为。**
+/// GBK 笔记里加一个 emoji：转存之前保存被拒，转存之后能存。
 ///
-/// GBK 笔记里加一个 emoji，保存被拒——而且应用内没有任何出路：用户要么去
-/// 外部编辑器另存为 UTF-8，要么删掉自己想写的那个字。判据不只是「报错」，
-/// 还有「重新读一遍，那个字确实不在磁盘上」：拒绝保存是正确的一半，
-/// 另一半是它把用户堵在死胡同里。
-///
-/// 转存为 UTF-8 落地之后，这条会被翻成「转存之后能存」。
+/// 这条是 B-38 的主验收。它原来是一条 characterization test
+/// （`b38_symptom_gbk_note_cannot_keep_an_emoji_the_user_typed`），记录的是
+/// 「想写的字没有落点」这个病灶；转存落地之后，前半段留着当**前提**
+/// （证明这一刀解决的是真问题），后半段换成期望行为。
 #[test]
-fn b38_symptom_gbk_note_cannot_keep_an_emoji_the_user_typed() {
+fn gbk_note_saves_emoji_after_transcode() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let original = gbk_bytes("中文笔记\n");
@@ -354,39 +377,166 @@ fn b38_symptom_gbk_note_cannot_keep_an_emoji_the_user_typed() {
         format!("{err:?}").contains("EncodingNotWritable"),
         "实际 {err:?}"
     );
+    assert_eq!(disk_bytes(root, "gbk.md"), original, "拒绝保存时磁盘不许动");
 
-    // 病灶的第二半：想写的字在磁盘上没有落点，而界面只能再说一次「保存失败」。
-    let after = read_note(root, "gbk.md").unwrap();
-    assert_eq!(after.content, note.content, "那个 emoji 没能留在磁盘上");
-    assert!(!after.content.contains('😀'));
-    assert_eq!(disk_bytes(root, "gbk.md"), original);
+    // 转存：磁盘上换成 UTF-8 的同一份正文。
+    let transcoded = transcode_to_utf8(root, "gbk.md", Some(note.mtime)).expect("转存应当成功");
+    assert_eq!(transcoded.content, note.content, "正文一个字都不该变");
+    assert_eq!(transcoded.decoded_from, None);
+    assert_eq!(disk_bytes(root, "gbk.md"), note.content.as_bytes());
+
+    // 现在那个 emoji 存得下去了，磁盘就是它的 UTF-8 字节。
+    write_note(root, "gbk.md", &wanted).expect("转存之后应当能存");
+    assert_eq!(disk_bytes(root, "gbk.md"), wanted.as_bytes());
+    assert_eq!(read_note(root, "gbk.md").unwrap().content, wanted);
 }
 
-/// **这条记录的是 B-38 的病灶，不是期望行为。**
+/// 转存返回的 `NoteContent.decoded_from` 必须是 `None`——前端那行提示据此消失。
 ///
-/// Big5 的重复映射（`A2 A4` 与 `F9 F9` 都是「═」）让往返不无损，于是这类
-/// 文件连「改一个错别字」都做不到——每一次保存都被拒，与改了什么无关。
-///
-/// 转存为 UTF-8 落地之后，这条会被翻成 `…_is_editable_after_transcode`。
+/// 顺带钉住「不带 BOM」：转存的目标是「最通用的形态」，不是「记事本兼容」。
+/// 带 BOM 的 UTF-8 在 `is_utf8()` 里算「本来就是 UTF-8」，所以它走幂等分支、
+/// 原样保留 BOM——这是刻意的，别把两件事混成一件。
 #[test]
-fn b38_symptom_big5_note_cannot_fix_a_typo() {
+fn transcode_returns_plain_utf8_without_bom() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    // 「中文筆記」+ 重复映射的「═」
-    let original = [0xA4, 0xA4, 0xA4, 0xE5, 0xB5, 0xA7, 0xB0, 0x4F, 0xA2, 0xA4];
-    fs::write(root.join("big5.md"), original).unwrap();
+    fs::write(root.join("gbk.md"), gbk_bytes("# 标题\n正文\n")).unwrap();
 
-    let note = read_note(root, "big5.md").unwrap();
-    assert_eq!(note.content, "中文筆記═");
+    let note = read_note(root, "gbk.md").unwrap();
+    assert_eq!(note.decoded_from.as_deref(), Some("GBK"));
 
-    // 「改一个错别字」：把「文」改成「字」，两个都在 Big5 里，装得下。
-    let edited = note.content.replace('文', "字");
-    let err = write_note(root, "big5.md", &edited).expect_err("往返不无损时任何保存都被拒");
-    assert!(
-        format!("{err:?}").contains("EncodingNotWritable"),
-        "实际 {err:?}"
+    let after = transcode_to_utf8(root, "gbk.md", Some(note.mtime)).unwrap();
+    assert_eq!(after.decoded_from, None, "转存之后不许再报「已按 X 解码」");
+    assert_eq!(after.content, "# 标题\n正文\n");
+    assert_eq!(after.size, after.content.len() as u64, "size 是磁盘真值");
+    assert_eq!(disk_bytes(root, "gbk.md"), "# 标题\n正文\n".as_bytes());
+    assert_ne!(&disk_bytes(root, "gbk.md")[..1], &[0xEF], "不许带 BOM");
+}
+
+/// 备份逐字节等于原文件——这是「可撤销」的唯一保证，不是可选项。
+#[test]
+fn transcode_backup_is_byte_identical() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let original = gbk_bytes("中文笔记\n");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("notes/gbk.md"), &original).unwrap();
+
+    let note = read_note(root, "notes/gbk.md").unwrap();
+    transcode_to_utf8(root, "notes/gbk.md", Some(note.mtime)).unwrap();
+
+    let backups = history_files(root, "notes/gbk.md");
+    assert_eq!(backups.len(), 1, "转存一次只该留一份备份：{backups:?}");
+    assert_eq!(
+        fs::read(&backups[0]).unwrap(),
+        original,
+        "备份必须逐字节等于原文件（不是「按原编码编回去的正文」）"
     );
-    assert_eq!(disk_bytes(root, "big5.md"), original, "拒绝保存时磁盘不许动");
+    assert_eq!(
+        backups[0].parent().unwrap(),
+        root.join(".knowisle/history/notes/gbk.md"),
+        "备份按 rel 分组：notes/a.md → .knowisle/history/notes/a.md/<ts>.md"
+    );
+}
+
+/// 幂等：对已经是 UTF-8 的文件调用 = no-op。
+///
+/// 这条不只是优化——它保证「同一篇最多转存一次」，于是 `history/` 里每篇
+/// 最多一份，不需要保留策略。
+#[test]
+fn transcode_is_idempotent_for_utf8() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join("utf8.md"), "# 标题\n正文\n").unwrap();
+
+    let before = fs::metadata(root.join("utf8.md")).unwrap().modified().unwrap();
+    let note = read_note(root, "utf8.md").unwrap();
+    let after = transcode_to_utf8(root, "utf8.md", Some(note.mtime)).expect("幂等调用应当 Ok");
+
+    assert_eq!(after.content, note.content);
+    assert_eq!(after.decoded_from, None);
+    assert_eq!(disk_bytes(root, "utf8.md"), "# 标题\n正文\n".as_bytes());
+    assert_eq!(
+        fs::metadata(root.join("utf8.md")).unwrap().modified().unwrap(),
+        before,
+        "幂等调用不许碰 mtime"
+    );
+    assert!(
+        history_files(root, "utf8.md").is_empty(),
+        "幂等调用不许写备份"
+    );
+}
+
+/// 冲突：过期 mtime → `Conflict`，磁盘不动，`history/` 下也没有残留。
+///
+/// 备份写在冲突检查**之后**是刻意的：「写了再清掉」多一条会失败的路径。
+#[test]
+fn transcode_conflict_leaves_disk_and_history_untouched() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let original = gbk_bytes("中文笔记\n");
+    fs::write(root.join("gbk.md"), &original).unwrap();
+
+    let note = read_note(root, "gbk.md").unwrap();
+    let err = transcode_to_utf8(root, "gbk.md", Some(note.mtime - 1000))
+        .expect_err("过期的 mtime 必须被拦下");
+    match err {
+        KiError::Conflict {
+            expected_mtime,
+            disk_mtime,
+            ..
+        } => {
+            assert_eq!(expected_mtime, note.mtime - 1000);
+            assert_eq!(disk_mtime, Some(note.mtime));
+        }
+        other => panic!("应当是 Conflict，实际 {other:?}"),
+    }
+
+    assert_eq!(disk_bytes(root, "gbk.md"), original, "冲突时磁盘不许动");
+    assert!(
+        history_files(root, "gbk.md").is_empty(),
+        "冲突时不许留下备份"
+    );
+}
+
+/// 备份不能被扫成笔记（`.knowisle` 在 `IGNORED_DIRS` 里）。
+///
+/// 这条不靠记忆：`history/` 里的文件扩展名就是 `.md`，扫描器若漏掉那个
+/// 忽略项，用户会在侧栏里看到自己的历史版本，而且它们还会进索引。
+#[test]
+fn transcode_backup_is_not_scanned_as_a_note() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join("gbk.md"), gbk_bytes("中文笔记\n")).unwrap();
+
+    let note = read_note(root, "gbk.md").unwrap();
+    transcode_to_utf8(root, "gbk.md", Some(note.mtime)).unwrap();
+    assert_eq!(history_files(root, "gbk.md").len(), 1, "前提：备份确实写了");
+
+    let scanned = scan_vault(root, &ScanOptions::default()).unwrap();
+    let paths: Vec<String> = flatten_files(&scanned.tree)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    assert_eq!(paths, vec!["gbk.md".to_string()], "备份不该出现在树里");
+    assert_eq!(scanned.skipped, 0, "也不该被记成 skipped");
+}
+
+/// `history/<rel>/` 下的全部备份，按文件名排序。
+fn history_files(root: &Path, rel: &str) -> Vec<PathBuf> {
+    let mut dir = root.join(".knowisle").join("history");
+    for segment in rel.split('/') {
+        dir.push(segment);
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_file())
+        .collect();
+    files.sort();
+    files
 }
 
 /// 用 `iconv` 生成 GBK 字节：**不拿自己的编码器当夹具的裁判**。

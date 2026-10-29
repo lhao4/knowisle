@@ -664,15 +664,53 @@ body {
  * 用 warn 色而不是 danger：文件没坏，只是它不是 UTF-8——红色会让人以为
  * 数据出了问题。也刻意不做成可关闭的：它描述的是这篇笔记当前的**事实**，
  * 关掉之后用户下次打开还是同一篇 GBK 笔记。
+ *
+ * # 为什么这一行现在有动作
+ *
+ * 只描述困境不给出口，等于让用户自己去外部编辑器另存（B-38）。但动作
+ * **不是**「让这一行可关闭」——关掉它什么也没解决，下次打开还是同一篇。
+ * 所以动作是一个按钮，而且它改的是磁盘上的编码，必须二次确认。
  */
 .viewer__encoding {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin: 0;
   padding: 6px 24px;
   border-bottom: 1px solid var(--ki-border-subtle);
   background: var(--ki-bg-warn-soft);
   color: var(--ki-warn);
   font-size: 12px;
+}
+
+/*
+ * 「转存为 UTF-8」。
+ *
+ * 描边而不是实心：这一行是**状态提示**，主视觉不该被一个次要动作抢走；
+ * 而它又必须看起来可点（不能做成纯文字链接——那和提示文字长得一样）。
+ *
+ * 颜色沿用父级的 `--ki-warn`：对比度对已经由 `.viewer__encoding` 这一对
+ * （warn on warn-soft）钉在 e2e 里，新增一个色值就要新增一条对比度断言。
+ */
+.viewer__encoding-action {
+  margin-left: auto;
+  padding: 2px 10px;
+  border: 1px solid var(--ki-border-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.viewer__encoding-action:hover {
+  background: var(--ki-bg-hover);
+}
+
+.viewer__encoding-action:focus-visible {
+  outline: 2px solid var(--ki-accent);
+  outline-offset: 1px;
 }
 
 /* ───────────────────────── 编辑器（CodeMirror 6） ───────────────────────── */

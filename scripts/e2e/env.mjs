@@ -34,6 +34,15 @@ export const KEYS_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-keys')
 export const OUTLINE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-outline')
 export const THEME_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-theme')
 
+/**
+ * 编码转存（B-38）的夹具库。
+ *
+ * 单独一个库而不是塞进 theme：那个脚本会改全局主题偏好、还会往夹具里写字，
+ * 而这里的判据全在**磁盘字节**上——共用一个库会让「转存前是什么字节」
+ * 依赖上一个脚本跑没跑过（B-32）。
+ */
+export const ENCODING_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-encoding')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 

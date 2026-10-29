@@ -392,6 +392,49 @@ pub fn rename_slot(root: &Path, old_path: &str, new_path: &str) {
     }
 }
 
+/// 转存为 UTF-8 之后，把槽位对齐到新的 mtime。
+///
+/// # 为什么必须有这一步
+///
+/// 转存改的是**磁盘上的字节**：`size` 变长、`mtime` 变了。而槽位里的基线
+/// 还停在转存之前——下一次 `note_edit` 会拿旧基线去比，必然 `CONFLICT`。
+/// 用户看到的是「转存之后保存坏了」，而实际上是一次过期的乐观锁。
+///
+/// 前端也会用返回值替换 `activeNote`（那份 `mtime` 是新的），但
+/// `submit` **只在切换文档时采信 `base_mtime`**——同一篇的后续调用读的是
+/// `slot.baseline`。所以这条对齐只能落在 Rust 侧。
+///
+/// # 三件事
+///
+/// 1. `baseline` 前进到新 mtime（乐观锁的基准是磁盘真值）。
+/// 2. 槽位里若还压着待写内容（典型：GBK 里打的那个 emoji——它正是转存的
+///    理由，而它当初存不进去），把它的 `expected_mtime` 一起换掉。不换的话
+///    转存后的第一次重试仍然撞同一个冲突。
+/// 3. 清掉 `last_error`：那条「无法按 GBK 保存」已经过期了，留着会让
+///    「保存失败」的横幅在转存成功后还挂着。
+///
+/// # 不是当前文档时一个字都不动
+///
+/// 用户完全可能在树里对一篇**没打开**的笔记转存，此时槽位里是另一篇的内容。
+pub fn rebase_after_transcode(root: &Path, path: &str, note: &ki_core::NoteContent) {
+    let mut slot = lock();
+    if slot.key.as_ref() != Some(&(root.to_path_buf(), path.to_owned())) {
+        return;
+    }
+
+    slot.baseline = Some(note.mtime);
+    slot.last_saved_mtime = Some(note.mtime);
+    slot.last_saved = Some(SaveResult {
+        path: note.path.clone(),
+        size: note.size,
+        mtime: note.mtime,
+    });
+    slot.last_error = None;
+    if let Some(job) = slot.pending.as_mut() {
+        job.expected_mtime = Some(note.mtime);
+    }
+}
+
 /// 删除成功之后，把槽位**清空**（不是搬到别的键上）。
 ///
 /// # 这是整条删除路径上唯一防「文件复活」的硬防线

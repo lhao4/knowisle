@@ -24,6 +24,10 @@
 //! [`scan::read_note`] 读出来的正文是什么，也决定 [`write`] 写回去的字节是什么。
 //! 两者必须是同一份判定，否则会出现「读的时候按 GBK、写的时候按 UTF-8」——
 //! 那就是静默转码。
+//!
+//! 唯一的例外是 [`transcode`]：**用户显式确认**之后把一篇笔记改成 UTF-8。
+//! 它单独成一个模块，而不是 `write` 的一个参数——`write` 不收编码参数
+//! 是 ADR-010 的立论基础，多一个可以传错的参数就全塌了。
 
 pub mod autosave;
 pub mod encoding;
@@ -32,6 +36,7 @@ pub mod naming;
 pub mod path;
 pub mod scan;
 pub mod search;
+pub mod transcode;
 pub mod trash;
 pub mod write;
 
@@ -51,4 +56,5 @@ pub use trash::{
     page as trash_page, purge as trash_purge, restore as trash_restore, DEFAULT_PAGE_LIMIT,
     MANIFEST_DIR, MAX_PAGE_LIMIT, TRASH_DIR,
 };
+pub use transcode::{transcode_to_utf8, HISTORY_DIR};
 pub use write::{write_note, write_note_checked};

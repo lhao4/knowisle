@@ -305,3 +305,59 @@ fn empty_vault_syncs_cleanly() {
     );
     assert_eq!(inspect(dir.path()).counts().expect("读计数").ok, 0);
 }
+
+/* ───────────────── 转存为 UTF-8 之后，索引必须重读这一篇（B-38） ───────────────── */
+
+/// GBK「中文笔记\n」的字节。与 `ki-vault/tests/encoding.rs` 用的是同一串。
+const GBK_NOTE: [u8; 9] = [0xD6, 0xD0, 0xCE, 0xC4, 0xB1, 0xCA, 0xBC, 0xC7, 0x0A];
+
+/// 转存改了 `size`（GBK 9 字节 → UTF-8 13 字节）与 `mtime`，所以同步
+/// **必须重读**这一篇。
+///
+/// # 为什么 `inserted` 不是 1
+///
+/// 判据是「索引里有没有这一行」，不是「这一行有没有内容」。已经建过索引的
+/// 笔记转存之后是 `updated = 1`；`inserted = 1` 只出现在「转存发生在第一次
+/// 同步之前」。两种都验，两个数字都打出来——只报其中一个都会让下一个读
+/// 这段的人以为另一个是 bug。
+///
+/// # 真正的判据是 `unchanged == 0`
+///
+/// 转存若绕过了 size/mtime 的更新，这一篇会被判成「未变」，索引里留着旧
+/// token，用户搜到的是上一版——不报错，只是搜不到刚写的东西。
+#[test]
+fn transcode_makes_the_index_reread_the_note() {
+    // 场景 A：索引先建好，再转存 → 这一行是「更新」。
+    let dir = vault();
+    fs::write(dir.path().join("gbk.md"), GBK_NOTE).expect("写 GBK 文件");
+    let first = sync(dir.path());
+    assert_eq!(first.inserted, 1, "前提：转存前索引里已经有这一篇");
+
+    let note = ki_vault::read_note(dir.path(), "gbk.md").expect("读");
+    let after = ki_vault::transcode_to_utf8(dir.path(), "gbk.md", Some(note.mtime)).expect("转存");
+    assert_eq!(after.size, 13, "UTF-8 的「中文笔记\n」是 13 字节");
+
+    let second = sync(dir.path());
+    println!("[门禁③] 先建索引再转存 → {second:?}");
+    assert_eq!(second.unchanged, 0, "size/mtime 都变了，不许判「未变」");
+    assert_eq!(
+        second.inserted + second.updated,
+        1,
+        "必须重写这一行（已存在 → updated = 1）"
+    );
+    assert!(second.bytes_read > 0, "必须真的重读正文");
+
+    let hits = ki_ipc::search::service::search(dir.path(), "中文笔记", None).expect("搜索");
+    assert_eq!(hits.total, 1, "转存之后仍要搜得到");
+    assert_eq!(hits.hits[0].path, "gbk.md");
+
+    // 场景 B：转存发生在第一次同步之前 → 这一行是「新插入」。
+    let fresh = vault();
+    fs::write(fresh.path().join("gbk.md"), GBK_NOTE).expect("写 GBK 文件");
+    let note = ki_vault::read_note(fresh.path(), "gbk.md").expect("读");
+    ki_vault::transcode_to_utf8(fresh.path(), "gbk.md", Some(note.mtime)).expect("转存");
+    let only = sync(fresh.path());
+    println!("[门禁③] 先转存再建索引 → {only:?}");
+    assert_eq!(only.inserted, 1, "第一次同步看到的是一篇 UTF-8 笔记");
+    assert_eq!(only.bytes_read, 13);
+}

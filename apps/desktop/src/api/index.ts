@@ -97,6 +97,32 @@ export const noteRead = commands.noteRead
 export const noteSave = commands.noteSave
 
 /**
+ * 把一篇非 UTF-8 的笔记**显式地**转存为 UTF-8，返回转存后的正文。
+ *
+ * 这是「保存写回原编码」那条红线的**唯一例外**，所以调用前必须有用户
+ * 明确的动作（入口按钮 + 二次确认）。没有「打开就转」「保存就转」。
+ *
+ * # 三条硬约束（Rust 侧兑现）
+ *
+ * 1. **先备份**：原字节逐字节进 `.knowisle/history/<path>/<unix_ms>.md`。
+ *    备份写不进去就整个失败——没有备份的转存不可撤销。
+ * 2. **原子写**：`tmp → fsync → rename`。
+ * 3. **幂等**：磁盘上本来就是 UTF-8 时不写盘、不动 mtime、不留备份。
+ *
+ * # 参数
+ *
+ * `expectedMtime` 传**磁盘上当前那份**的 mtime（打开时读到的，或最近一次
+ * 成功落盘的）。过期返回 `CONFLICT`，此时磁盘一个字节都没动。
+ *
+ * # 返回值必须用来替换 `activeNote`
+ *
+ * `size` 与 `mtime` 都变了。只改本地 state 会让下一次自动保存拿着旧
+ * mtime 撞 `CONFLICT`——看起来像「转存之后保存坏了」。同时
+ * `decodedFrom` 变成 `null`，顶部那行「已按 GBK 解码」随之消失。
+ */
+export const noteTranscodeToUtf8 = commands.noteTranscodeToUtf8
+
+/**
  * 新建一篇空笔记，返回它的 Vault 相对路径。
  *
  * `dir` 是 Vault 相对目录（空串表示根目录），必须已存在——不会代建目录。
