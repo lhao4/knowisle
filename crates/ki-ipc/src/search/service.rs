@@ -61,7 +61,7 @@ use ki_vault::{
 
 use super::cache::{
     add_index_ms, bump_generation, canonical_root, ensure_root, generation, lock, publish,
-    state_for,
+    state_for, sync_gate,
 };
 
 /// 每批多少篇提交一次。
@@ -124,6 +124,9 @@ pub struct SyncReport {
 ///
 /// **不要**把它们改成异步——那会让「建库耗时」变成一个测不准的量。
 pub fn sync_after_scan(root: &Path, scan: &ScanResult) -> Result<SyncReport, KiError> {
+    // 门在 `lock()` **之前**：`run_background` 是「先门后缓存锁」，反过来拿
+    // 就会与它互等。见 `cache::sync_gate` 的注释。
+    let _gate = sync_gate();
     let started = Instant::now();
     let root = canonical_root(root)?;
     let files = sorted_files(scan);
@@ -236,6 +239,10 @@ pub fn spawn_after_scan(root: &Path, scan: &ScanResult) {
 
 /// 后台任务的主体。所有失败都变成可见状态，不往上抛（没有人接）。
 fn run_background(root: PathBuf, generation: u64, files: Vec<FileRef>, truncated: bool) {
+    // 门覆盖**整个**同步（含 `IndexDb::open`），不只是写库那一段：
+    // 一个线程在 open 里重建库时，另一个线程的连接会跟着失效。
+    // 顺序固定为「门 → 缓存锁」（`add_index_ms` 在门内拿缓存锁）。
+    let _gate = sync_gate();
     let started = Instant::now();
     match background_sync(&root, generation, &files, truncated) {
         Ok(()) => {

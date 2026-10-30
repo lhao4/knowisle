@@ -106,6 +106,29 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::SeqCst)
 }
 
+/// 同一时刻只允许一个同步在跑。**进程级，不按 root 分**。
+///
+/// # 为什么代际不够
+///
+/// 两次 `vault_scan` 并发（React StrictMode 双挂载，或用户连点两次「选择
+/// 文件夹」）会各自 `spawn_after_scan`，于是两个线程同时 `IndexDb::open`
+/// 同一个 WAL 库。代际只保证「旧的那个不发布状态」，**不保证它不写库**——
+/// 它在下一个批次边界才退出，而那个边界可能是一批 250 ms 之后。
+///
+/// 实测（8 轮并发扫描、每轮两个线程，第 3 轮复现）：另一个线程的写会拿到
+/// `SQLITE_READONLY`（`attempt to write a readonly database`），整次同步作废、
+/// 索引停在上一版。用户看到的现象是「删掉的笔记还留在跳过清单里」，
+/// 而重跑一次又好了——最难查的那一类。
+///
+/// 串行化的代价是第二次同步要等第一次退出。第一次在下一个批次边界就发现
+/// 自己被取代并退出（10k 篇约 250 ms），换的是「任何时刻只有一个写者」
+/// 这条不变量。**不要**为了省这 250 ms 把它改成按 root 加锁：索引库是
+/// 一个文件，写者只能有一个。
+pub(crate) fn sync_gate() -> MutexGuard<'static, ()> {
+    static GATE: Mutex<()> = Mutex::new(());
+    GATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// 发布后台索引的进度或终态。
 ///
 /// 代际已变则丢弃：旧任务不许覆盖新库的状态。检查与写入之间仍有窗口，
