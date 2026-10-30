@@ -636,3 +636,85 @@ fn max_depth_is_clamped_end_to_end() {
         "唯一的笔记在第 {levels} 层，超出上限后不该出现在树里"
     );
 }
+
+/* ═════════════ 扫描上限是安全阀，不是业务承诺（ADR-015） ═════════════ */
+
+fn opts_with_cap(max_entries: usize) -> ScanOptions {
+    ScanOptions {
+        max_entries,
+        ..ScanOptions::default()
+    }
+}
+
+/// 判据 2：`limit_entries` 是**实际生效**的上限，不是常量 20000。
+///
+/// 反例是它曾经的样子：横幅把 20000 写死在 `App.tsx` 里，改了默认值之后
+/// 横幅继续撒谎。所以这里必须传一个非默认值，并断言结果原样带回来。
+#[test]
+fn truncated_reports_the_effective_limit() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    for index in 0..8 {
+        write_file(root, &format!("n{index}.md"), "# n\n");
+    }
+
+    let capped = scan_vault(root, &opts_with_cap(3)).unwrap();
+    assert!(capped.truncated);
+    assert_eq!(capped.total_files, 3);
+    assert_eq!(capped.limit_entries, 3, "必须是生效值，不是默认值");
+
+    // 不截断时它也是真实值：描述「最多愿意收多少条」，不是「收了多少条」。
+    let full = scan_vault(root, &ScanOptions::default()).unwrap();
+    assert!(!full.truncated);
+    assert_eq!(
+        full.limit_entries,
+        ScanOptions::default().max_entries,
+        "未截断时也要带出本次生效的上限"
+    );
+}
+
+/// 判据 6：截断会制造**假空目录**，这是已知且被说出的行为。
+///
+/// DFS 中途 `break` 时，边界那个目录已经进了 `flat`，它的孩子一个都没进；
+/// `build_tree` 只按 `flat` 里有的条目组树，于是它成了一个空目录。而
+/// `prune_empty_dirs` 默认 `false`，所以它会显示出来，且与真的空目录
+/// 一模一样。
+///
+/// # 为什么不能「修」
+///
+/// 修法只有两条，都比病灶贵：① 给 `FileNode` 加字段标记边界（它是
+/// serde / IPC / 前端树的核心结构）；② 截断后再遍历一次数「少了多少篇」
+/// （ADR-014 决策五同款的陷阱）。所以本刀把它钉成用例 + 横幅里说一句。
+///
+/// 横幅那一半在 `apps/desktop/src/lib/truncation.test.ts`（Rust 侧不渲染
+/// 文案）；两半合起来才是判据 6。e2e 显式 SKIP：造 20000 个文件 ≈ 80s，
+/// 比整轮 e2e 还贵（B-19）。
+#[test]
+fn the_boundary_dir_can_look_empty_and_that_is_known() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    for index in 0..3 {
+        write_file(root, &format!("A/n{index}.md"), "# A\n");
+    }
+    write_file(root, "B/b.md", "# B\n");
+
+    // 走查顺序（`sort_by_file_name`）：A → A/n0 → A/n1 → A/n2 → B → B/b。
+    // 上限 1 = 收下 A 的目录项之后立刻停，A 的三个孩子一个都没进 `flat`。
+    let result = scan_vault(root, &opts_with_cap(1)).unwrap();
+
+    assert!(result.truncated);
+    assert_eq!(result.total_files, 0, "A 的孩子一个都没扫到");
+    assert_eq!(result.total_dirs, 1, "A 自己进了树");
+
+    let a = &result.tree.children.as_ref().unwrap()[0];
+    assert_eq!(a.path, "A");
+    assert!(
+        a.is_empty_dir(),
+        "边界目录在树里必须显示为空——这是病灶，不是 bug"
+    );
+    assert_eq!(
+        fs::read_dir(root.join("A")).unwrap().count(),
+        3,
+        "磁盘上它并不是空的"
+    );
+}

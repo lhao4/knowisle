@@ -8,7 +8,7 @@
 //! 4. 三种「写坏」都退回内置默认值并可看见（不存在 / 语法错 / 语义错）；
 //! 5. 配置写坏时库仍然打得开；
 //! 6. 删掉配置文件 → 树回到默认（与第 1 项同一份快照）；
-//! 7. `max_files` / `truncated` 语义不动。
+//! 7. `max_entries` / `truncated` 语义不动。
 //!
 //! # 为什么断言的是「快照」而不是几个 `contains`
 //!
@@ -54,10 +54,14 @@ fn flatten(node: &FileNode, out: &mut Vec<String>) {
     }
 }
 
-/// 一次扫描的冻结快照：树 + `skipped` 三件套。
+/// 一次扫描的冻结快照：树 + 计数三件套 + `skipped`。
 ///
 /// `ignore_rules` 与 `elapsed_ms` 刻意不在里面：前者是本刀新增的**诊断**字段
 /// （它变了不代表树变了），后者每次都不一样。判据 1 要证明的是「树没动」。
+///
+/// `total_files` / `total_dirs` 在 M7 第十四刀补进来：改名那一刀最危险的
+/// 回归不是树结构变了，而是计数口径被顺手改了（例如把目录从 `total_files`
+/// 里扣掉）。三个数一起冻住，才叫「逐字节相同」。
 fn snapshot(root: &Path, opts: &ScanOptions) -> String {
     let result = scan_vault(root, opts).expect("扫描不应失败");
     let mut entries = Vec::new();
@@ -65,6 +69,8 @@ fn snapshot(root: &Path, opts: &ScanOptions) -> String {
     entries.sort();
     serde_json::json!({
         "entries": entries,
+        "total_files": result.total_files,
+        "total_dirs": result.total_dirs,
         "skipped": result.skipped,
         "detail": result.skipped_detail,
         "truncated": result.skipped_truncated,
@@ -91,6 +97,8 @@ const DEFAULT_ENTRIES: &[&str] = &[
 fn expected_default_snapshot() -> String {
     serde_json::json!({
         "entries": DEFAULT_ENTRIES,
+        "total_files": 4,
+        "total_dirs": 6,
         "skipped": 0,
         "detail": [],
         "truncated": false,
@@ -385,7 +393,7 @@ fn deleting_the_config_restores_the_default_tree() {
     );
 }
 
-/* ═════════════ 7. max_files / truncated 语义不动 ═════════════ */
+/* ═════════════ 7. max_entries / truncated 语义不动 ═════════════ */
 
 #[test]
 fn truncated_still_means_the_entry_cap() {
@@ -394,15 +402,21 @@ fn truncated_still_means_the_entry_cap() {
     for index in 0..8 {
         write(root, &format!("n{index}.md"), "# n\n");
     }
+    // 被忽略的条目**不进 `flat`**，因此不占上限额度：`node_modules` 里
+    // 这 5 篇如果算进额度，`total_files` 会变成 2（第 4 条就撞上限）。
+    for index in 0..5 {
+        write(root, &format!("node_modules/p{index}.md"), "# 依赖\n");
+    }
     write_config(root, "[ignore]\nextra = [\"nothing-here\"]\n");
 
     let opts = ScanOptions {
-        max_files: 3,
+        max_entries: 3,
         ..ScanOptions::default()
     };
     let result = scan_vault(root, &opts).unwrap();
     assert!(result.truncated, "达到条目上限必须置 truncated");
     assert_eq!(result.total_files, 3, "上限仍然数的是条目");
+    assert_eq!(result.limit_entries, 3, "生效上限必须从结果里带出来");
     // 忽略规则不改变这条语义：`extra` 里那个不存在的名字不该影响上限。
     assert_eq!(result.ignore_rules.extra, vec!["nothing-here"]);
 }

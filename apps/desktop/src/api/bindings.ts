@@ -1071,9 +1071,53 @@ export type ScanResult = {
 	/**  规范化后的绝对路径（Windows 上已剥离 `\\?\` 前缀）。 */
 	root: string,
 	tree: FileNode,
+	/**
+	 *  树里的笔记数（只数 `.md` / `.markdown`，不含目录）。
+	 * 
+	 *  # `truncated` 为真时它是**下界**
+	 * 
+	 *  截断发生在 DFS 中途，后面的条目根本没访问过，所以这个数只覆盖
+	 *  「扫到的那一段」。判据与 [`crate::SearchResult::total`] 是同一条公理：
+	 * 
+	 *  > **`total_files` 不准 ⇔ [`ScanResult::truncated`] 为真。**
+	 * 
+	 *  不许出现「`truncated` 为真而 `total_files` 恰好准确」的依赖——那只是
+	 *  这一次的巧合，UI 一旦把它当准数就会在下一个库上说错。
+	 */
 	totalFiles: number,
 	totalDirs: number,
-	/**  是否因为达到文件数上限而提前停止。 */
+	/**
+	 *  本次扫描实际生效的条目上限（= `ScanOptions::max_entries`）。
+	 * 
+	 *  # 为什么必须从结果里来
+	 * 
+	 *  横幅要显示「在多少个条目处停下」，而 `ScanOptions` **不进 IPC**
+	 *  （`vault_scan` 只收 root）。前端曾经把这个数写死成 20000，默认值改了
+	 *  之后横幅继续说 20000——它已经错过一次（ADR-015）。
+	 * 
+	 *  未截断时它也是真实值：它描述「这次扫描最多愿意收多少条」，不是
+	 *  「收了多少条」（后者是 `total_files + total_dirs`）。
+	 */
+	limitEntries: number,
+	/**
+	 *  **路径集合不全**：扫描在 [`ScanResult::limit_entries`] 处提前停止。
+	 * 
+	 *  # 它只说一件事：树里没有的路径，不代表磁盘上没有
+	 * 
+	 *  与 [`crate::SearchResult::truncated`] 同一条公理——`total_files` 不准
+	 *  ⇔ 本字段为真。为真时 `total_files` 是下界，不是准确值。
+	 * 
+	 *  # 它还是索引侧的「别删」信号
+	 * 
+	 *  `ki_ipc::search` 拿它为真就**一条都不删**（`service.rs` 的 `sync`）：
+	 *  截断结果里缺失的路径只代表「没扫到」。所以改这个字段的语义必须同时跑
+	 *  `ki-ipc` 的同步用例，不只是 `ki-vault`。
+	 * 
+	 *  # 它不是「跳过清单被截断」
+	 * 
+	 *  那是 [`ScanResult::skipped_truncated`]（ADR-013）：一个说树不全，
+	 *  一个说清单只有前 50 条。两个布尔值，不许合并。
+	 */
 	truncated: boolean,
 	/**
 	 *  被跳过的条目数。**精确**：所有原因之和，含那些不进清单的

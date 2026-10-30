@@ -171,8 +171,29 @@ pub enum IgnoreSource {
 /// 唯一不能随意调大的是 [`ScanOptions::max_depth`]：它是请求值，会被收敛。
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
-    /// 文件数上限。防止病态目录（如误选了整个用户目录）把 UI 卡死。
-    pub max_files: usize,
+    /// 条目数上限（**目录 + 文件**），安全阀。
+    ///
+    /// # 它数的不是笔记
+    ///
+    /// [`RawEntry`] 的扁平表同时装目录与文件，所以撞上限时能看见的笔记数
+    /// **不超过**上限（只有「全部笔记都在库根、没有任何子目录」时才恰好相等）。
+    /// ADR-015 门禁①在 10k 夹具上实测：
+    ///
+    /// | 夹具形状 | entries/notes | 撞 20000 条目时能看见 |
+    /// |---|---|---|
+    /// | 10k 篇 / 50 目录（平铺） | 1.0050 | **19900 篇** |
+    /// | 10k 篇 / 499 目录 / 5 层 | 1.0499 | **19049 篇** |
+    ///
+    /// 所以「两万篇」这个承诺差的是 0.5%–4.75%，不是十倍。**这不是业务
+    /// 上限**：它防的是「误选了整个用户目录」把 UI 卡死。
+    ///
+    /// # 为什么没有 `max_notes`
+    ///
+    /// 想给「最多索引多少篇」做产品承诺的人，必须先回答「截断时索引怎么
+    /// 安全剪枝」：`truncated` 是索引侧的「别删」信号，业务上限一旦让它
+    /// 常态为真，磁盘上删掉的笔记会**永久**留在索引里——门禁③实测
+    /// 100 篇一条都清不掉。见 ADR-015。
+    pub max_entries: usize,
     /// 请求的遍历深度上限。**会被收敛到 [`MAX_SAFE_DEPTH`]，调大无效。**
     ///
     /// 不让它直接决定递归深度，是因为组树、`Drop`、serde 序列化都按树深递归，
@@ -204,7 +225,7 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            max_files: 20_000,
+            max_entries: 20_000,
             max_depth: 32,
             follow_links: false,
             prune_empty_dirs: false,
@@ -370,7 +391,9 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
             }
         };
 
-        if flat.len() >= opts.max_files {
+        // 上限数的是**条目**（目录 + 文件），不是笔记。`>=` 而不是 `>`：
+        // 收满 `max_entries` 条就停，`limit_entries` 是「最多愿意收多少条」。
+        if flat.len() >= opts.max_entries {
             truncated = true;
             break;
         }
@@ -393,6 +416,7 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
         tree,
         total_files,
         total_dirs,
+        limit_entries: opts.max_entries,
         truncated,
         skipped: skips.total,
         skipped_detail: skips.entries,

@@ -361,3 +361,74 @@ fn transcode_makes_the_index_reread_the_note() {
     assert_eq!(only.inserted, 1, "第一次同步看到的是一篇 UTF-8 笔记");
     assert_eq!(only.bytes_read, 13);
 }
+
+/* ═════════════ 截断扫描绝不删（ADR-015） ═════════════ */
+
+/// `truncated` 是索引侧的「别删」信号，不是 UI 的一个横幅开关。
+///
+/// # 与 `truncated_scan_never_deletes` 的分工
+///
+/// 那一条手工把 `ScanResult.truncated` 改成 `true`，测的是**标志位**接对了；
+/// 这一条走真实路径：`ScanOptions::max_entries` 让扫描自己截断，测的是
+/// 「截断这个事实」到「不删行」的整条链路。
+///
+/// # 这条用例是**故意绿**的
+///
+/// 它保护的是「不误删」，不是「删得干净」。扫描在上限处停下时，缺失的路径
+/// 只代表「没扫到」，不代表「文件没了」。若这里改成删，一次截断就会把上限
+/// 之后的全部笔记从索引里抹掉——而且下一次搜索会静默地少掉一大批结果。
+///
+/// # 为什么规模是 100 篇
+///
+/// 与 ADR-015 门禁③同一组数：10k 夹具上删 100 篇，`max_entries = 5000`
+/// 同步后 `stale = 100`（一条都清不掉）。这里把同一件事缩到 103 篇，
+/// 让回归用例能进 `cargo test` 的常规集合，而不是只在基准里跑。
+#[test]
+fn a_truncated_scan_keeps_deleted_notes_in_the_index() {
+    let dir = vault();
+    let root = dir.path();
+
+    for index in 0..100 {
+        fs::write(root.join(format!("a{index:03}.md")), "alpha 知识库").expect("写 A");
+    }
+    for index in 0..3 {
+        fs::write(root.join(format!("k{index}.md")), "bravo 索引").expect("写 K");
+    }
+
+    let first = sync(root);
+    assert_eq!(first.inserted, 103, "前提：全量索引 103 篇");
+    assert_eq!(inspect(root).load_state().unwrap().len(), 103);
+
+    // 磁盘上删掉 100 篇，只剩 3 篇；上限 2 → 第 3 篇处截断。
+    for index in 0..100 {
+        fs::remove_file(root.join(format!("a{index:03}.md"))).expect("删 A");
+    }
+    let scan = scan_vault(
+        root,
+        &ScanOptions {
+            max_entries: 2,
+            ..ScanOptions::default()
+        },
+    )
+    .expect("截断扫描");
+    assert!(scan.truncated, "前提：这次扫描确实截断了");
+    assert_eq!(scan.total_files, 2);
+    assert_eq!(scan.limit_entries, 2);
+
+    let capped = sync_after_scan(root, &scan).expect("截断同步").stats;
+    assert_eq!(capped.deleted, 0, "截断时一条都不许删");
+    assert_eq!(capped.inserted + capped.updated, 0, "留下的两篇没变");
+
+    let rows = inspect(root).load_state().unwrap();
+    assert_eq!(rows.len(), 103, "索引行数必须原封不动");
+    let stale = rows
+        .iter()
+        .filter(|row| !root.join(&row.path).exists())
+        .count();
+    assert_eq!(stale, 100, "磁盘上删掉的 100 篇仍留在索引里——这是契约");
+
+    // 对照：全量扫描之后，僵尸行才允许被清掉。
+    let full = sync(root);
+    assert_eq!(full.deleted, 100, "不截断时才删得掉");
+    assert_eq!(inspect(root).load_state().unwrap().len(), 3);
+}
