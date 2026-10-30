@@ -21,13 +21,6 @@
 
 ## P1 · 用户能感知的正确性缺口
 
-### B-04 `skipped` 是个混装计数器，出问题无法定位
-
-- **来源** M0 代码 review（`scan.rs` 内 5 处 `skipped += 1`，对应 5 种不同原因）
-- **影响** 权限不足、路径越界、非 UTF-8 文件名、管道/设备文件全记进同一个数。前端只显示 `skipped: N`，用户和我们都不知道丢了什么、为什么丢。
-- **方案** 换成 `SkipSummary { permission, non_utf8, other }`，或保留前 50 条 `Vec<{path, reason}>`。
-- **触发** 第一次出现 `skipped > 0` 的用户反馈，或做"库健康检查"功能时。
-
 ### B-05 忽略名单硬编码，用户自己的目录会被误伤
 
 - **来源** M0 代码 review（`IGNORED_DIRS` / `NOTE_EXTENSIONS` 均为 `const`）
