@@ -26,7 +26,8 @@ mod schema;
 
 pub use db::{IndexDb, OpenOutcome, RebuildReason};
 pub use repo::{
-    Candidate, Counts, IndexedNote, NoteBatch, NoteState, SkipReason, SkippedNote, SyncStats,
+    Candidate, Counts, EncodingScan, IndexedNote, NoteBatch, NoteState, SkipReason, SkippedNote,
+    SkippedScan, SyncStats,
 };
 pub use schema::{DB_FILE, SCHEMA_VERSION, TOKENIZER_VERSION};
 

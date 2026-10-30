@@ -17,12 +17,14 @@ pub mod encoding;
 pub mod error;
 pub mod node;
 pub mod search;
+pub mod skip;
 pub mod trash;
 
 pub use encoding::{EncodingEntry, EncodingStats, TranscodeBatch, TranscodeFailure, TranscodeProgress};
 pub use error::{IoKind, KiError};
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{IndexState, SearchHit, SearchResult};
+pub use skip::{IndexSkipEntry, IndexSkipReason, IndexSkipStats, ScanSkipEntry, ScanSkipReason};
 pub use trash::{Fallback, PurgeResult, RestoreResult, TrashCursor, TrashEntry, TrashPage};
 
 /// 本应用的元数据目录（Vault 相对路径的第一级）。

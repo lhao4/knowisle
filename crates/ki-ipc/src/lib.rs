@@ -22,8 +22,8 @@
 //! `vault_scan`、`vault_search`、`note_read`、`note_save`、`note_create`、
 //! `note_rename`、`note_delete`、`trash_list`、`trash_restore`、`trash_purge`、
 //! `note_edit`、`note_flush`、`note_status`、`note_rebase`、
-//! `note_transcode_to_utf8`、`vault_encoding_stats`、`note_transcode_batch`、
-//! `note_transcode_progress`、`note_transcode_cancel`、`app_ping`。
+//! `note_transcode_to_utf8`、`vault_encoding_stats`、`vault_skipped_notes`、
+//! `note_transcode_batch`、`note_transcode_progress`、`note_transcode_cancel`、`app_ping`。
 //!
 //! 生成到 TS 后访问器是小驼峰（`commands.noteSave`），但 IPC 字符串仍是下划线。
 
@@ -36,7 +36,7 @@ pub use commands::{
     app_ping, note_create, note_delete, note_edit, note_flush, note_read, note_rename, note_save,
     note_rebase, note_status, note_transcode_batch, note_transcode_cancel,
     note_transcode_progress, note_transcode_to_utf8, trash_list, trash_purge, trash_restore,
-    vault_encoding_stats, vault_scan, vault_search,
+    vault_encoding_stats, vault_scan, vault_search, vault_skipped_notes,
 };
 
 use tauri_specta::{Builder, ErrorHandlingMode};
@@ -57,6 +57,7 @@ pub fn ipc_builder<R: tauri::Runtime>() -> Builder<R> {
             vault_scan,
             vault_search,
             vault_encoding_stats,
+            vault_skipped_notes,
             note_read,
             note_save,
             note_transcode_to_utf8,

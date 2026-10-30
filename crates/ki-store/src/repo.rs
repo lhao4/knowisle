@@ -19,7 +19,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use ki_core::{EncodingEntry, KiError};
+use ki_core::{EncodingEntry, IndexSkipEntry, IndexSkipReason, KiError};
 
 use crate::db::{index_err, IndexDb};
 use crate::schema::meta_key;
@@ -88,6 +88,24 @@ impl SkipReason {
             SkipReason::Io => "io",
         }
     }
+
+    /// 落库的串 → 跨 IPC 的枚举。
+    ///
+    /// # 为什么认不出时给 `Unknown` 而不是丢掉这一行
+    ///
+    /// `total` 来自 `count(*)`，清单来自这一行。认不出就丢，会让
+    /// 「total 说 3、清单只有 2 条、而 `truncated` 是 false」——那正是本刀
+    /// 要消灭的那种自相矛盾。未知值只可能来自一个被外部改过的索引库
+    /// （写入方只有 [`SkipReason::as_str`] 一处，schema 变更走整库重建），
+    /// 所以给一个「说不清」的枚举比丢掉它诚实。
+    pub fn from_db(value: &str) -> IndexSkipReason {
+        match value {
+            "too_large" => IndexSkipReason::TooLarge,
+            "invalid_utf8" => IndexSkipReason::InvalidUtf8,
+            "io" => IndexSkipReason::Io,
+            _ => IndexSkipReason::Unknown,
+        }
+    }
 }
 
 impl fmt::Display for SkipReason {
@@ -133,6 +151,20 @@ pub struct EncodingScan {
     /// 按路径升序的清单，最多 `limit` 条。
     pub non_utf8: Vec<EncodingEntry>,
     /// 清单被截断（`non_utf8` 只是前 `limit` 条）。
+    pub truncated: bool,
+}
+
+/// 一次「索引侧跳过清单」查询的原始结果。
+///
+/// 与 [`ki_core::IndexSkipStats`] 的差别同样只有 `index_state`——
+/// 理由与 [`EncodingScan`] 逐字相同，不重复一遍。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedScan {
+    /// 跳过的笔记数，**精确**（`count(*)`）。
+    pub total: usize,
+    /// 按路径升序的清单，最多 `limit` 条。
+    pub entries: Vec<IndexSkipEntry>,
+    /// 清单被截断。
     pub truncated: bool,
 }
 
@@ -242,6 +274,57 @@ impl IndexDb {
             Ok(EncodingScan {
                 total: usize::try_from(total).unwrap_or(usize::MAX),
                 non_utf8,
+                truncated,
+            })
+        }
+        inner(self.conn(), limit).map_err(|e| index_err(self.path(), &e))
+    }
+
+    /// 索引侧跳过清单：哪几篇没进索引、各是为什么。
+    ///
+    /// # 与 [`IndexDb::encoding_scan`] 的三点不同
+    ///
+    /// 1. 筛的是 `status = 'skipped'`（**没被索引**），不是 `src_encoding`
+    ///    （**能索引但编码不是 UTF-8**）。两批行**不重叠**：一篇要么成功
+    ///    索引、要么被跳过，没有第三种。这条正是验收 5 要的「同一篇不许同时
+    ///    出现在两个清单里」——它不是靠文案，是靠这两条 WHERE 互斥。
+    /// 2. `skip_reason` 可能为 `NULL`（老库、或被外部改过）。`NULL` 走
+    ///    `Unknown`，**不丢行**：丢了 `total` 与清单长度就对不上。
+    /// 3. 排序同样是 `path` 的字节序，理由同上。
+    ///
+    /// # 截断
+    ///
+    /// `limit` 是**清单**上限，不影响 `total`：`count(*)` 走
+    /// `note_status` 索引，是常数级查询。多取一条判断截断，不拿
+    /// `rows.len() == limit` 猜。
+    pub fn skipped_scan(&self, limit: usize) -> Result<SkippedScan, KiError> {
+        fn inner(conn: &Connection, limit: usize) -> rusqlite::Result<SkippedScan> {
+            let total: i64 = conn.query_row(
+                "SELECT count(*) FROM note WHERE status = 'skipped'",
+                [],
+                |r| r.get(0),
+            )?;
+
+            let mut stmt = conn.prepare_cached(
+                "SELECT path, skip_reason FROM note
+                 WHERE status = 'skipped'
+                 ORDER BY path
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([size_of_usize(limit) + 1], |r| {
+                let reason: Option<String> = r.get(1)?;
+                Ok(IndexSkipEntry {
+                    path: r.get(0)?,
+                    reason: SkipReason::from_db(reason.as_deref().unwrap_or("")),
+                })
+            })?;
+            let mut entries: Vec<IndexSkipEntry> = rows.collect::<rusqlite::Result<_>>()?;
+            let truncated = entries.len() > limit;
+            entries.truncate(limit);
+
+            Ok(SkippedScan {
+                total: usize::try_from(total).unwrap_or(usize::MAX),
+                entries,
                 truncated,
             })
         }
@@ -987,6 +1070,86 @@ mod tests {
             0,
             "跳过的篇不许留在待转存清单里"
         );
+    }
+
+    /// 索引侧跳过清单：三条原因各自可定位、按路径升序、`total` 精确。
+    ///
+    /// # 为什么这条用例是变异②的靶子
+    ///
+    /// 把 `total` 改成「清单长度」的实现（`entries.len()` 而不是 `count(*)`）
+    /// 会让 `cut.total` 从 3 变成 2——本用例的 `assert_eq!(cut.total, 3)`
+    /// 当场红。UI 那边靠 `total` 说「3 篇被跳过」，改了它就会说「2 篇」，
+    /// 而用户永远查不到第 3 篇。
+    #[test]
+    fn skipped_scan_sorts_truncates_and_counts_exactly() {
+        let (_dir, mut db) = opened_vault();
+
+        let skipped = |path: &str, reason: SkipReason| SkippedNote {
+            path: path.to_string(),
+            name_lower: path.trim_end_matches(".md").to_string(),
+            size: 1,
+            mtime: NOW,
+            reason,
+        };
+
+        // 故意乱序写入：顺序必须由查询给（`ORDER BY path`）。
+        db.upsert_skipped(&skipped("c.md", SkipReason::Io), NOW)
+            .expect("写 io");
+        db.upsert_skipped(&skipped("a.md", SkipReason::TooLarge), NOW)
+            .expect("写 too_large");
+        db.upsert_skipped(&skipped("b.md", SkipReason::InvalidUtf8), NOW)
+            .expect("写 invalid_utf8");
+        // 成功索引的那一篇**不许**出现在这里：两个清单的 WHERE 互斥，
+        // 这就是验收 5「同一篇不许同时出现在两个清单里」的数据层证明。
+        db.upsert_ok(&indexed("ok.md", "alpha", "al lp ph ha", "al lp"), NOW)
+            .expect("写 ok 行");
+
+        let all = db.skipped_scan(10).expect("清单");
+        assert_eq!(all.total, 3, "只有 3 篇被跳过");
+        assert!(!all.truncated);
+        let paths: Vec<&str> = all.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md", "b.md", "c.md"], "按路径升序");
+        assert_eq!(all.entries[0].reason, IndexSkipReason::TooLarge);
+        assert_eq!(all.entries[1].reason, IndexSkipReason::InvalidUtf8);
+        assert_eq!(all.entries[2].reason, IndexSkipReason::Io);
+
+        // 截断：清单只给前 2 条，`total` 仍然精确。
+        let cut = db.skipped_scan(2).expect("清单");
+        assert_eq!(cut.total, 3, "截断不许影响 total");
+        assert!(cut.truncated);
+        assert_eq!(cut.entries.len(), 2);
+
+        let exact = db.skipped_scan(3).expect("清单");
+        assert!(!exact.truncated, "恰好 3 条不是截断");
+    }
+
+    /// 认不出的 `skip_reason` 不许把行吞掉：`total` 与清单长度必须一致。
+    ///
+    /// 吞掉的话会得到「total 说 2、清单 1 条、truncated 是 false」——
+    /// 那正是本刀要消灭的自相矛盾。
+    #[test]
+    fn unknown_skip_reason_keeps_the_row() {
+        let (_dir, mut db) = opened_vault();
+        db.upsert_skipped(
+            &SkippedNote {
+                path: "weird.md".to_string(),
+                name_lower: "weird".to_string(),
+                size: 1,
+                mtime: NOW,
+                reason: SkipReason::Io,
+            },
+            NOW,
+        )
+        .expect("写一行");
+        // 直接把列改成一个当前代码不会产出的值：模拟「索引库被外部改过」。
+        db.conn()
+            .execute("UPDATE note SET skip_reason = 'mystery' WHERE path = 'weird.md'", [])
+            .expect("改坏");
+
+        let scan = db.skipped_scan(10).expect("清单");
+        assert_eq!(scan.total, 1);
+        assert_eq!(scan.entries.len(), 1, "认不出的原因也要占一行");
+        assert_eq!(scan.entries[0].reason, IndexSkipReason::Unknown);
     }
 
     /// 批次里任一条失败 → 整批回滚，不留半批。

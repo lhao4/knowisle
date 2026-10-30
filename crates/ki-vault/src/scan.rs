@@ -11,11 +11,12 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::time::{Instant, UNIX_EPOCH};
 
 use walkdir::{DirEntry, WalkDir};
 
+use ki_core::skip::{ScanSkipEntry, ScanSkipReason};
 use ki_core::{FileNode, KiError, NoteContent, ScanResult};
 
 use crate::encoding;
@@ -72,6 +73,93 @@ const NOTE_EXTENSIONS: &[&str] = &["md", "markdown"];
 
 /// 单篇笔记读取上限。超过就拒绝，避免用户误点一个 2GB 的假 `.md` 把内存打爆。
 pub(crate) const MAX_NOTE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 跳过清单最多返回多少条。
+///
+/// # 为什么是 50 而不是 1000
+///
+/// 这是**诊断**清单，不是待办清单：用户要的行动是「把这个文件挪走 / 改个名 /
+/// 删掉」，而正常库里被跳过的条目是个位数。50 条足够覆盖「误选了整个用户
+/// 目录」之外的绝大多数真实情况，同时保证这一次扫描的额外分配与序列化开销
+/// 与树的大小无关（10k 库实测增量在噪声内，见 `tests/skip_gate.rs`）。
+///
+/// 超过时 `skipped_truncated` 为真，UI 说「只列出前 50 条」，
+/// 而 `skipped` 仍然是精确总数——契约照抄 ADR-012（total 精确、truncated
+/// 只描述清单），不许重新发明一套。
+pub const SKIP_LIST_MAX: usize = 50;
+
+/// 跳过条目的收集器。
+///
+/// # 为什么是一个结构体而不是散在循环里的 `skipped += 1`
+///
+/// 五处跳过的**原因互不相同**，而它们此前共用同一个整数。收成一个类型之后，
+/// 有三条不变量只能在这一个地方维持，也就只可能被破坏一次：
+///
+/// 1. `total` 精确（含不进清单的 `Internal`）；
+/// 2. 清单长度 ≤ [`SKIP_LIST_MAX`]；
+/// 3. `truncated` 只由「**本来可以进清单**的条数」决定——不能拿
+///    `total > entries.len()` 推，因为 `Internal` 从来不进清单，那样推会把
+///    「有 1 条 Internal」误报成「清单被截断」。
+#[derive(Debug, Default)]
+struct SkipLog {
+    /// 精确总数：所有原因之和。
+    total: usize,
+    /// 本来可以进清单的条数（不含 `Internal`）。`truncated` 只由它决定。
+    listable: usize,
+    entries: Vec<ScanSkipEntry>,
+    truncated: bool,
+}
+
+impl SkipLog {
+    /// 记一条**用户修不了**的跳过：只进总数，不进清单。
+    ///
+    /// 目前只有 [`ScanSkipReason::Internal`] 走这里。把这类条目列给用户看，
+    /// 等于告诉他「这里有件事你能处理」，而他处理不了——那比不说更糟。
+    fn internal(&mut self) {
+        self.total += 1;
+    }
+
+    /// 记一条可以定位的跳过。
+    ///
+    /// `Internal` 会被挡在清单外（红线：用户修不了的只进总数），所以调用方
+    /// 不必自己判断——判断只有这一处，漏不掉。
+    fn record(&mut self, entry: ScanSkipEntry) {
+        self.total += 1;
+        if entry.reason == ScanSkipReason::Internal {
+            return;
+        }
+        self.listable += 1;
+        if self.entries.len() < SKIP_LIST_MAX {
+            self.entries.push(entry);
+        } else {
+            self.truncated = true;
+        }
+    }
+}
+
+/// 把相对路径转成「清单里能显示的一行」。
+///
+/// 返回 `(POSIX 路径, 是否 lossy)`。
+///
+/// [`to_posix`] 返回 `None` 时退回逐段 `to_string_lossy`——清单里必须有一行
+/// 看得见的东西，但调用方要据此加上「名字含无法显示的字符」的标记：
+/// `U+FFFD` 冒充真名字，用户照着它去改名会找不到文件（红线）。
+fn posix_lossy(relative: &Path) -> (String, bool) {
+    if let Some(path) = to_posix(relative) {
+        return (path, false);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => parts.push(segment.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            // RootDir / Prefix / ParentDir 在 `strip_prefix` 之后不该出现。
+            // 出现了也不能 panic：这一条本来就是要报给用户的那一类。
+            _ => {}
+        }
+    }
+    (parts.join("/"), true)
+}
 
 /// 树深硬上限。**这不是业务参数，是一条栈安全不变量。**
 ///
@@ -160,7 +248,7 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
     }
 
     let mut flat: Vec<RawEntry> = Vec::new();
-    let mut skipped: usize = 0;
+    let mut skips = SkipLog::default();
     let mut truncated = false;
 
     // 唯一收敛点：无论调用方传 32 还是 usize::MAX，树深都不会超过 MAX_SAFE_DEPTH。
@@ -182,8 +270,38 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
             //
             // 这里**没有**"软链成环"这种情况：`follow_links(false)` 下 WalkDir
             // 根本不进入软链，也就不会形成环。排查问题时别被这个念头带偏。
-            Err(_) => {
-                skipped += 1;
+            //
+            // # 两种原因，靠 `io_error()` 分
+            //
+            // - `PermissionDenied` → 用户能修（改权限 / 换个地方放）；
+            // - 其余（含 `io_error()` 为 `None` 的 `Loop`）→ 用户多半修不了，
+            //   但仍然给路径：文件被删了这件事，说出来比不说好。
+            //
+            // 路径同样可能拿不到（`Loop` 变体只给祖先与子节点），所以是
+            // `Option`——清单里必须能渲染「没有路径」。
+            Err(err) => {
+                let reason = match err.io_error().map(std::io::Error::kind) {
+                    Some(std::io::ErrorKind::PermissionDenied) => ScanSkipReason::Permission,
+                    _ => ScanSkipReason::WalkError,
+                };
+                let (path, path_lossy) = match err.path() {
+                    Some(failed) => match failed.strip_prefix(&root_abs) {
+                        Ok(relative) => {
+                            let (path, lossy) = posix_lossy(relative);
+                            (Some(path), lossy)
+                        }
+                        // 报错的路径不在库根之下（理论上不可达）。给绝对路径
+                        // 等于把库外的路径塞进「Vault 相对路径」这个字段，
+                        // 前端拼面包屑时会拼出一堆 `..`。宁可说「没有路径」。
+                        Err(_) => (None, false),
+                    },
+                    None => (None, false),
+                };
+                skips.record(ScanSkipEntry {
+                    path,
+                    path_lossy,
+                    reason,
+                });
                 continue;
             }
         };
@@ -194,8 +312,11 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
 
         let relative = match entry.path().strip_prefix(&root_abs) {
             Ok(relative) => relative,
+            // 走的是 `WalkDir::new(&root_abs)`，所以每一个产出的路径都必然
+            // 以它开头——这一支**不可达**。真到了这里说明 walkdir 的行为变了，
+            // 那是我们自己的 bug，不是用户能修的问题：只进总数，不进清单。
             Err(_) => {
-                skipped += 1;
+                skips.internal();
                 continue;
             }
         };
@@ -203,8 +324,16 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
         let path = match to_posix(relative) {
             Some(path) => path,
             None => {
-                // 非 UTF-8 文件名：跳过，绝不 panic。
-                skipped += 1;
+                // 非 UTF-8 文件名：跳过，绝不 panic，也绝不塞替换字符。
+                //
+                // 这一档**拿不到真路径**，只能 lossy + 标记。用户照着
+                // `U+FFFD` 去改名会找不到文件，所以 `path_lossy` 必须为真。
+                let (path, path_lossy) = posix_lossy(relative);
+                skips.record(ScanSkipEntry {
+                    path: Some(path),
+                    path_lossy,
+                    reason: ScanSkipReason::NonUtf8Name,
+                });
                 continue;
             }
         };
@@ -213,8 +342,15 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
         let is_dir = file_type.is_dir();
 
         if !is_dir && !file_type.is_file() {
-            // 管道 / socket / 设备文件，不是笔记。
-            skipped += 1;
+            // 管道 / socket / 设备文件 / 软链，不是笔记。
+            //
+            // 软链也落在这一支：`follow_links(false)` 下它是一个独立目录项，
+            // 既不是 `is_dir()` 也不是 `is_file()`（B-12 的可见边界）。
+            skips.record(ScanSkipEntry {
+                path: Some(path),
+                path_lossy: false,
+                reason: ScanSkipReason::NotARegularFile,
+            });
             continue;
         }
 
@@ -225,8 +361,11 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
 
         let name = match entry.file_name().to_str() {
             Some(name) => name.to_owned(),
+            // 不可达：`to_posix` 刚刚证明整条相对路径是 UTF-8，文件名是它的
+            // 最后一段。留着是为了让**五处**跳过各有明确归属，而不是为了它
+            // 真的会发生——真发生了就是内部不变量破了，用户修不了。
             None => {
-                skipped += 1;
+                skips.internal();
                 continue;
             }
         };
@@ -255,7 +394,9 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
         total_files,
         total_dirs,
         truncated,
-        skipped,
+        skipped: skips.total,
+        skipped_detail: skips.entries,
+        skipped_truncated: skips.truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -526,6 +667,63 @@ fn count_tree(node: &FileNode) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(path: &str, reason: ScanSkipReason) -> ScanSkipEntry {
+        ScanSkipEntry {
+            path: Some(path.to_owned()),
+            path_lossy: false,
+            reason,
+        }
+    }
+
+    /// 清单上限是**清单**的上限，不是总数的上限。
+    ///
+    /// 60 条非 UTF-8 文件名：`skipped` 必须是 60（精确），清单只能是 50，
+    /// `truncated` 必须为真。UI 显示的是 60——拿清单长度当总数会让用户
+    /// 以为「只有 50 个问题」，而剩下 10 个永远查不到。
+    #[test]
+    fn skip_log_caps_the_list_but_keeps_the_total_exact() {
+        let mut log = SkipLog::default();
+        for index in 0..60 {
+            log.record(entry(&format!("gbk-{index:02}.md"), ScanSkipReason::NonUtf8Name));
+        }
+
+        assert_eq!(log.total, 60, "总数必须精确，含清单外的 10 条");
+        assert_eq!(log.entries.len(), SKIP_LIST_MAX, "清单只保留前 50 条");
+        assert!(log.truncated, "清单被截断时必须为真");
+        assert_eq!(log.entries[0].path.as_deref(), Some("gbk-00.md"));
+        assert_eq!(log.entries[SKIP_LIST_MAX - 1].path.as_deref(), Some("gbk-49.md"));
+    }
+
+    /// `Internal` 只进总数，不进清单（红线：用户修不了的别列给他）。
+    ///
+    /// 关键在最后两条断言：`total` 比清单长，但 `truncated` 必须是**假**。
+    /// 拿 `total > entries.len()` 推 `truncated` 会在这里红——而那种写法
+    /// 会让「有 1 条 Internal」的库在 UI 上说「只列出前 1 条」，纯属编造。
+    #[test]
+    fn skip_log_keeps_internal_out_of_the_list() {
+        let mut log = SkipLog::default();
+        log.internal();
+        log.record(entry("locked", ScanSkipReason::Permission));
+
+        assert_eq!(log.total, 2, "Internal 也算一条");
+        assert_eq!(log.entries.len(), 1, "但清单里只有能定位的那一条");
+        assert!(!log.truncated, "清单没被截断，只是有一条不该进");
+        assert_eq!(log.entries[0].reason, ScanSkipReason::Permission);
+    }
+
+    /// 60 条 `Internal`：总数 60、清单 0 条、`truncated` 仍然是假。
+    #[test]
+    fn skip_log_never_truncates_on_internal_entries() {
+        let mut log = SkipLog::default();
+        for _ in 0..60 {
+            log.internal();
+        }
+
+        assert_eq!(log.total, 60);
+        assert!(log.entries.is_empty());
+        assert!(!log.truncated);
+    }
 
     /// 边界算术：这是"极端入参不会变成递归深度"的第一道证明。
     #[test]

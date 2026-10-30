@@ -395,6 +395,108 @@ fn does_not_follow_symlinks() {
 
     let result = scan_vault(root, &ScanOptions::default()).expect("软链不应导致扫描失败");
     assert_eq!(collect_files(&result.tree), vec!["real/a.md".to_string()]);
+
+    // 软链是一个**目录项**，既不是目录也不是普通文件——它必须可定位。
+    // 「树里少了 1 个」是 M0 的行为；本刀之后还要能说出「少的是这一个」。
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.skipped_detail.len(), 1);
+    assert_eq!(result.skipped_detail[0].path.as_deref(), Some("loop"));
+    assert_eq!(
+        result.skipped_detail[0].reason,
+        ki_core::ScanSkipReason::NotARegularFile
+    );
+    assert!(!result.skipped_truncated);
+}
+
+/* ───────────────── 跳过清单：每一类都要能定位 ───────────────── */
+
+/// 60 个非 UTF-8 文件名：总数精确 60、清单 50 条、`truncated` 为真。
+///
+/// # 为什么必须是真文件而不是构造出来的 `ScanSkipEntry`
+///
+/// `SkipLog` 的上限逻辑有单测（`scan.rs` 的 `tests` 模块），但那只证明
+/// 「收集器会截断」。这条证明的是**扫描器真的把 60 个这样的目录项喂给了它**——
+/// 少一次 `record` 调用，两边的数字就对不上，而那种漏法是编译器看不见的。
+///
+/// # 为什么只能在 Unix 上跑
+///
+/// NTFS 的文件名是 UTF-16，Rust 的 `OsStr::to_str()` 只在「不成对的代理项」
+/// 时返回 `None`，而那种名字 Win32 根本建不出来。所以 Windows 上这一档
+/// **不可构造**——不是测试写不出来，是操作系统不存在这种名字。
+#[cfg(unix)]
+#[test]
+fn sixty_non_utf8_names_are_counted_but_listed_only_fifty() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    const COUNT: usize = 60;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(root, "normal.md", "# 正常\n");
+
+    for index in 0..COUNT {
+        // GBK 的「中文」= D6 D0 CE C4，单独拿出来不是合法 UTF-8。
+        let mut bytes = vec![0xd6, 0xd0, 0xce, 0xc4, b'-'];
+        bytes.extend_from_slice(format!("{index:02}").as_bytes());
+        bytes.extend_from_slice(b".md");
+        let name = OsStr::from_bytes(&bytes);
+        fs::write(root.join(name), b"# gbk\n").unwrap();
+    }
+
+    let result = scan_vault(root, &ScanOptions::default()).expect("非 UTF-8 文件名不该让扫描失败");
+
+    assert_eq!(result.total_files, 1, "只有 normal.md 进树");
+    assert_eq!(result.skipped, COUNT, "总数必须精确");
+    assert_eq!(result.skipped_detail.len(), 50, "清单只保留前 50 条");
+    assert!(result.skipped_truncated, "清单被截断时必须为真");
+
+    for entry in &result.skipped_detail {
+        assert_eq!(entry.reason, ki_core::ScanSkipReason::NonUtf8Name);
+        // 红线：这一档拿不到真路径，必须带「名字含无法显示的字符」的标记。
+        // 少了它，用户会照着 U+FFFD 去改名，然后找不到文件。
+        assert!(entry.path_lossy, "lossy 路径必须被标出来：{entry:?}");
+        let path = entry.path.as_deref().expect("lossy 之后仍然要有一行");
+        assert!(path.ends_with(".md"), "扩展名要能看见：{path}");
+        assert!(
+            path.contains('\u{FFFD}'),
+            "这条用例的前提就是名字里有无法表示的字节：{path}"
+        );
+    }
+}
+
+/// 无读权限的目录：扫描侧计一条 `Permission`，并给出路径。
+#[cfg(unix)]
+#[test]
+fn unreadable_directory_is_reported_with_its_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write_file(root, "ok.md", "# ok\n");
+    fs::create_dir_all(root.join("locked")).unwrap();
+    write_file(root, "locked/inside.md", "# 读不到\n");
+
+    let locked = root.join("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = scan_vault(root, &ScanOptions::default());
+
+    // 无论断言成败都要把权限还原，否则 TempDir 的 Drop 删不掉它。
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let result = result.expect("一个目录没权限不该让整次扫描失败");
+
+    assert_eq!(result.total_files, 1, "读不到的目录里那篇不该进树");
+    assert_eq!(result.skipped, 1, "目录本身计一条");
+    assert_eq!(
+        result.skipped_detail[0].path.as_deref(),
+        Some("locked"),
+        "路径必须指到那个目录，而不是它里面的文件"
+    );
+    assert_eq!(
+        result.skipped_detail[0].reason,
+        ki_core::ScanSkipReason::Permission
+    );
+    assert!(!result.skipped_detail[0].path_lossy, "这个名字是合法 UTF-8");
 }
 
 /* ───────────────── 深度上限：极端入参不得让递归失控 ───────────────── */

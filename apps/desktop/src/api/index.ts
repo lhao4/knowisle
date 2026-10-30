@@ -23,6 +23,9 @@ export type {
   EncodingStats,
   Fallback,
   FileNode,
+  IndexSkipEntry,
+  IndexSkipReason,
+  IndexSkipStats,
   IndexState,
   KiError,
   NodeKind,
@@ -32,6 +35,8 @@ export type {
   SaveResult,
   SaveState,
   ScanResult,
+  ScanSkipEntry,
+  ScanSkipReason,
   SearchHit,
   SearchResult,
   TrashCursor,
@@ -159,6 +164,30 @@ export const noteCreate = commands.noteCreate
  * 那会让入口永远不出现。
  */
 export const vaultEncodingStats = commands.vaultEncodingStats
+
+/**
+ * 索引侧跳过清单：哪几篇没进索引、各是为什么。
+ *
+ * # 它与 `vaultEncodingStats` 数的是两批**互斥**的行
+ *
+ * `vaultEncodingStats` 数 `src_encoding IS NOT NULL`（能被读取、编码不是
+ * UTF-8）；这条数 `status = 'skipped'`（**根本没被索引**）。一篇要么成功
+ * 索引、要么被跳过，所以同一篇不可能同时出现在两个清单里。
+ *
+ * # 它与侧栏那个「跳过 N」数的是两件不同的事
+ *
+ * 侧栏那个来自 `ScanResult.skipped`——**扫描**时跳过的**条目**（目录、软链、
+ * FIFO、非 UTF-8 文件名）。这条数的是**索引**时跳过的**笔记**（认不出编码、
+ * 超过 2MB、IO 失败）。两个数任何时候不相等也合法，前端必须分开显示、
+ * 分开计数，不许相加或取其中一个（ADR-013）。
+ *
+ * # `indexState` 必须看
+ *
+ * 索引在后台建，建到一半时 `total` 只是「目前为止数到的」。前端要据此
+ * 继续轮询（`state === 'building'`），而不是把 0 当成「没有跳过」——
+ * 那会让入口永远不出现。
+ */
+export const vaultSkippedNotes = commands.vaultSkippedNotes
 
 /**
  * 批量转存：把一批非 UTF-8 的笔记逐篇改写成 UTF-8。

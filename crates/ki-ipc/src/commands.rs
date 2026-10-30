@@ -13,8 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use ki_core::{
-    AppInfo, EncodingStats, KiError, NoteContent, PurgeResult, RestoreResult, SaveResult, SaveState,
-    ScanResult, SearchResult, TranscodeBatch, TranscodeProgress, TrashCursor, TrashPage,
+    AppInfo, EncodingStats, IndexSkipStats, KiError, NoteContent, PurgeResult, RestoreResult,
+    SaveResult, SaveState, ScanResult, SearchResult, TranscodeBatch, TranscodeProgress, TrashCursor,
+    TrashPage,
 };
 use ki_vault::trash as trash_ops;
 use ki_vault::{
@@ -180,6 +181,31 @@ pub async fn note_transcode_to_utf8(
 #[specta::specta]
 pub async fn vault_encoding_stats(root: String) -> Result<EncodingStats, KiError> {
     run_blocking(move || search::encoding_stats(Path::new(&root))).await
+}
+
+/// 索引侧跳过清单：哪几篇没进索引、各是为什么。
+///
+/// # 它与 `vault_encoding_stats` 数的是两批**互斥**的行
+///
+/// `vault_encoding_stats` 数 `src_encoding IS NOT NULL`（能被读取、编码不是
+/// UTF-8）；本命令数 `status = 'skipped'`（**根本没被索引**）。一篇要么成功
+/// 索引、要么被跳过，所以同一篇不可能同时出现在两个清单里。
+///
+/// # 它与侧栏那个「跳过 N」数的是两件不同的事
+///
+/// 侧栏那个来自 [`ScanResult::skipped`]——**扫描**时跳过的**条目**（目录、
+/// 软链、FIFO、非 UTF-8 文件名）。本命令数的是**索引**时跳过的**笔记**
+/// （认不出编码、超过 2MB、IO 失败）。两个数任何时候不相等也合法，
+/// 前端必须分开显示、分开计数，不许相加或取其中一个（ADR-013）。
+///
+/// # `truncated` 与 `total` 的分工
+///
+/// `total` 永远精确；`truncated` 只说明 `entries` 被截到了前
+/// `SKIP_LIST_MAX`（50）条。别把清单长度当总数。
+#[tauri::command]
+#[specta::specta]
+pub async fn vault_skipped_notes(root: String) -> Result<IndexSkipStats, KiError> {
+    run_blocking(move || search::skipped_notes(Path::new(&root))).await
 }
 
 /// 批量转存：把一批非 UTF-8 的笔记逐篇改写成 UTF-8。

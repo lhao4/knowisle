@@ -48,7 +48,9 @@ use std::sync::atomic::Ordering;
 use std::sync::PoisonError;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ki_core::{EncodingStats, IndexState, KiError, ScanResult, SearchHit, SearchResult};
+use ki_core::{
+    EncodingStats, IndexSkipStats, IndexState, KiError, ScanResult, SearchHit, SearchResult,
+};
 use ki_search::{bigrams, fuse, plan, project, token_stream, Mode, Plan};
 use ki_store::{
     Counts, IndexDb, IndexedNote, NoteState, OpenOutcome, SkipReason, SkippedNote, SyncStats,
@@ -1159,6 +1161,55 @@ pub fn encoding_stats(root: &Path) -> Result<EncodingStats, KiError> {
     Ok(EncodingStats {
         total: scan.total,
         non_utf8: scan.non_utf8,
+        truncated: scan.truncated,
+        index_state,
+    })
+}
+
+/// 索引侧跳过清单：哪几篇没进索引、各是为什么。
+///
+/// # 它回答的问题与 `encoding_stats` **不同**
+///
+/// | 命令 | 数的是 | 那一篇的处境 | 动作 |
+/// |---|---|---|---|
+/// | `vault_encoding_stats` | 能被读取、但磁盘编码不是 UTF-8 | 正常，只是编码不同 | 转存 |
+/// | `vault_skipped_notes` | **没被索引**（认不出编码 / 超 2MB / IO 失败） | 搜不到 | 用户自己看一眼 |
+///
+/// 两批行**互斥**：一篇要么 `status='ok'`、要么 `status='skipped'`。
+/// 所以同一篇不可能同时出现在「待转存」与「跳过」两个清单里——验收 5
+/// 靠的就是这条 WHERE，不是靠文案。
+///
+/// # 三条纪律与 `encoding_stats` 逐字相同
+///
+/// 1. 不自己 `IndexDb::open`：走 [`lock`] + [`ensure_root`]，与检索共用同一个
+///    连接，也就共用「切库时释放连接」这条生命周期。
+/// 2. 索引在建时**让路**：不新开连接（Windows 上会抢写锁），把
+///    `indexState: building` 如实回报，前端据此继续轮询。
+/// 3. `total` 精确、`truncated` 只描述清单（ADR-012 的契约，照抄不重新发明）。
+pub fn skipped_notes(root: &Path) -> Result<IndexSkipStats, KiError> {
+    let root = canonical_root(root)?;
+    let mut cache = lock();
+    ensure_root(&mut cache, &root);
+
+    // 顺序理由与 `encoding_stats` 完全一致：先取状态再读库，最坏把
+    // 「已建完」说成「在建」（保守、无害），绝不会拿部分结果配 `Ready`。
+    let index_state = state_for(&root);
+
+    if cache.store.is_none() {
+        if matches!(index_state, IndexState::Building { .. }) {
+            return Ok(IndexSkipStats::empty(index_state));
+        }
+        let (db, _) = IndexDb::open(&root)?;
+        cache.store = Some(db);
+        cache.builds += 1;
+    }
+    let db = cache.store.as_mut().expect("上面刚保证过 store 非空");
+
+    // 上限复用扫描侧那一个常量：两个面板说「只列出前 N 条」时，N 必须是同一个数。
+    let scan = db.skipped_scan(ki_vault::SKIP_LIST_MAX)?;
+    Ok(IndexSkipStats {
+        total: scan.total,
+        entries: scan.entries,
         truncated: scan.truncated,
         index_state,
     })

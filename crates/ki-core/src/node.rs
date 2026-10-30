@@ -97,8 +97,27 @@ pub struct ScanResult {
     pub total_dirs: usize,
     /// 是否因为达到文件数上限而提前停止。
     pub truncated: bool,
-    /// 被跳过的条目数：权限不足、非 UTF-8 文件名、管道/设备文件等。
+    /// 被跳过的条目数。**精确**：所有原因之和，含那些不进清单的
+    /// （[`ScanSkipReason::Internal`]）。
+    ///
+    /// # 它是「条目」不是「笔记」
+    ///
+    /// 目录、软链、FIFO、非 UTF-8 文件名都算一条。它与
+    /// [`crate::SearchResult::skipped_files`]（索引侧的**笔记**数）是两件事，
+    /// 任何时候不相等也合法——理由见 [`crate::skip`] 的模块文档。
     pub skipped: usize,
+    /// 被跳过的条目清单，最多 `ki_vault::SKIP_LIST_MAX` 条。
+    ///
+    /// 诊断数据，不落盘：它描述的是**这一次**扫描看到了什么（ADR-013）。
+    /// 空不等于 `skipped == 0`：`Internal` 类的条目只进总数、不进这里。
+    pub skipped_detail: Vec<crate::skip::ScanSkipEntry>,
+    /// 清单是否被截断（`skipped_detail` 只是前 N 条）。
+    ///
+    /// **只描述清单**，不影响 [`ScanResult::skipped`] 的精确性——契约照抄
+    /// `EncodingStats`（ADR-012：total 精确、truncated 只描述清单）。
+    /// 它也不能由 `skipped > skipped_detail.len()` 推出来：`Internal` 类的
+    /// 条目本来就不在清单里，那样推会把「有 1 条 Internal」误报成「清单被截断」。
+    pub skipped_truncated: bool,
     /// 扫描耗时（毫秒），用于直接验证 M0 的 500ms 预算。
     pub elapsed_ms: u64,
 }

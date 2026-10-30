@@ -73,6 +73,28 @@ export const commands = {
 	 *  继续等，而不是把 0 当成「库里没有非 UTF-8」。
 	 */
 	vaultEncodingStats: (root: string) => __TAURI_INVOKE<EncodingStats>("vault_encoding_stats", { root }),
+	/**
+	 *  索引侧跳过清单：哪几篇没进索引、各是为什么。
+	 * 
+	 *  # 它与 `vault_encoding_stats` 数的是两批**互斥**的行
+	 * 
+	 *  `vault_encoding_stats` 数 `src_encoding IS NOT NULL`（能被读取、编码不是
+	 *  UTF-8）；本命令数 `status = 'skipped'`（**根本没被索引**）。一篇要么成功
+	 *  索引、要么被跳过，所以同一篇不可能同时出现在两个清单里。
+	 * 
+	 *  # 它与侧栏那个「跳过 N」数的是两件不同的事
+	 * 
+	 *  侧栏那个来自 [`ScanResult::skipped`]——**扫描**时跳过的**条目**（目录、
+	 *  软链、FIFO、非 UTF-8 文件名）。本命令数的是**索引**时跳过的**笔记**
+	 *  （认不出编码、超过 2MB、IO 失败）。两个数任何时候不相等也合法，
+	 *  前端必须分开显示、分开计数，不许相加或取其中一个（ADR-013）。
+	 * 
+	 *  # `truncated` 与 `total` 的分工
+	 * 
+	 *  `total` 永远精确；`truncated` 只说明 `entries` 被截到了前
+	 *  `SKIP_LIST_MAX`（50）条。别把清单长度当总数。
+	 */
+	vaultSkippedNotes: (root: string) => __TAURI_INVOKE<IndexSkipStats>("vault_skipped_notes", { root }),
 	/**  读取单篇笔记。`path` 必须是 `vault_scan` 返回过的 POSIX 相对路径。 */
 	noteRead: (root: string, path: string) => __TAURI_INVOKE<NoteContent>("note_read", { root, path }),
 	/**
@@ -524,6 +546,78 @@ export type FileNode = {
 	children?: FileNode[] | null,
 };
 
+/**  索引时被跳过的一条。 */
+export type IndexSkipEntry = {
+	/**  Vault 相对路径（POSIX）。索引侧的行来自扫描树，所以**恒有路径**。 */
+	path: string,
+	reason: IndexSkipReason,
+};
+
+/**
+ *  索引侧为什么跳过。
+ * 
+ *  与 `ki_store::SkipReason` 是**同一件事的两个形状**：那边是落库的字符串
+ *  （`too_large` / `invalid_utf8` / `io`），这边是跨 IPC 的枚举。多出来的
+ *  [`IndexSkipReason::Unknown`] 只可能来自一个被外部改过的索引库——它存在是
+ *  为了「`total` 与清单长度不许对不上」：认不出的原因也要占一行，否则
+ *  `count(*)` 说 3、清单只有 2 条，而 `truncated` 是 `false`。
+ */
+export type IndexSkipReason = 
+/**  超过单篇索引上限（2MB）。 */
+"tooLarge" | 
+/**
+ *  **正文**认不出编码：BOM、NUL 模式、严格 UTF-8、chardetng 四道都过了
+ *  还是解不出来。
+ * 
+ *  与 [`ScanSkipReason::NonUtf8Name`] 不是一件事：那是**文件名**，
+ *  这是**正文**。一篇 GBK 的笔记在这里**不会**出现（它解得出来，
+ *  只是需要转存，见 `EncodingStats`）。
+ */
+"invalidUtf8" | 
+/**  读取时 IO 失败。 */
+"io" | 
+/**  索引里记着一个认不出的原因（索引库被外部改过）。 */
+"unknown";
+
+/**
+ *  索引侧跳过清单。
+ * 
+ *  # `total` 精确，`truncated` 只描述清单
+ * 
+ *  与 [`crate::EncodingStats`] 逐字同一条契约（ADR-012），不重新发明：
+ * 
+ *  | 字段 | 含义 |
+ *  |---|---|
+ *  | `total` | 跳过的**笔记**数，精确（`count(*)`） |
+ *  | `entries` | 按路径升序的清单，最多 `SKIP_LIST_MAX` 条 |
+ *  | `truncated` | 清单被截断了（`entries` 只是前 N 条） |
+ * 
+ *  UI 一直显示精确的 `total`，只在清单底部说「只列出前 N 篇」。
+ *  **别拿清单长度当总数**——那是第十一刀专门写进 ADR 的一句话。
+ */
+export type IndexSkipStats = {
+	/**  跳过的笔记数（精确）。 */
+	total: number,
+	/**  清单，按路径升序。最多 `SKIP_LIST_MAX` 条。 */
+	entries: IndexSkipEntry[],
+	/**  清单是否被截断。 */
+	truncated: boolean,
+	/**
+	 *  这份统计**依据的那份索引**建到哪了。
+	 * 
+	 *  # 为什么必须有这个字段
+	 * 
+	 *  索引在后台建（10k 篇 10–108 秒）。建到一半时 `total` 是「目前为止
+	 *  数到的」；索引库刚被重建（schema 升级、换库、库损坏）那一刻更糟：
+	 *  `total` 是 0，而用户的库里明明躺着几篇 3MB 的笔记。前端据此继续轮询，
+	 *  而不是把 0 读成「没有跳过」——那会让入口**永远不出现**。
+	 * 
+	 *  第十一刀已经踩过这个坑（ADR-012 的「`indexState` 必须跟着数字一起
+	 *  回来」），这是第二次，所以复用它，不另立枚举。
+	 */
+	indexState: IndexState,
+};
+
 /**
  *  索引是否就绪。
  * 
@@ -902,11 +996,97 @@ export type ScanResult = {
 	totalDirs: number,
 	/**  是否因为达到文件数上限而提前停止。 */
 	truncated: boolean,
-	/**  被跳过的条目数：权限不足、非 UTF-8 文件名、管道/设备文件等。 */
+	/**
+	 *  被跳过的条目数。**精确**：所有原因之和，含那些不进清单的
+	 *  （[`ScanSkipReason::Internal`]）。
+	 * 
+	 *  # 它是「条目」不是「笔记」
+	 * 
+	 *  目录、软链、FIFO、非 UTF-8 文件名都算一条。它与
+	 *  [`crate::SearchResult::skipped_files`]（索引侧的**笔记**数）是两件事，
+	 *  任何时候不相等也合法——理由见 [`crate::skip`] 的模块文档。
+	 */
 	skipped: number,
+	/**
+	 *  被跳过的条目清单，最多 `ki_vault::SKIP_LIST_MAX` 条。
+	 * 
+	 *  诊断数据，不落盘：它描述的是**这一次**扫描看到了什么（ADR-013）。
+	 *  空不等于 `skipped == 0`：`Internal` 类的条目只进总数、不进这里。
+	 */
+	skippedDetail: ScanSkipEntry[],
+	/**
+	 *  清单是否被截断（`skipped_detail` 只是前 N 条）。
+	 * 
+	 *  **只描述清单**，不影响 [`ScanResult::skipped`] 的精确性——契约照抄
+	 *  `EncodingStats`（ADR-012：total 精确、truncated 只描述清单）。
+	 *  它也不能由 `skipped > skipped_detail.len()` 推出来：`Internal` 类的
+	 *  条目本来就不在清单里，那样推会把「有 1 条 Internal」误报成「清单被截断」。
+	 */
+	skippedTruncated: boolean,
 	/**  扫描耗时（毫秒），用于直接验证 M0 的 500ms 预算。 */
 	elapsedMs: number,
 };
+
+/**
+ *  扫描时被跳过的一条。
+ * 
+ *  `path` 是 `Option`：`walkdir` 的错误分支可能连路径都拿不到（`Loop` 变体
+ *  只给祖先与子节点，不给一个"这条路径"）。清单里必须能渲染「没有路径」，
+ *  不许 `unwrap`。
+ */
+export type ScanSkipEntry = {
+	/**  Vault 相对路径（POSIX）。`None` = 连路径都没拿到。 */
+	path: string | null,
+	/**
+	 *  `path` 是不是 `to_string_lossy()` 的产物。
+	 * 
+	 *  # 为什么必须单独一个布尔值
+	 * 
+	 *  非 UTF-8 文件名那一档**拿不到真路径**——`to_str()` 返回 `None` 正是
+	 *  它被跳过的原因。清单里仍然要给出看得见的一行，于是只能 lossy；
+	 *  而 lossy 会把无法表示的字节换成 `U+FFFD`，**用户照着它去改名会找不到
+	 *  文件**。所以这一位不是装饰：它为真时 UI 必须加一句「名字含无法显示的
+	 *  字符」，让用户知道这个名字不能照抄。
+	 * 
+	 *  为假时 `path` 是逐字可信的原始路径。
+	 */
+	pathLossy: boolean,
+	reason: ScanSkipReason,
+};
+
+/**
+ *  扫描侧为什么跳过。**每一种对应 `scan_vault` 里的一处 `record`。**
+ * 
+ *  # 为什么不与索引侧的 `SkipReason` 合成一个枚举
+ * 
+ *  两边至少差三种只有一侧才有的原因（非 UTF-8 **文件名**、`walkdir` 错误、
+ *  `strip_prefix` 失败）。合成一个枚举的结果是每一侧都要写「这一支我永远不会
+ *  产生」的分支，而那种分支最先腐烂——半年后没人敢删。
+ */
+export type ScanSkipReason = 
+/**  目录或文件没有读权限（`PermissionDenied`）。 */
+"permission" | 
+/**  文件名里有无法用 UTF-8 表示的字节（Linux 上由任意字节组成的名字）。 */
+"nonUtf8Name" | 
+/**
+ *  既不是目录也不是普通文件：管道、socket、设备文件、**软链**。
+ * 
+ *  软链也在这里：`follow_links(false)` 下它是一个独立的目录项，
+ *  但既不是 `is_dir()` 也不是 `is_file()`。
+ */
+"notARegularFile" | 
+/**
+ *  `walkdir` 报了错，但不是权限问题（遍历中途文件消失、目录被并发删除、
+ *  软链成环）。**用户多半修不了**，但仍然给路径：文件被删了这件事，
+ *  说出来比不说好。
+ */
+"walkError" | 
+/**
+ *  内部不变量被破坏（`strip_prefix` 失败、文件名与整条路径的 UTF-8 判定
+ *  自相矛盾）。**永不进清单**，只进 `skipped` 总数——用户修不了的东西
+ *  列在他面前，只会让他以为能修。
+ */
+"internal";
 
 /**
  *  一条命中：某篇笔记的某一行。

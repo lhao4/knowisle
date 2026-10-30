@@ -30,7 +30,9 @@ mod cache;
 pub mod legacy;
 pub mod service;
 
-pub use service::{encoding_stats, reindex, spawn_after_scan, sync_after_scan, SyncReport};
+pub use service::{
+    encoding_stats, reindex, skipped_notes, spawn_after_scan, sync_after_scan, SyncReport,
+};
 
 use std::path::Path;
 
