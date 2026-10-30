@@ -77,6 +77,16 @@ export const EXTERNAL_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-external')
  */
 export const SKIP_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-skip-list')
 
+/**
+ * 忽略规则（B-05 第十三刀）的夹具库。
+ *
+ * 单独一个库，理由与上面几条相同：这个脚本会往 `.knowisle/config.toml` 里
+ * **写配置文件**，而 `.knowisle` 在 `sweepNotes` 里是保留的——跨脚本共用库
+ * 会让下一个脚本莫名其妙地少一片目录（§6 的已知坑）。脚本自己开头与结尾
+ * 各删一次配置，但库仍然要独立。
+ */
+export const IGNORE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-ignore-rules')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 

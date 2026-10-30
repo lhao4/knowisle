@@ -4,6 +4,7 @@ import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContextMenu } from './components/ContextMenu'
 import { EncodingPanel } from './components/EncodingPanel'
 import { TreeNode } from './components/FileTree'
+import { IgnorePanel } from './components/IgnorePanel'
 import { NamePrompt } from './components/NamePrompt'
 import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
 import { Outline, type OutlineHandle } from './components/Outline'
@@ -152,6 +153,18 @@ export default function App() {
    */
   const [outline, setOutline] = useState<OutlineItem[]>([])
   const outlineRef = useRef<OutlineHandle>(null)
+  /**
+   * 「当前忽略规则」面板开着没有。
+   *
+   * 它没有自己的数据：规则跟着 `vault` 一起来（`ScanResult.ignoreRules`），
+   * 面板只是把那一份画出来。所以这里只有一个布尔，没有第五个 hook——
+   * 按「读写都在一个域才进 hook」的判据，它连一个域都算不上。
+   */
+  const [ignoreOpen, setIgnoreOpen] = useState(false)
+  /** 面板容器。挂载时聚焦、Esc 与 Tab 环都挂在它上面。 */
+  const ignorePanelRef = useRef<HTMLDivElement>(null)
+  /** 面板里那个「重新扫描」在飞。 */
+  const [ignoreRescanning, setIgnoreRescanning] = useState(false)
 
   /**
    * 主题。
@@ -505,6 +518,30 @@ export default function App() {
       refreshSkipList,
     ],
   )
+
+  /**
+   * 重扫一次库（忽略规则面板里那个按钮）。
+   *
+   * # 为什么必须是「整库重扫」而不是「重新读配置」
+   *
+   * 规则只影响**树里有什么**，而树是 `vault_scan` 的返回值。单独重读配置
+   * 只能拿到规则、拿不到树——那正是「改了配置却什么都没变」的由来。
+   *
+   * 面板不关：重扫完 `vault` 换了新对象，面板立刻显示新的规则。关掉再让
+   * 用户点开一次，等于让他怀疑自己刚才那一下有没有生效。
+   */
+  const rescanVault = useCallback(async () => {
+    if (!vault) return
+    setIgnoreRescanning(true)
+    try {
+      applyVault(await vaultScan(vault.root))
+      setError(null)
+    } catch (err) {
+      setError(describeError(err))
+    } finally {
+      setIgnoreRescanning(false)
+    }
+  }, [vault, applyVault])
 
   /**
    * 侧栏域。它要知道另外两个域的全屏浮层：`Mod+N` 叠层会让 Esc 没有答案。
@@ -1289,13 +1326,35 @@ export default function App() {
                 {vault.skipped > 0 && (
                   <button
                     type="button"
-                    className="trash-link skip-link"
+                    className="skip-link"
                     onClick={openSkipPanel}
                     title="扫描时有条目被跳过（目录、软链、设备文件、非 UTF-8 文件名），点开看是哪几个"
                   >
                     <span>跳过 {vault.skipped}</span>
                   </button>
                 )}
+                {/*
+                  忽略规则入口。**常驻**，不像「跳过 N」那样只在非零时出现：
+                  带着「我的某个文件夹不见了」来的用户，此刻 `skipped` 往往是 0
+                  ——目录被剪枝剪掉了，一个数都没有。入口消失就等于没有出口。
+
+                  类名只挂 `ignore-link`，**不许顺手带 `trash-link`**。`.trash-link`
+                  是 `cdp-trash*.mjs` 的钩子（`document.querySelector` 取第一个匹配），
+                  这个入口常驻且排在回收站按钮前面，带上它三个回收站脚本就会点开
+                  本面板，然后红在「列表里 0 行」这种完全对不上的地方。样式共享走
+                  CSS 的并列选择器，见 `.trash-link, .encoding-link, .ignore-link`。
+                */}
+                <button
+                  type="button"
+                  className="ignore-link"
+                  onClick={() => setIgnoreOpen(true)}
+                  title="查看当前生效的忽略规则（内置名单 + 你写的 extra / negate）"
+                >
+                  <span>忽略规则</span>
+                  {vault.ignoreRules.configError !== null && (
+                    <span className="ignore-link__warn">配置有误</span>
+                  )}
+                </button>
                 <button
                   type="button"
                   className="trash-link"
@@ -1646,6 +1705,21 @@ export default function App() {
           indexStats={indexSkipStats}
           error={skipError}
           onClose={closeSkipPanel}
+        />
+      )}
+
+      {/*
+        「当前忽略规则」面板。**与跳过面板平级、互不嵌套**：两种缺席两个出口
+        （ADR-013 / ADR-014）。规则来自 `vault.ignoreRules`——最近一次扫描的
+        投影，不额外发 IPC，也就没有两份数据漂移的机会。
+      */}
+      {ignoreOpen && vault && (
+        <IgnorePanel
+          panelRef={ignorePanelRef}
+          rules={vault.ignoreRules}
+          rescanning={ignoreRescanning}
+          onRescan={() => void rescanVault()}
+          onClose={() => setIgnoreOpen(false)}
         />
       )}
 

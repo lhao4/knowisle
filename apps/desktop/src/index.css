@@ -1257,8 +1257,15 @@ body {
   border-top: 1px solid var(--ki-border-subtle);
 }
 
+/*
+ * 侧栏底部那排入口共用一套外观。**样式共享走这里的并列选择器，不靠往
+ * JSX 上叠 `trash-link`**——`.trash-link` 同时是 `cdp-trash*.mjs` 的定位
+ * 钩子（`querySelector` 取第一个匹配），谁带上它谁就抢走回收站脚本的点击。
+ */
 .trash-link,
-.encoding-link {
+.encoding-link,
+.skip-link,
+.ignore-link {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1276,7 +1283,9 @@ body {
 }
 
 .trash-link:hover,
-.encoding-link:hover {
+.encoding-link:hover,
+.skip-link:hover,
+.ignore-link:hover {
   background: var(--ki-bg-hover);
   color: var(--ki-text-primary);
 }
@@ -1981,7 +1990,6 @@ body {
 }
 
 /* ── 搜索 footer 上那个可点的「跳过 M」 ── */
-
 .search__foot-actions {
   display: flex;
   align-items: center;
@@ -2007,4 +2015,156 @@ body {
 
 .search__skipped:hover {
   color: var(--ki-text-primary);
+}
+
+/* ───────────────────────── 忽略规则面板 ───────────────────────── */
+
+/*
+ * 外壳复用回收站 / 跳过那一套（`.trash-backdrop` / `.trash-panel` /
+ * `.trash__head` / `.skip__section`）：同一类东西——低频、模态、要 Esc 关掉
+ * 的说明面板。**但它与跳过面板是两个入口**：跳过是「我试了，没成」，
+ * 忽略是「我按规则没看」，两种缺席两个出口（ADR-013 / ADR-014）。
+ */
+.ignore-panel {
+  width: min(720px, 94vw);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+/* 配置错误那一行：比 `.trash__error` 多两行信息（路径 + 「没生效」）。 */
+.ignore__error {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ignore__error-line {
+  font-weight: 600;
+}
+
+/*
+ * 路径用等宽字体并允许换行：Windows 上的绝对路径很长，截断之后用户抄不去。
+ * `overflow-wrap: anywhere` 而不是 `word-break: break-all`——后者会在
+ * 反斜杠之外的地方也硬断，中文路径会断得很难看。
+ */
+.ignore__error-path,
+.ignore__path {
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+  color: var(--ki-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.ignore__error-path {
+  color: var(--ki-danger);
+}
+
+.ignore__error-note {
+  margin-top: 2px;
+  color: var(--ki-text-muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.ignore__path {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--ki-bg-code);
+}
+
+/* 配置样例：用户照着抄的那三行。不给语法高亮——它只是一段模板。 */
+.ignore__sample {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--ki-bg-code);
+  color: var(--ki-text-primary);
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-x: auto;
+}
+
+.ignore__hint {
+  margin: 0 0 8px;
+  color: var(--ki-text-faint);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.ignore__hint code {
+  font-family: var(--ki-font-mono);
+}
+
+.ignore__rescan {
+  margin: 0 0 10px;
+}
+
+/*
+ * 名单本身：**流式排列**而不是一行一条。15 个短名字（`dist` / `.cache`）
+ * 竖排会拉出一屏空白，而用户要的是「一眼扫过去有没有我的目录名」。
+ */
+.ignore__rules {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0 0 8px;
+  list-style: none;
+}
+
+.ignore__rule {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--ki-border-subtle);
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.ignore__rule code {
+  font-family: var(--ki-font-mono);
+  color: var(--ki-text-primary);
+}
+
+/*
+ * 被 negate 掉的那一条：**划掉但仍然在列表里**。
+ * 删掉它（只显示剩下的 14 条）会让用户无法确认「我写的那条到底生效了没有」,
+ * 而那正是他打开这个面板的原因。
+ */
+.ignore__rule.is-disabled code {
+  color: var(--ki-text-faint);
+  text-decoration: line-through;
+}
+
+.ignore__flag {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--ki-bg-code);
+  color: var(--ki-text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* 「额外忽略」与「已停用」是相反的两件事，用两种色系，别让它们长得一样。 */
+.ignore__flag--extra {
+  background: var(--ki-bg-warn-soft);
+  color: var(--ki-warn);
+}
+
+.ignore__flag--negate {
+  background: var(--ki-bg-code);
+  color: var(--ki-text-muted);
+}
+
+/* 侧栏入口上那个「配置有误」的小标记：入口常驻，但只有出错时才变色。 */
+.ignore-link__warn {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--ki-bg-warn-soft);
+  color: var(--ki-warn);
+  font-size: 10px;
+  white-space: nowrap;
 }
