@@ -21,13 +21,6 @@
 
 ## P2 · 现在够用，规模化后还债
 
-### B-06 `max_files` 限制的是条目数，不是文件数
-
-- **来源** M0 代码 review（`scan.rs` 的 `flat.len() >= opts.max_files`；`flat` 同时装目录和文件，`ScanOptions::max_files` 的文档却写"文件数上限"）
-- **影响** 名字骗人。20000 个目录 + 1 个文件也会触发 `truncated`；反过来文档承诺的两万篇笔记，在目录结构深的库里根本达不到。
-- **方案** 拆成 `max_entries`（安全阀，真实语义）与 `max_notes`（业务上限）；最次也要改名并同步 `ScanOptions` 文档与前端文案。
-- **触发** 有用户报"只显示了一部分笔记"，或复测性能预算时（这条会污染基准数据的解释）。
-
 ### B-07 目录排序按 Unicode 码位，不是拼音
 
 - **来源** M0 代码 review（`compare_entries`，`scan.rs` L292-297，注释已自承）
