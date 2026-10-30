@@ -22,6 +22,7 @@ import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { revalidate } from './lib/revalidate'
 import { useTheme } from './lib/theme'
+import { truncationNotice } from './lib/truncation'
 import {
   appPing,
   describeError,
@@ -1236,9 +1237,14 @@ export default function App() {
         </div>
       )}
 
+      {/*
+        截断横幅。数字取 `vault.limitEntries`，**不许写死**：上限是
+        `ScanOptions.max_entries`，它不进 IPC，只能经 `ScanResult` 带出来。
+        文案在 `lib/truncation.ts`（判据 5 的断言在那里）。
+      */}
       {vault?.truncated && (
         <div className="banner banner--warn" role="status">
-          文件数超过上限（20000），已截断。当前只索引了前 20000 个条目。
+          {truncationNotice(vault.limitEntries)}
         </div>
       )}
 
