@@ -9,10 +9,12 @@ import { NoteEditor, type NoteEditorHandle } from './components/NoteEditor'
 import { Outline, type OutlineHandle } from './components/Outline'
 import { QuickOpen } from './components/QuickOpen'
 import { SearchOverlay } from './components/SearchOverlay'
+import { SkipPanel } from './components/SkipPanel'
 import { ThemeToggle } from './components/ThemeToggle'
 import { TrashPanel } from './components/TrashPanel'
 import { useEncoding } from './hooks/useEncoding'
 import { useSearch } from './hooks/useSearch'
+import { useSkipList } from './hooks/useSkipList'
 import { useSidebar } from './hooks/useSidebar'
 import { useTrash } from './hooks/useTrash'
 import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
@@ -439,6 +441,27 @@ export default function App() {
   })
 
   /**
+   * 跳过清单的**索引侧**那一半。
+   *
+   * 扫描侧不需要它：那半份清单跟着 `vault.skippedDetail` 一起来，就在
+   * `vault_scan` 的返回值里。再问一次等于让两份数据有机会漂移。
+   *
+   * 两个数**分开显示、分开计数**：侧栏入口上的是扫描侧的条目数，搜索 footer
+   * 上的是索引侧的笔记数。任何把它们相加 / 取最大 / 只显示其中一个的写法，
+   * 都会让「侧栏说 3、搜索说 1」重新变成一句无法解释的话（ADR-013）。
+   */
+  const {
+    stats: indexSkipStats,
+    open: skipOpen,
+    error: skipError,
+    panelRef: skipPanelRef,
+    refresh: refreshSkipList,
+    reset: resetSkipList,
+    openPanel: openSkipPanel,
+    closePanel: closeSkipPanel,
+  } = useSkipList({ vault })
+
+  /**
    * 安装一次扫描结果：树进 state，扁平候选表进搜索域，回收站条数跟着重读。
    *
    * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
@@ -461,14 +484,26 @@ export default function App() {
       if (result === null) {
         resetTrash()
         resetEncoding()
+        resetSkipList()
         return
       }
       // 编码统计跟着扫描走：入口上的那个数字必须与刚扫过的这份磁盘一致。
       // 索引还在建时它是 0，`useEncoding` 会自己接着问（见 `BUILDING_POLL_MS`）。
       void refreshEncoding(result.root)
+      // 跳过清单同理：入口上那个索引侧的数必须与刚扫过的这份磁盘一致。
+      // 索引还在建时它是 0，`useSkipList` 会自己接着问（见 `BUILDING_POLL_MS`）。
+      void refreshSkipList(result.root)
       if (options?.keepTrash !== true) void refreshTrash(result.root)
     },
-    [syncCandidates, resetTrash, refreshTrash, resetEncoding, refreshEncoding],
+    [
+      syncCandidates,
+      resetTrash,
+      refreshTrash,
+      resetEncoding,
+      refreshEncoding,
+      resetSkipList,
+      refreshSkipList,
+    ],
   )
 
   /**
@@ -1092,7 +1127,6 @@ export default function App() {
           {vault && (
             <span className="stats" title={vault.root}>
               {vault.totalFiles} 篇 · {vault.totalDirs} 个目录 · {vault.elapsedMs} ms
-              {vault.skipped > 0 && ` · 跳过 ${vault.skipped}`}
             </span>
           )}
           {/*
@@ -1242,6 +1276,24 @@ export default function App() {
                     {!encodingRunning && (
                       <span className="encoding-link__count">{encodingStats?.total ?? 0}</span>
                     )}
+                  </button>
+                )}
+                {/*
+                  跳过入口。**只在真的有时才出现**：0 条时挂一个「跳过 0」等于
+                  常驻一条无意义的警告，用户会学着忽略它。
+
+                  它显示的是**扫描侧**的条目数（目录、软链、设备文件、非 UTF-8
+                  文件名）。索引侧那个数在搜索 footer 上，两者分开显示、分开
+                  计数——它们任何时候不相等也合法（ADR-013）。
+                */}
+                {vault.skipped > 0 && (
+                  <button
+                    type="button"
+                    className="trash-link skip-link"
+                    onClick={openSkipPanel}
+                    title="扫描时有条目被跳过（目录、软链、设备文件、非 UTF-8 文件名），点开看是哪几个"
+                  >
+                    <span>跳过 {vault.skipped}</span>
                   </button>
                 )}
                 <button
@@ -1423,6 +1475,11 @@ export default function App() {
           onPrepare={prepareSearch}
           onOpen={openFromSearch}
           onClose={closeSearch}
+          onOpenSkipped={() => {
+            // 先关搜索再开面板：两个都是全屏模态，叠着开等于让 Esc 没有答案。
+            closeSearch()
+            openSkipPanel()
+          }}
         />
       )}
 
@@ -1571,6 +1628,25 @@ export default function App() {
             中途失败不会中断，也不会回滚已经转好的那些；撤销（Ctrl/Cmd+Z）不会把编码改回去。
           </p>
         </ConfirmDialog>
+      )}
+
+      {/*
+        跳过面板。与回收站 / 待转存同级、互斥（都是 z-index 100 的模态）。
+
+        两个入口都能开它：侧栏底部那个「跳过 N」（扫描侧）与搜索 footer 上
+        那个「跳过 M」（索引侧）。它们打开的是**同一个面板**，因为面板里
+        两栏都在——但两个数字从头到尾没有被合并过。
+      */}
+      {skipOpen && (
+        <SkipPanel
+          panelRef={skipPanelRef}
+          scanSkipped={vault?.skipped ?? 0}
+          scanEntries={vault?.skippedDetail ?? []}
+          scanTruncated={vault?.skippedTruncated ?? false}
+          indexStats={indexSkipStats}
+          error={skipError}
+          onClose={closeSkipPanel}
+        />
       )}
 
       {/*

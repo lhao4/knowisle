@@ -40,6 +40,7 @@ const STEPS = [
   ['e2e:encoding', 'cdp-encoding.mjs', '编码：转存为 UTF-8'],
   ['e2e:encoding-batch', 'cdp-encoding-batch.mjs', '编码：库级清单 + 批量转存'],
   ['e2e:external', 'cdp-external-change.mjs', '外部改动：聚焦校验 / 重新加载 / 保留我的'],
+  ['e2e:skip-list', 'cdp-skip-list.mjs', '跳过清单：两栏分开 / 逐条可定位'],
   ['e2e:trash-page', 'cdp-trash-page.mjs', '回收站：10k 条分页'],
 ]
 

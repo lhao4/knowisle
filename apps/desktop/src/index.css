@@ -1871,3 +1871,140 @@ body {
   color: var(--ki-danger);
   font-size: 12px;
 }
+
+/* ───────────────────────── 跳过清单 ───────────────────────── */
+
+/*
+ * 外壳复用回收站那一套（`.trash-backdrop` / `.trash-panel` / `.trash__head`
+ * …）：同一类东西——低频、模态、要 Esc 关掉的清单。
+ *
+ * # 为什么整个面板滚动，而不是每栏各自滚
+ *
+ * 两栏必须能**一起**看：用户要判断的是「少的那几篇是被扫描丢了还是被索引
+ * 丢了」，那需要同时看见两个数。让两栏各自带滚动条，等于逼他在两个小窗口里
+ * 分别找，而它们的行数往往只有个位数。
+ */
+.skip-panel {
+  width: min(820px, 94vw);
+  max-height: 76vh;
+  overflow-y: auto;
+}
+
+.skip__section {
+  flex: 0 0 auto;
+  padding: 12px 16px 4px;
+  border-bottom: 1px solid var(--ki-border-subtle);
+}
+
+.skip__heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ki-text-primary);
+}
+
+/*
+ * 两个数是**分开计数**的，所以两个徽标长一样、位置一样——只有标题不同。
+ * 不给其中一个加 accent 或 danger：那会暗示「这个更重要」，而它们的地位
+ * 完全对等（一个说树里少了什么，一个说索引里少了什么）。
+ */
+.skip__count {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--ki-bg-code);
+  color: var(--ki-text-muted);
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.skip__lead {
+  margin: 0 0 8px;
+  color: var(--ki-text-faint);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* 段落内联的列表不需要自己的滚动条：滚动由整个面板负责。 */
+.skip__section .trash__list {
+  overflow: visible;
+  padding: 0 0 4px;
+}
+
+.skip__item {
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+
+.skip__item:hover {
+  background: var(--ki-bg-hover);
+}
+
+.skip__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/*
+ * 非 UTF-8 文件名那一档的标记。**必须显眼**：它旁边的路径是 lossy 的替身
+ * （`U+FFFD`），用户照着它去改名会找不到文件。用 warn 色而不是 danger——
+ * 文件没坏，只是名字没法完整显示。
+ */
+.skip__flag {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--ki-bg-warn-soft);
+  color: var(--ki-warn);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.skip__what {
+  margin: 4px 0 0;
+  color: var(--ki-text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* 「为什么不能自动修」比「发生了什么」低一档：先看见问题，再看见解释。 */
+.skip__fix {
+  margin: 2px 0 0;
+  color: var(--ki-text-muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* ── 搜索 footer 上那个可点的「跳过 M」 ── */
+
+.search__foot-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+
+/*
+ * 长得像链接、行为是按钮。不给它边框与背景：footer 已经够挤了，一个描边按钮
+ * 会把「诊断信息」变成「主要动作」，而它恰恰不该抢「Enter 跳转」的位置。
+ */
+.search__skipped {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ki-text-faint);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.search__skipped:hover {
+  color: var(--ki-text-primary);
+}

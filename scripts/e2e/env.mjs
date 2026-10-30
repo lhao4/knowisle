@@ -64,6 +64,19 @@ export const ENCODING_BATCH_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-encodin
  */
 export const EXTERNAL_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-external')
 
+/**
+ * 跳过清单（B-04 第十二刀）的夹具库。
+ *
+ * 单独一个库，理由与上面几条相同：这个脚本要造**无读权限的目录**（Windows
+ * 走 `icacls`、Unix 走 `chmod 000`）、**非 UTF-8 文件名**与 **FIFO**（仅 Unix），
+ * 而且会在中途**从 Node 侧删文件**造「删掉那篇之后清单少一条」。
+ * 与别的脚本共用库会让「起点是什么」依赖上一个脚本跑没跑过（B-32）。
+ *
+ * 权限类夹具必须能被还原：`resetVault` 的 `sweepNotes` 递归删 `.md`，遇到
+ * 一个 000 的目录会直接抛 EACCES——**所以每次重建之前先解锁**。
+ */
+export const SKIP_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-skip-list')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 

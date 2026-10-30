@@ -24,6 +24,14 @@ interface SearchOverlayProps {
   onPrepare: () => Promise<void>
   onOpen: (hit: SearchHit) => void
   onClose: () => void
+  /**
+   * 点 footer 上那个「跳过 M」。
+   *
+   * 它是**索引侧**的数（`status='skipped'` 的笔记），与侧栏那个扫描侧的条目数
+   * 是两件事。两个数分开显示、分开计数，都能点开看到各自的清单——但打开的是
+   * 同一个面板，因为面板里两栏都在（ADR-013）。
+   */
+  onOpenSkipped: () => void
 }
 
 /** `aria-activedescendant` 指向的 id。序号即身份，列表每次查询都重建。 */
@@ -62,6 +70,7 @@ export function SearchOverlay({
   onPrepare,
   onOpen,
   onClose,
+  onOpenSkipped,
 }: SearchOverlayProps) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
@@ -299,7 +308,24 @@ export function SearchOverlay({
 
         <div className="search__footer">
           <span className="search__summary">{summaryOf(result, error, busy)}</span>
-          <span className="search__keys">↑↓ 选择 · Enter 跳转 · Esc 关闭</span>
+          <span className="search__foot-actions">
+            {/*
+              索引侧的「跳过 M」。**必须是按钮**：这个数此前是一个说不清的
+              整数，用户查不了「是哪几篇」。点开之后是同一篇清单，但这里
+              显示的数与侧栏那个（扫描侧的条目数）从头到尾没有合并过。
+            */}
+            {result !== null && result.skippedFiles > 0 && (
+              <button
+                type="button"
+                className="search__skipped"
+                onClick={onOpenSkipped}
+                title="索引时跳过的笔记（认不出编码、超过 2MB、IO 失败），点开看是哪几篇"
+              >
+                跳过 {result.skippedFiles}
+              </button>
+            )}
+            <span className="search__keys">↑↓ 选择 · Enter 跳转 · Esc 关闭</span>
+          </span>
         </div>
       </div>
     </div>
@@ -339,7 +365,8 @@ function summaryOf(
         : `${result.hits.length} 条`,
   )
   parts.push(`索引 ${result.indexedFiles} 篇`)
-  if (result.skippedFiles > 0) parts.push(`跳过 ${result.skippedFiles}`)
+  // 「跳过 M」不在这里：它变成了 footer 上可点的按钮（见上面的渲染）。
+  // 一个数字只有变成可点之后，用户才能回答「是哪几篇」——而那正是本刀的全部。
   parts.push(`建索引 ${result.builds} 次`)
   if (result.indexMs > 0) parts.push(`${result.indexMs} ms`)
   return parts.join(' · ')
