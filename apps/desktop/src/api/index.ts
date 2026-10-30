@@ -23,6 +23,8 @@ export type {
   EncodingStats,
   Fallback,
   FileNode,
+  IgnoreConfigError,
+  IgnoreRules,
   IndexSkipEntry,
   IndexSkipReason,
   IndexSkipStats,

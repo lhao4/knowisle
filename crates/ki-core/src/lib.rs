@@ -15,6 +15,7 @@
 
 pub mod encoding;
 pub mod error;
+pub mod ignore;
 pub mod node;
 pub mod search;
 pub mod skip;
@@ -22,6 +23,7 @@ pub mod trash;
 
 pub use encoding::{EncodingEntry, EncodingStats, TranscodeBatch, TranscodeFailure, TranscodeProgress};
 pub use error::{IoKind, KiError};
+pub use ignore::{IgnoreConfigError, IgnoreRules};
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{IndexState, SearchHit, SearchResult};
 pub use skip::{IndexSkipEntry, IndexSkipReason, IndexSkipStats, ScanSkipEntry, ScanSkipReason};
@@ -29,10 +31,15 @@ pub use trash::{Fallback, PurgeResult, RestoreResult, TrashCursor, TrashEntry, T
 
 /// 本应用的元数据目录（Vault 相对路径的第一级）。
 ///
-/// 三处必须引用同一个常量，否则会各自漂移：
+/// 四处必须引用同一个常量，否则会各自漂移：
 /// - `ki-vault::scan` 的忽略名单（扫描器「看不见它」）
 /// - `ki-vault::path` 的破坏性操作闸（改名/删除不许碰它）
 /// - `ki-store` 的索引库位置（`<root>/.knowisle/index.sqlite`）
+/// - `ki-vault::ignore` 的配置文件位置（`<root>/.knowisle/config.toml`）
+///
+/// 最后一条与前三条例外：前三样都是**派生数据**（可整库重建），配置文件
+/// 是**用户输入**。所以「重建」只许删 `index.sqlite`，不许删这个目录——
+/// 见 ADR-014。
 ///
 /// 它放在领域层而不是 `ki-vault`：索引库也要用它，而 `ki-store` 不该为了一个
 /// 字符串常量去依赖文件系统层。

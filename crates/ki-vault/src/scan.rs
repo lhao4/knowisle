@@ -4,6 +4,11 @@
 //!
 //! - **剪枝而不是过滤**：命中 `.git` 时直接不下降（`filter_entry`），
 //!   而不是遍历完再丢弃。在一个带 `.git` 的 Vault 上这是 10 倍差距。
+//!   代价是「被剪掉的子树里有多少篇笔记」这个数**不存在**——我们没访问过它。
+//!   所以忽略永远不进 `skipped`（ADR-014）。
+//! - **忽略名单可配置**：内置名单 + 用户配置（`.knowisle/config.toml`）。
+//!   配置在 [`scan_vault`] 开头读**一次**，编译成 [`ignore::Matcher`] 之后
+//!   才进 `filter_entry`——绝不每个目录读一次文件。
 //! - **不跟随符号链接**：否则一个指向父目录的软链会让遍历无限递归。
 //! - **错误只跳过不传播**：单个文件权限不足不该让整次扫描失败。
 //! - **路径一律 POSIX**：见 `crate::path` 的说明。
@@ -16,57 +21,13 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use walkdir::{DirEntry, WalkDir};
 
+use ki_core::ignore::IgnoreRules;
 use ki_core::skip::{ScanSkipEntry, ScanSkipReason};
 use ki_core::{FileNode, KiError, NoteContent, ScanResult};
 
 use crate::encoding;
+use crate::ignore;
 use crate::path::{to_posix, ResolvedVault};
-
-/// 目录级忽略名单：命中即**不再下降**。
-///
-/// 名单里的名字分两类，忽略它们的理由并不相同：
-///
-/// - **其他工具的元数据目录**（`.git` / `.obsidian` / `.logseq` / `.trash` /
-///   `.stversions`）：里面装的是别人工具的配置、备份和回收站，不是用户的笔记。
-///   `.obsidian` 与 `logseq` 尤其关键——"打开现有的 Obsidian / Logseq 库"是最主要的
-///   迁移入口，不忽略的话 `.obsidian/plugins/*/README.md`、`logseq/bak/*.md`
-///   会整片混进树里，用户第一眼看到的是一堆别人的文档和重复笔记。
-/// - **构建产物与依赖**（`node_modules` / `target` / `dist` / ...）：误把前端仓库
-///   选成 Vault 时，这些目录能有几十万文件，剪掉它们是性能问题而不只是观感问题。
-///
-/// `.knowisle` 单独说一句：这是我们自己的元数据目录（索引、缓存、历史），
-/// 它永远不该出现在笔记树里——这是"派生数据不属于用户内容"的边界。
-///
-/// 名单是硬编码的，两个方向都会误伤：该忽略的漏了，或者用户真有个叫
-/// `dist`、`logseq` 的笔记目录被静默吞掉。后者目前无法配置，
-/// 见 `docs/BACKLOG.md` 的 B-05。
-const IGNORED_DIRS: &[&str] = &[
-    // 其他工具的元数据与备份
-    ".git",
-    ".obsidian",
-    ".logseq",
-    // 不带点的 `logseq` 也要忽略：Logseq 的图谱结构就是 `<graph>/logseq/bak/*.md`，
-    // 里面是 pages 的全量历史副本。误伤面是一个真的叫 `logseq` 的笔记目录——
-    // 概率低，且一旦有人抱怨就走 B-05 的配置化，不要靠加名字解决。
-    "logseq",
-    ".trash",
-    ".stversions",
-    // 自己的元数据目录。与 `path::METADATA_DIR` 是同一个常量：扫描器"看不见它"
-    // 与破坏性操作"不许碰它"必须指的是同一个名字，各写一份就会漂移。
-    crate::path::METADATA_DIR,
-    // 构建产物与依赖
-    "node_modules",
-    "target",
-    "dist",
-    ".next",
-    ".turbo",
-    ".cache",
-    ".venv",
-    "__pycache__",
-];
-
-/// 文件级忽略名单：纯噪音，连元数据都不必读。
-const IGNORED_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 
 /// 纳入笔记树的扩展名（大小写不敏感）。
 const NOTE_EXTENSIONS: &[&str] = &["md", "markdown"];
@@ -182,6 +143,29 @@ fn clamp_depth(requested: usize) -> usize {
     requested.min(MAX_SAFE_DEPTH)
 }
 
+/// 忽略规则的来源。
+///
+/// # 为什么是枚举而不是一个 `bool read_config`
+///
+/// 调用点读得懂：`ignore: BuiltinOnly` 说的是「我要一份**可复现的基线**」，
+/// 而 `read_config: false` 只说了「不要读」。将来要加「从指定路径读」
+/// （`isle scan --config <path>`）时只多一个变体，不用再长第二个布尔，
+/// 也不用重新解释两个布尔同时为真是什么意思。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IgnoreSource {
+    /// 只用内置名单，**不碰磁盘上的配置**。
+    ///
+    /// 测试与「我要知道默认名单到底忽略了什么」的场景用它。它等价于
+    /// 改动之前的行为——判据 1 的「逐字节相同」就是拿它与带配置的扫描对比。
+    BuiltinOnly,
+    /// 读 `<vault>/.knowisle/config.toml`（缺文件 = 只用内置）。
+    ///
+    /// 应用走这条。配置写坏不会让扫描失败，只会在 `ScanResult.ignore_rules`
+    /// 的 `config_error` 里留下一句人话（ADR-014）。
+    #[default]
+    VaultConfig,
+}
+
 /// 扫描参数。默认值对 99% 的 Vault 都够用。
 ///
 /// 唯一不能随意调大的是 [`ScanOptions::max_depth`]：它是请求值，会被收敛。
@@ -208,6 +192,13 @@ pub struct ScanOptions {
     /// 正确做法是"保留 mtime 在 N 分钟内的空目录"——给新建目录一个宽限期，
     /// 历史空目录照剪。那时这个字段应该从 `bool` 变成一个小枚举。
     pub prune_empty_dirs: bool,
+    /// 忽略规则从哪来。
+    ///
+    /// **不加一个 `rules: IgnoreRules` 字段**，理由有两条：
+    /// ① 那样每个调用方（含 20 多个测试）都要自己先读一次配置，而读配置
+    /// 属于扫描的前置条件，不该外泄给调用方；② 规则里带着 `config_error`，
+    /// 让调用方构造它就等于允许调用方伪造一条「配置错误」。
+    pub ignore: IgnoreSource,
 }
 
 impl Default for ScanOptions {
@@ -217,6 +208,7 @@ impl Default for ScanOptions {
             max_depth: 32,
             follow_links: false,
             prune_empty_dirs: false,
+            ignore: IgnoreSource::default(),
         }
     }
 }
@@ -255,13 +247,21 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
     // 这一行就是"栈安全不依赖入参"的全部实现，别把它删掉或挪到别处。
     let depth_limit = clamp_depth(opts.max_depth);
 
+    // 配置**只在这里读一次**（红线）：`filter_entry` 每个目录项都会被调用，
+    // 在里面读文件等于把一次 1 KB 的 read 乘上条目数。
+    let rules = match opts.ignore {
+        IgnoreSource::BuiltinOnly => IgnoreRules::builtin_only(),
+        IgnoreSource::VaultConfig => ignore::load(&root_abs),
+    };
+    let matcher = ignore::Matcher::new(&rules);
+
     let walker = WalkDir::new(&root_abs)
         .follow_links(opts.follow_links)
         .max_depth(depth_limit)
         // 确定性输出：同一份 Vault 每次扫描得到完全相同的顺序，CI 才能断言。
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(should_descend);
+        .filter_entry(|entry| should_descend(entry, &matcher));
 
     for item in walker {
         let entry = match item {
@@ -397,6 +397,7 @@ pub fn scan_vault(root: &Path, opts: &ScanOptions) -> Result<ScanResult, KiError
         skipped: skips.total,
         skipped_detail: skips.entries,
         skipped_truncated: skips.truncated,
+        ignore_rules: rules,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -521,19 +522,25 @@ pub fn flatten_files(tree: &FileNode) -> Vec<FileRef> {
 ///
 /// `depth() == 0` 永远放行——用户完全可能选了一个名叫 `dist` 或 `target`
 /// 的目录作为 Vault，此时把根剪掉会导致"选了文件夹却什么都没有"。
-fn should_descend(entry: &DirEntry) -> bool {
+///
+/// # 只看名字，不看路径
+///
+/// 这是刻意的，也是「误伤」的精确机制：`my-notes/dist/` 与根下的 `dist/`
+/// 一视同仁地被剪掉。改成看路径要给 `filter_entry` 传整条路径并做前缀匹配，
+/// 代价高一个数量级，而且会让「为什么这个目录能进」不可解释——用户看到
+/// 一个能进的 `dist` 和一个不能进的 `dist`，没有任何规则能解释这个差别。
+/// 配置里的路径会被**明确拒绝**并给出理由（`ignore::check_names`）。
+///
+/// 匹配表在扫描开头编译一次（[`ignore::Matcher`]），这里只做名字比较。
+fn should_descend(entry: &DirEntry, matcher: &ignore::Matcher) -> bool {
     if entry.depth() == 0 {
         return true;
     }
     let name = entry.file_name().to_string_lossy();
     if entry.file_type().is_dir() {
-        !IGNORED_DIRS
-            .iter()
-            .any(|ignored| ignored.eq_ignore_ascii_case(name.as_ref()))
+        !matcher.ignores_dir(name.as_ref())
     } else {
-        !IGNORED_FILES
-            .iter()
-            .any(|ignored| ignored.eq_ignore_ascii_case(name.as_ref()))
+        !matcher.ignores_file(name.as_ref())
     }
 }
 

@@ -118,6 +118,14 @@ pub struct ScanResult {
     /// 它也不能由 `skipped > skipped_detail.len()` 推出来：`Internal` 类的
     /// 条目本来就不在清单里，那样推会把「有 1 条 Internal」误报成「清单被截断」。
     pub skipped_truncated: bool,
+    /// 本次扫描生效的忽略规则（内置名单 + 用户配置 + 配置错误）。
+    ///
+    /// # 它不是 `skipped` 的一部分
+    ///
+    /// 被忽略的条目**不在**这里，也不在 [`ScanResult::skipped`] 里：剪枝意味着
+    /// 根本没访问过那棵子树，一个数都没有。忽略是「我按你的要求没看」，
+    /// 跳过是「我试了，没成」——两件事，两个出口（ADR-013 / ADR-014）。
+    pub ignore_rules: crate::ignore::IgnoreRules,
     /// 扫描耗时（毫秒），用于直接验证 M0 的 500ms 预算。
     pub elapsed_ms: u64,
 }

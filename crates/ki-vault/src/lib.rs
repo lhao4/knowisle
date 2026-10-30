@@ -32,6 +32,7 @@
 pub mod autosave;
 pub mod encoding;
 pub mod fileops;
+pub mod ignore;
 pub mod naming;
 pub mod path;
 pub mod scan;
@@ -43,11 +44,12 @@ pub mod write;
 pub use autosave::{SaveThrottle, AUTOSAVE_INTERVAL};
 pub use encoding::{Decoded, EncodeError, Encoding, Undecodable};
 pub use fileops::{create_note, delete_note, rename_note};
+pub use ignore::{config_path, load as load_ignore_rules, CONFIG_FILE};
 pub use naming::normalize_note_name;
 pub use path::{resolve_for_write, resolve_in_vault, to_posix, ResolvedVault};
 pub use scan::{
-    flatten_files, read_note, read_note_in, scan_vault, FileRef, ScanOptions, MAX_SAFE_DEPTH,
-    SKIP_LIST_MAX,
+    flatten_files, read_note, read_note_in, scan_vault, FileRef, IgnoreSource, ScanOptions,
+    MAX_SAFE_DEPTH, SKIP_LIST_MAX,
 };
 pub use search::{
     fold_ascii, name_lower_for_path, note_stem, Located, NoteLocator, QueryNeedles, SearchIndex,
