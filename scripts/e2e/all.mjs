@@ -50,6 +50,7 @@ const STEPS = [
   ['e2e:external', 'cdp-external-change.mjs', '外部改动：聚焦校验 / 重新加载 / 保留我的'],
   ['e2e:skip-list', 'cdp-skip-list.mjs', '跳过清单：两栏分开 / 逐条可定位'],
   ['e2e:ignore-rules', 'cdp-ignore-rules.mjs', '忽略规则：extra / negate / 写坏可见'],
+  ['e2e:vault-info', 'cdp-vault-info.mjs', '库信息：只读快照 / 数字口径 / 避让'],
   ['e2e:trash-page', 'cdp-trash-page.mjs', '回收站：10k 条分页'],
 ]
 

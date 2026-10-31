@@ -77,6 +77,25 @@ export const commands = {
 	 */
 	vaultFingerprint: (root: string) => __TAURI_INVOKE<string>("vault_fingerprint", { root }),
 	/**
+	 *  库信息：一次**只读快照**——索引库占用 / 回收站占用 / 索引建到哪。
+	 * 
+	 *  # 它回答什么
+	 * 
+	 *  「这个库现在是什么状态」：索引多大、回收站里还压着多少、后台建完了没。
+	 *  三个数都只数**这个应用自己占的**，不含笔记本身的体积——那是用户的文件。
+	 * 
+	 *  # 为什么不做成「打开面板就自动刷新」
+	 * 
+	 *  面板是用户驱动的：打开时取一次，索引还在建时按 `useSkipList` 那套 1.5 秒
+	 *  节奏续问，建完就停。没有常驻轮询——一个诊断面板不该让磁盘每秒被 stat 一次。
+	 * 
+	 *  # 失败
+	 * 
+	 *  只读，不改任何东西。`.knowisle/` 或 `trash/` 不存在 = 0，不是错误；
+	 *  读不动（权限）才报错，前端在面板里显示出来。
+	 */
+	vaultInfo: (root: string) => __TAURI_INVOKE<VaultInfo>("vault_info", { root }),
+	/**
 	 *  全文搜索：ASCII 大小写折叠后的字面子串匹配，多词取 AND。
 	 * 
 	 *  # 参数
@@ -1536,5 +1555,41 @@ export type TrashPage = {
 	total: number,
 	/**  下一页的游标。`null` = 没有下一页。 */
 	next: TrashCursor | null,
+};
+
+/**
+ *  一次只读快照。**没有任何缓存**：每次调用都重新读盘。
+ * 
+ *  缓存会让「我刚清空了回收站，怎么还显示 200 MB」变成一个必须靠重启解决的
+ *  问题。这几个数的成本是「两次 `read_dir` + 若干次 `metadata`」，回收目录与
+ *  `.knowisle/` 都是平铺的小目录，不值得为它引入失效逻辑。
+ */
+export type VaultInfo = {
+	/**
+	 *  `.knowisle/` 下索引库占的字节数：`index.sqlite` + `-wal` + `-shm`。
+	 * 
+	 *  三个一起算，因为 WAL 模式下它们**是同一个库**：只算主库文件时，一个
+	 *  刚建到一半的库会显示 0，而磁盘上明明躺着几十 MB 的 WAL。
+	 */
+	indexBytes: number,
+	/**
+	 *  回收目录里文件占的字节数。**不含** `trash-manifest/`。
+	 * 
+	 *  这是用户唯一能感知的那部分：「我删了 500 MB，磁盘没变宽」说的就是它。
+	 */
+	trashBytes: number,
+	/**
+	 *  回收目录里的**文件数**，与 `trash_list.total` 同一口径。
+	 * 
+	 *  面板显示它、回收站也显示它，两处必须相等——否则用户会以为其中一个坏了。
+	 */
+	trashEntries: number,
+	/**
+	 *  后台索引建到哪。
+	 * 
+	 *  与检索、跳过清单、待转存用的是同一个 [`IndexState`]：同一件事不该有
+	 *  两种说法（`building` 时「搜到的可能不全」这句话在四个地方都要成立）。
+	 */
+	indexState: IndexState,
 };
 

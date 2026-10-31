@@ -13,11 +13,13 @@ import { SearchOverlay } from './components/SearchOverlay'
 import { SkipPanel } from './components/SkipPanel'
 import { ThemeToggle } from './components/ThemeToggle'
 import { TrashPanel } from './components/TrashPanel'
+import { VaultInfoPanel } from './components/VaultInfoPanel'
 import { useEncoding } from './hooks/useEncoding'
 import { useSearch } from './hooks/useSearch'
 import { useSkipList } from './hooks/useSkipList'
 import { useSidebar } from './hooks/useSidebar'
 import { useTrash } from './hooks/useTrash'
+import { useVaultInfo } from './hooks/useVaultInfo'
 import { useTreeProbe } from './hooks/useTreeProbe'
 import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
@@ -500,6 +502,25 @@ export default function App() {
   } = useSkipList({ vault })
 
   /**
+   * 库信息：**只读快照**，打开时取一次。
+   *
+   * 它只补两块前端手里没有的数据：索引库占用、回收站占用，外加索引建到哪。
+   * 「笔记数 / 目录数 / 跳过 / 忽略 / 待转存」全部来自 `vault` 与既有 hook，
+   * 再问一次等于让两份数据有机会漂移。
+   */
+  const {
+    info: vaultInfo,
+    open: infoOpen,
+    error: infoError,
+    busy: infoBusy,
+    panelRef: infoPanelRef,
+    refresh: refreshInfo,
+    reset: resetInfo,
+    openPanel: openInfoPanel,
+    closePanel: closeInfoPanel,
+  } = useVaultInfo({ vault })
+
+  /**
    * 安装一次扫描结果：树进 state，扁平候选表进搜索域，回收站条数跟着重读。
    *
    * 三件事必须**一起**做。分开写（某处 setVault、另一处忘了重建候选表）
@@ -529,6 +550,7 @@ export default function App() {
         resetTrash()
         resetEncoding()
         resetSkipList()
+        resetInfo()
         return
       }
       // 编码统计跟着扫描走：入口上的那个数字必须与刚扫过的这份磁盘一致。
@@ -547,6 +569,7 @@ export default function App() {
       refreshEncoding,
       resetSkipList,
       refreshSkipList,
+      resetInfo,
     ],
   )
 
@@ -1026,6 +1049,7 @@ export default function App() {
     encodingRunning ||
     skipOpen ||
     ignoreOpen ||
+    infoOpen ||
     prompt !== null ||
     menu !== null ||
     deleteTarget !== null ||
@@ -1553,6 +1577,23 @@ export default function App() {
                     <span className="trash-link__count">{trash.total}</span>
                   )}
                 </button>
+                {/*
+                  库信息入口。**常驻**，与「忽略规则」同理：它不承载任何「有没有
+                  东西需要处理」的信号，而是「这个库现在是什么状态」的唯一出口。
+                  只在非零时出现会让「索引建完了没」永远无处可查。
+
+                  类名只挂 `info-link`，**不许带 `trash-link`**：`.trash-link` 是
+                  `cdp-trash*.mjs` 的定位钩子（取第一个匹配），而这个入口排在它
+                  后面也不该被那几个脚本点开。样式共享走 CSS 并列选择器。
+                */}
+                <button
+                  type="button"
+                  className="info-link"
+                  onClick={openInfoPanel}
+                  title="查看这个库的规模、索引状态与占用（只读，不改任何东西）"
+                >
+                  <span>库信息</span>
+                </button>
               </div>
             </>
           ) : (
@@ -1930,6 +1971,44 @@ export default function App() {
           onLoadMore={() => void loadMoreTrash()}
           onPurge={requestPurge}
           onClose={closeTrash}
+        />
+      )}
+
+      {/*
+        库信息面板：**只读诊断面**，一个写操作都没有。
+
+        放在回收站之后：它不承载「有没有东西要处理」的信号，纯粹是
+        「这个库现在是什么状态」的出口。三个「没进树」的入口从这里跳出去时
+        先把自己关掉——两层模态叠在一起，Esc 只会关掉上面那层，而用户以为
+        自己回到了编辑器。
+      */}
+      {infoOpen && vault && (
+        <VaultInfoPanel
+          panelRef={infoPanelRef}
+          vault={vault}
+          encodingPending={encodingStats?.total ?? 0}
+          info={vaultInfo}
+          error={infoError}
+          busy={infoBusy}
+          onRefresh={() => void refreshInfo(vault.root)}
+          onClose={() => {
+            closeInfoPanel()
+            // 与回收站同一条：面板关掉之后焦点要回到编辑器，否则下一次按键
+            // 落在 `<body>` 上，用户会以为输入法坏了。
+            focusEditor()
+          }}
+          onOpenSkip={() => {
+            closeInfoPanel()
+            openSkipPanel()
+          }}
+          onOpenEncoding={() => {
+            closeInfoPanel()
+            openEncoding()
+          }}
+          onOpenIgnore={() => {
+            closeInfoPanel()
+            setIgnoreOpen(true)
+          }}
         />
       )}
 

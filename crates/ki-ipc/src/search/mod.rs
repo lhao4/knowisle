@@ -26,7 +26,9 @@
 //!
 //! 旧引擎计划保留一个 release 再清理：它是回滚路径，也是对拍的参照实现。
 
-mod cache;
+// `pub(crate)` 而不是 `mod`：库信息面板要问「索引建到哪了」，而它不该为了
+// 一个只读状态去触发一次搜索（那会顺带建索引，把「看一眼」变成「跑一遍」）。
+pub(crate) mod cache;
 pub mod legacy;
 pub mod service;
 

@@ -115,6 +115,16 @@ export const RESCAN_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-rescan')
  */
 export const PROBE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-probe')
 
+/**
+ * 库信息面板的夹具（M7 第十八刀）。
+ *
+ * 独立一个库的理由与上面几条相同（B-32），但它多一条**自己的**理由：
+ * 这个脚本要断言「回收站占了多少字节」与「索引库占了多少字节」，而这两个
+ * 数字依赖磁盘上恰好有什么。与别人共用库，等于让断言依赖上一个脚本删过
+ * 什么——那种依赖第一次跑是绿的，第二次就不是了。
+ */
+export const INFO_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-info')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 

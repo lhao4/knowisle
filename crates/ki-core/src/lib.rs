@@ -16,6 +16,7 @@
 pub mod encoding;
 pub mod error;
 pub mod ignore;
+pub mod info;
 pub mod node;
 pub mod search;
 pub mod skip;
@@ -24,6 +25,7 @@ pub mod trash;
 pub use encoding::{EncodingEntry, EncodingStats, TranscodeBatch, TranscodeFailure, TranscodeProgress};
 pub use error::{IoKind, KiError};
 pub use ignore::{IgnoreConfigError, IgnoreRules};
+pub use info::VaultInfo;
 pub use node::{AppInfo, FileNode, NodeKind, NoteContent, SaveResult, SaveState, ScanResult};
 pub use search::{IndexState, SearchHit, SearchResult};
 pub use skip::{IndexSkipEntry, IndexSkipReason, IndexSkipStats, ScanSkipEntry, ScanSkipReason};

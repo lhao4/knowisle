@@ -1285,7 +1285,8 @@ body {
 .trash-link,
 .encoding-link,
 .skip-link,
-.ignore-link {
+.ignore-link,
+.info-link {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1305,7 +1306,8 @@ body {
 .trash-link:hover,
 .encoding-link:hover,
 .skip-link:hover,
-.ignore-link:hover {
+.ignore-link:hover,
+.info-link:hover {
   background: var(--ki-bg-hover);
   color: var(--ki-text-primary);
 }
@@ -2187,4 +2189,135 @@ body {
   color: var(--ki-warn);
   font-size: 10px;
   white-space: nowrap;
+}
+
+/* ───────────────────────── 库信息面板（只读诊断） ───────────────────────── */
+
+/*
+ * 比跳过面板窄：它没有清单，只有六行数字与三段说明。宽面板会让每行文字都
+ * 长到需要换行，反而更难扫。
+ */
+.info-panel {
+  width: min(620px, 94vw);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.info__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.info__section {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--ki-border-subtle);
+}
+
+.info__section:last-of-type {
+  border-bottom: 0;
+}
+
+/*
+ * 路径要能整段选中（面板里没有「复制」按钮，见组件的注释）。
+ * `user-select: all` 让单击一次就选中整行，Ctrl+C 就够了；
+ * `word-break` 保证长路径换行而不是把面板撑出横向滚动条。
+ */
+.info__path {
+  margin: 0 0 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--ki-bg-code);
+  color: var(--ki-text-primary);
+  font-family: var(--ki-font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+}
+
+/* 数字成组：三列，窄屏自动降到两列。 */
+.info__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px 16px;
+  margin: 0;
+}
+
+.info__cell dt {
+  margin: 0 0 2px;
+  color: var(--ki-text-muted);
+  font-size: 11px;
+}
+
+.info__cell dd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--ki-text-primary);
+  font-family: var(--ki-font-mono);
+  font-size: 14px;
+}
+
+/*
+ * 「下界」标记：截断时笔记数是下界，必须当场说出来（ADR-015 的同一条公理）。
+ * 用中性底而不是 danger——它不是错误，是这次扫描的边界。
+ */
+.info__flag {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--ki-bg-code);
+  color: var(--ki-text-muted);
+  font-family: var(--ki-font-sans);
+  font-size: 10px;
+}
+
+.info__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 4px;
+}
+
+.info__label {
+  color: var(--ki-text-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.info__hint {
+  margin: 6px 0 0;
+  color: var(--ki-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.info__hint code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--ki-bg-code);
+  font-family: var(--ki-font-mono);
+  font-size: 11px;
+}
+
+.info__lead {
+  margin: 0 0 10px;
+  color: var(--ki-text-muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/*
+ * 三个出口横排，放不下就换行。它们是**按钮**而不是链接：点了会打开另一个
+ * 面板（并把本面板关掉），与侧栏底部那排入口同一套语义。
+ */
+.info__exits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.info__exit:disabled {
+  opacity: 0.55;
+  cursor: default;
 }

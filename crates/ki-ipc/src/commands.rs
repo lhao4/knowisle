@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use ki_core::{
     AppInfo, EncodingStats, IndexSkipStats, KiError, NoteContent, PurgeResult, RestoreResult,
     SaveResult, SaveState, ScanResult, SearchResult, TranscodeBatch, TranscodeProgress, TrashCursor,
-    TrashPage,
+    TrashPage, VaultInfo,
 };
 use ki_vault::trash as trash_ops;
 use ki_vault::{
@@ -112,6 +112,34 @@ pub async fn vault_fingerprint(root: String) -> Result<String, KiError> {
         // 与 `vault_scan` 同一份规则：否则 `.knowisle` 里写索引会触发自己重扫。
         let rules = ki_vault::ignore::load(&root);
         dir_fingerprint(&root, &rules)
+    })
+    .await
+}
+
+/// 库信息：一次**只读快照**——索引库占用 / 回收站占用 / 索引建到哪。
+///
+/// # 它回答什么
+///
+/// 「这个库现在是什么状态」：索引多大、回收站里还压着多少、后台建完了没。
+/// 三个数都只数**这个应用自己占的**，不含笔记本身的体积——那是用户的文件。
+///
+/// # 为什么不做成「打开面板就自动刷新」
+///
+/// 面板是用户驱动的：打开时取一次，索引还在建时按 `useSkipList` 那套 1.5 秒
+/// 节奏续问，建完就停。没有常驻轮询——一个诊断面板不该让磁盘每秒被 stat 一次。
+///
+/// # 失败
+///
+/// 只读，不改任何东西。`.knowisle/` 或 `trash/` 不存在 = 0，不是错误；
+/// 读不动（权限）才报错，前端在面板里显示出来。
+#[tauri::command]
+#[specta::specta]
+pub async fn vault_info(root: String) -> Result<VaultInfo, KiError> {
+    run_blocking(move || {
+        let root = PathBuf::from(root);
+        // 索引状态在内存里（后台任务写的），不在这层的 IO 里。
+        let state = search::cache::state_for(&root);
+        crate::info::collect(&root, state)
     })
     .await
 }

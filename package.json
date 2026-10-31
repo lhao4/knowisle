@@ -31,6 +31,7 @@
     "e2e:external": "node scripts/e2e/cdp-external-change.mjs",
     "e2e:skip-list": "node scripts/e2e/cdp-skip-list.mjs",
     "e2e:ignore-rules": "node scripts/e2e/cdp-ignore-rules.mjs",
+    "e2e:vault-info": "node scripts/e2e/cdp-vault-info.mjs",
     "e2e:all": "node scripts/e2e/all.mjs"
   }
 }

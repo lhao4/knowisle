@@ -47,6 +47,7 @@ export type {
   TranscodeProgress,
   TrashEntry,
   TrashPage,
+  VaultInfo,
 } from './bindings'
 
 /**
@@ -87,6 +88,30 @@ export const vaultScan = commands.vaultScan
  * 写进 localStorage 反而会让「上次那台机器上的形状」冒充「这一次的形状」。
  */
 export const vaultFingerprint = commands.vaultFingerprint
+
+/**
+ * 库信息：一次**只读快照**——索引库占用、回收站占用、索引建到哪。
+ *
+ * # 每个数的口径（面板必须照这个说，否则它会变成新的误解来源）
+ *
+ * - `indexBytes` = `.knowisle/` 下 `index.sqlite` + `-wal` + `-shm` 的字节和。
+ *   只算主库文件会让一个正在建的库显示 0，而 WAL 里躺着几十 MB。
+ * - `trashBytes` / `trashEntries` = `trash/` 里**文件**的字节和与个数，
+ *   不含 `trash-manifest/`。`trashEntries` 与 `trashList().total` **同口径**，
+ *   两处显示同一个概念却差一，用户会以为其中一个坏了。
+ * - `indexState` 与检索、跳过清单、待转存用的是同一个 `IndexState`。
+ *
+ * # 它不数笔记的体积
+ *
+ * 那是用户的文件，不是这个应用占的空间。混在一起，「库信息」会读起来像
+ * 「磁盘占用」，而用户真正想问的是「我删掉的那些东西还占着多少」。
+ *
+ * # 没有缓存，也不轮询
+ *
+ * 每次调用都重新读盘（两次 `read_dir`）。面板打开时取一次，索引还在建时
+ * 按既有节奏续问，建完就停——一个诊断面板不该让磁盘每秒被 stat 一次。
+ */
+export const vaultInfo = commands.vaultInfo
 
 /**
  * 全文搜索。
