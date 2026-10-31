@@ -28,10 +28,11 @@
 | 忽略规则 | 已实现 | 内置 15 条 + 自己写 `extra` / `negate`，配置在 `.knowisle/config.toml`；写坏了有可见告警，不是静默失效 |
 | 跳过清单 | 已实现 | 扫描侧（条目）与索引侧（笔记）**两栏分开、不求和**，逐条可定位。两个「跳过」的定义本来就不同 |
 | 大库保护 | 已实现 | 扫描有安全阀：撞上限时横幅说清「条目」与「篇」的差别，以及被截断处目录可能显示为空（磁盘上并不是） |
+| 库信息 | 已实现 | 侧栏底部**只读诊断面**：库路径（可整段选中）/ 笔记·目录·上次扫描耗时 / 索引库与回收站**占了多少磁盘** / 索引状态 / 跳过·待转存·忽略三个出口。一个写操作都没有，每个数字都写着口径 |
 | AI 能力 | 未开始 | — |
 | 多端同步 | 未开始 | — |
 
-当前处于 **M7** 阶段：v0.1.0 的六项 Must 全部在线，之后一直在按 [`docs/BACKLOG.md`](docs/BACKLOG.md) 逐条清技术债（M7 已十七刀）。里程碑与验收口径见 [`docs/MVP-SCOPE.md`](docs/MVP-SCOPE.md)，每条架构决策的依据见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（ADR 到 018）。
+当前处于 **M7** 阶段：v0.1.0 的六项 Must 全部在线，之后一直在按 [`docs/BACKLOG.md`](docs/BACKLOG.md) 逐条清技术债（M7 已十八刀）。里程碑与验收口径见 [`docs/MVP-SCOPE.md`](docs/MVP-SCOPE.md)，每条架构决策的依据见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（ADR 到 019）。
 
 ## 快捷键
 
