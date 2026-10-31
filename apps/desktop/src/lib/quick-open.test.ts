@@ -47,16 +47,17 @@ describe('flattenVault', () => {
     expect(paths(flattenVault(tree))).toEqual(['a.md', 'b/c.md'])
   })
 
-  it('扁平化：按路径的 UTF-16 码位排序，不是 localeCompare', () => {
-    // 码位序里 `B`(66) < `a`(97)；localeCompare 会给出相反的顺序。
-    // 引入 ICU 排序会让同一个库在两台机器上给出不同的「前 50 篇」。
-    const tree = dir('', '', [file('a.md', 'a.md'), file('B.md', 'B.md')])
-    expect(paths(flattenVault(tree))).toEqual(['B.md', 'a.md'])
+  it('扁平化：保持树里的顺序，不重排', () => {
+    // 输入故意违反码位序（`b.md` > `a.md`）：输出必须原样保持。
+    // 排序是扫描器的事（`ki-vault/src/sort.rs`），前端再排一遍就是第二份顺序。
+    const tree = dir('', '', [file('b.md', 'b.md'), file('a.md', 'a.md')])
+    expect(paths(flattenVault(tree))).toEqual(['b.md', 'a.md'])
   })
 
-  it('扁平化：`a.md` 排在 `a/x.md` 前面（`.` 的码位小于 `/`）', () => {
-    const tree = dir('', '', [file('a.md', 'a.md'), dir('a', 'a', [file('x.md', 'a/x.md')])])
-    expect(paths(flattenVault(tree))).toEqual(['a.md', 'a/x.md'])
+  it('扁平化：目录展开在原地（先序），不是把所有文件攒完再排', () => {
+    // `a` 目录排在 `a.md` 前面时，它里面的文件就出现在 `a.md` 之前。
+    const tree = dir('', '', [dir('a', 'a', [file('x.md', 'a/x.md')]), file('a.md', 'a.md')])
+    expect(paths(flattenVault(tree))).toEqual(['a/x.md', 'a.md'])
   })
 
   it('扁平化：name 去掉 `.md`，大小写不敏感', () => {
@@ -73,8 +74,8 @@ describe('flattenVault', () => {
     const tree = dir('', '', [file('c.md', 'c.md'), file('b.md', 'a/b.md')])
     const items = flattenVault(tree)
     expect(items.map((it) => [it.path, it.dir])).toEqual([
-      ['a/b.md', 'a'],
       ['c.md', ''],
+      ['a/b.md', 'a'],
     ])
   })
 

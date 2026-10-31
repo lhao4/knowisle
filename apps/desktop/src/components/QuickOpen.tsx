@@ -121,7 +121,7 @@ export function QuickOpen({ items, onOpen, onClose }: QuickOpenProps) {
 
   const summary =
     query.length === 0
-      ? '没有打开历史，按路径排序'
+      ? '没有打开历史，按侧栏顺序'
       : results.length >= QUICK_LIMIT
         ? `前 ${QUICK_LIMIT} 个结果`
         : `${results.length} 个结果`

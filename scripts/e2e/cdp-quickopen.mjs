@@ -24,19 +24,17 @@ console.log(`夹具：${fixture.count} 篇 + 2 个坏文件 → ${fixture.root}`
 const NOTE_A = path.join(VAULT, 'notes', 'note-0000.md')
 const NOTE_B = 'foo/bar.md'
 
-/* ───────────────────── 期望值（Node 侧独立算一遍） ───────────────────── */
+/* ───────────────────── 期望值：见 `expectedTop50`（连上 CDP 之后算） ───────────────────── */
 
-const walk = (dir, prefix) => {
-  const out = []
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`
-    if (entry.isDirectory()) out.push(...walk(path.join(dir, entry.name), rel))
-    else if (entry.name.toLowerCase().endsWith('.md')) out.push(rel)
-  }
-  return out
-}
-const ALL_PATHS = walk(VAULT, '').sort()
-const EXPECTED_TOP50 = ALL_PATHS.slice(0, 50)
+// 顺序不再由 Node 侧 `.sort()` 独立算。
+//
+// 以前这里用 `walk().sort()` 复现「按 path 排序」，因为那时前端确实自己排。
+// ADR-016 之后顺序由扫描器给（拼音 + 数字感知），Node 侧要复现它就得再实现
+// 一遍 ICU 排序——那正是「两套顺序」这个病。所以期望值改成**向 Rust 要真树、
+// 按 DFS 先序取前 50**：这条判据验的是「面板与侧栏同序」这条新契约。
+//
+// 不用 `.tree-row` 对齐：目录默认折叠，DOM 里只有根层（B-12）。
+// 计算放在 `ev` 定义之后——`const` 的 TDZ 会让脚本在连接之前就崩。
 
 /* ───────────────────────────── CDP ───────────────────────────── */
 
@@ -73,6 +71,20 @@ const ev = async (expression) => {
   }
   return res.result?.result?.value
 }
+
+/** 真树的 DFS 先序前 50 篇——空查询面板的期望值（判据 8）。 */
+const expectedTop50 = await ev(`(async () => {
+  const scan = await window.__TAURI_INTERNALS__.invoke('vault_scan', { root: ${JSON.stringify(VAULT)} })
+  const out = []
+  const walk = (node) => {
+    for (const child of node.children ?? []) {
+      if (child.kind === 'file') out.push(child.path)
+      else walk(child)
+    }
+  }
+  walk(scan.tree)
+  return { paths: out.slice(0, 50), total: out.length, truncated: scan.truncated }
+})()`)
 
 /**
  * 在**页面任何脚本之前**注入的探针：统计 `window` 上 `keydown` 监听器的
@@ -300,20 +312,24 @@ const openSamples = await ev(`window.__KI_OPEN__`)
 const openStats = stats(openSamples)
 check('1.open-latency', openStats.n === 10 && openStats.p95 <= 100 && openStats.max <= 100, openStats)
 
-/* ───────────────────── 2. 空查询：前 50 篇按 path 排序 ───────────────────── */
+/* ───────────────── 2. 空查询：前 50 篇与树同序（判据 8） ───────────────── */
 
 await freshPanel()
 const empty = await panel()
 check('2.empty-count', empty.count === 50, { count: empty.count, summary: empty.summary })
 check(
   '2.empty-order',
-  empty.items.every((it, i) => it.path === EXPECTED_TOP50[i]),
+  expectedTop50.paths.length === 50 &&
+    !expectedTop50.truncated &&
+    empty.items.every((it, i) => it.path === expectedTop50.paths[i]),
   {
     first5: empty.items.slice(0, 5).map((i) => i.path),
-    mismatch: empty.items.findIndex((it, i) => it.path !== EXPECTED_TOP50[i]),
+    expectedFirst5: expectedTop50.paths.slice(0, 5),
+    mismatch: empty.items.findIndex((it, i) => it.path !== expectedTop50.paths[i]),
+    expectedTotal: expectedTop50.total,
   },
 )
-check('2.empty-hint', empty.summary === '没有打开历史，按路径排序', empty.summary)
+check('2.empty-hint', empty.summary === '没有打开历史，按侧栏顺序', empty.summary)
 check('2.focus-on-input', empty.focus.includes('quick-open__input'), empty.focus)
 check(
   '2.activedescendant',

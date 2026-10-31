@@ -40,15 +40,23 @@ export const QUICK_LIMIT = 50
 /* ───────────────────────── 扁平化 ───────────────────────── */
 
 /**
- * 把扫描出来的树压成按 `path` 排序的一维数组。
+ * 把扫描出来的树按**先序**压成一维数组：目录展开在原地，文件按树里的顺序
+ * 依次出现。于是返回值的前 N 项就是「侧栏从上往下数前 N 篇」。
  *
  * 用显式栈而不是递归：扫描器允许很深的目录（实测 136 层），递归版本在
  * 更深的库上会爆栈，而这里没有任何理由替用户设一个深度上限。
  *
- * 排序用 UTF-16 码位比较（`<` / `>`），与扫描器的码位序一致。
- * 不引入 `localeCompare`：它依赖 ICU 与系统语言，同一个库在两台机器上
- * 会给出不同的「前 50 篇」——这是验收里可以复现的差异，不是细节。
- * （拼音排序是 B-07 的事，改的时候两边一起改。）
+ * # 这里不排序
+ *
+ * 顺序由扫描器给（`ki-vault/src/sort.rs`：目录在前 → 拼音 → 数字感知）。
+ * 前端再排一遍就是第二份顺序——两份顺序在小库上看着一样，改任何一边都会
+ * 分叉。这个函数曾经按 `path` 的 UTF-16 码位排，注释里写着「拼音排序是
+ * B-07 的事，改的时候两边一起改」；ADR-016 兑现了那句：扫描器换成拼音序，
+ * 这里同时把排序删掉。
+ *
+ * 也因此不能改用 `localeCompare`：它依赖 WebView 自带的 ICU 与系统语言，
+ * 同一个库在两台机器上会给出不同的「前 50 篇」。排序数据必须锁在
+ * `Cargo.lock` 里（ICU4X 的 `compiled_data`），不能来自运行环境。
  */
 export function flattenVault(tree: FileNode): QuickItem[] {
   const items: QuickItem[] = []
@@ -78,7 +86,6 @@ export function flattenVault(tree: FileNode): QuickItem[] {
     for (let i = children.length - 1; i >= 0; i -= 1) stack.push(children[i])
   }
 
-  items.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   return items
 }
 
@@ -259,7 +266,7 @@ function scoreItem(item: QuickItem, query: string): number | null {
 /**
  * 查询 → 最多 `limit` 个候选。
  *
- * 空查询返回**按路径排序的前 `limit` 篇**（列表在扁平化时已经排好）。
+ * 空查询返回**树序的前 `limit` 篇**（与侧栏同序，扁平化时已经是这个顺序）。
  * 不做「最近打开」：那是第二份状态，要持久化、要失效、要跟删除对账，
  * 换来的是列表顶部几条更顺眼——不值。界面上会明说这一点。
  */
