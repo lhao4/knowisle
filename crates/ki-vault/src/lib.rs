@@ -37,6 +37,7 @@ pub mod naming;
 pub mod path;
 pub mod scan;
 pub mod search;
+pub mod sort;
 pub mod transcode;
 pub mod trash;
 pub mod write;

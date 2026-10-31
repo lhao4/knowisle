@@ -409,8 +409,9 @@ fn after_batch(batches: usize) -> Option<bool> {
 
 /// 扫描树 → 同步要的扁平文件表，按路径排序。
 ///
-/// 扫描器的顺序是「目录优先 + 名字不区分大小写」；同步只要一个确定性顺序，
-/// 这样两批之间的分界在同样的输入下总是一样的（便于复现问题）。
+/// **必须自己再排一次，不能直接吃树的顺序**：树序是**显示序**（拼音 + 数字
+/// 感知，ADR-016），它随 ICU 的数据版本变；同步的分批边界要与「同一份输入」
+/// 绑定，而不是与用户看到的顺序绑定。按 path 的码位排是最便宜、最稳的尺子。
 fn sorted_files(scan: &ScanResult) -> Vec<FileRef> {
     let mut files = flatten_files(&scan.tree);
     files.sort_by(|a, b| a.path.cmp(&b.path));

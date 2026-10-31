@@ -16,6 +16,9 @@ walkdir = { workspace = true }
 dunce = { workspace = true }
 encoding_rs = { workspace = true }
 chardetng = { workspace = true }
+icu_collator = { workspace = true }
+icu_locale_core = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

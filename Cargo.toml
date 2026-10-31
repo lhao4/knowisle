@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -57,6 +57,20 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 specta = { version = "=2.0.0-rc.26", features = ["derive", "function"] }
 specta-typescript = "=0.0.13"
 tauri-specta = { version = "=2.0.0-rc.26", features = ["derive", "typescript"] }
+
+# ---- 显示序（ADR-016）----
+# 树里同层条目的排序：拼音 + 数字感知 + 规范化 + 大小写折叠，一次全给。
+# 选它而不是 `pinyin` crate 或手写表：手写表要自己做「多音字取常用读音 +
+# 规范化 + 数字分段 + 大小写折叠」四件事，后两件是 Unicode 算法不是一张表。
+# `compiled_data` = 数据编进二进制，不读系统 ICU，版本锁在 Cargo.lock（确定性）。
+# **`=2.4.0` 是 MSRV 的下界**：2.4 要求 rustc 1.88（见 1.8 版本矩阵）。
+icu_collator = { version = "2.4", features = ["compiled_data"] }
+# 只为把 `zh` 解析成 `Locale` 再交给 `CollatorPreferences`；ICU 的 locale 与
+# 排序偏好在大版本 2.0 之后分成了两个类型，绕不开。
+icu_locale_core = "2.4"
+# 排序键的内联容器：10k 条目平均键长 9.8 字节，24 字节内联后比较是栈上
+# memcmp，且省掉 10k 次堆分配。它已经在依赖树里（ICU 自己也在用）。
+smallvec = "1"
 
 # ---- 发布构建 ----
 # 默认 release（opt-level=3 / 无 LTO / codegen-units=16 / 不 strip）产出 10.3MB。

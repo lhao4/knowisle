@@ -13,6 +13,8 @@
 //! - **错误只跳过不传播**：单个文件权限不足不该让整次扫描失败。
 //! - **路径一律 POSIX**：见 `crate::path` 的说明。
 //! - **非 UTF-8 文件名跳过**：绝不 `unwrap()`，也绝不塞替换字符。
+//! - **走查序 ≠ 显示序**：`sort_by_file_name`（码位）决定截断边界（ADR-015），
+//!   树里同层的顺序由 [`crate::sort`] 给（拼音 + 数字感知，ADR-016）。两件事。
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -28,6 +30,7 @@ use ki_core::{FileNode, KiError, NoteContent, ScanResult};
 use crate::encoding;
 use crate::ignore;
 use crate::path::{to_posix, ResolvedVault};
+use crate::sort;
 
 /// 纳入笔记树的扩展名（大小写不敏感）。
 const NOTE_EXTENSIONS: &[&str] = &["md", "markdown"];
@@ -600,18 +603,17 @@ fn parent_of(path: &str) -> &str {
     }
 }
 
-/// 目录在前，然后按名称不区分大小写排序，最后用原名兜底保证稳定。
+/// 组树：同层条目按**显示序**排（[`crate::sort`]），不是走查序。
 ///
-/// 注意：中文按 Unicode 码位排序，不是拼音序。M0 接受这一点；
-/// 真正的自然排序（拼音 / 数字感知）等有用户抱怨再说。
-fn compare_entries(a: &RawEntry, b: &RawEntry) -> std::cmp::Ordering {
-    b.is_dir
-        .cmp(&a.is_dir)
-        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        .then_with(|| a.name.cmp(&b.name))
-}
-
+/// # 为什么键在这里预计算，而不是在 `compare` 里现算
+///
+/// 排序点只有这一处（每个 parent 分组排一次），10k 条目约 1.3×10⁵ 次比较。
+/// 每次比较都构造一次排序器或生成一次排序元素，代价就随 `n log n` 涨；
+/// 整表算一次键之后，比较阶段是纯 `memcmp`。门禁③的实测见 ADR-016。
 fn build_tree(flat: &[RawEntry], prune_empty_dirs: bool) -> FileNode {
+    let sorter = sort::Sorter::new();
+    let keys: Vec<sort::SortKey> = flat.iter().map(|entry| sorter.key(&entry.name)).collect();
+
     let mut by_parent: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, entry) in flat.iter().enumerate() {
         by_parent
@@ -620,7 +622,23 @@ fn build_tree(flat: &[RawEntry], prune_empty_dirs: bool) -> FileNode {
             .push(index);
     }
     for indices in by_parent.values_mut() {
-        indices.sort_by(|&a, &b| compare_entries(&flat[a], &flat[b]));
+        // `sort_unstable_by` 而不是 `sort_by`：比较器是**全序**（最后一级是原名，
+        // 同一层里不存在两个同名条目），没有相等元素要靠稳定性保序。
+        // 稳定排序要多一份 n/2 的临时缓冲与搬运，10k 夹具实测差 1–2 ms。
+        indices.sort_unstable_by(|&a, &b| {
+            sort::compare(
+                sort::Entry {
+                    is_dir: flat[a].is_dir,
+                    name: &flat[a].name,
+                    key: &keys[a],
+                },
+                sort::Entry {
+                    is_dir: flat[b].is_dir,
+                    name: &flat[b].name,
+                    key: &keys[b],
+                },
+            )
+        });
     }
     assemble("", "", 0, flat, &by_parent, prune_empty_dirs)
 }

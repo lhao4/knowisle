@@ -334,7 +334,9 @@ impl SearchIndex {
         let root = PathBuf::from(scan.root);
 
         let mut entries = crate::scan::flatten_files(&scan.tree);
-        // 扫描器的顺序是「目录优先 + 名字不区分大小写」；索引只要一个确定性顺序。
+        // 树序是**显示序**（拼音 + 数字感知，ADR-016），随 ICU 数据版本变；
+        // 索引只要一个与「同一份输入」绑定的确定性顺序，所以这里按 path 码位
+        // 再排一次。别把它删掉去「省一次排序」——那会让分批边界跟着排序器漂。
         entries.sort_by(|a, b| a.path.cmp(&b.path));
 
         let mut files = Vec::with_capacity(entries.len());
