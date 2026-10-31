@@ -16,7 +16,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { QUICK_VAULT, RESCAN_VAULT } from './env.mjs'
+import { PROBE_VAULT, QUICK_VAULT, RESCAN_VAULT } from './env.mjs'
 
 /**
  * 兜底：这些脚本会 `unlink` / `rmSync`，绝不允许被指向真人的库。
@@ -309,5 +309,51 @@ export function prepareRescanVault() {
     )
   }
 
+  return { root, count: Object.keys(files).length }
+}
+
+/* ─────────────────── 「树自己刷新」的夹具（ADR-018） ─────────────────── */
+
+/**
+ * 造一个「树里有什么」能被 Node 侧一步步改掉的库。
+ *
+ * # 每个目录都对应一条判据
+ *
+ * | 目录 | 子项 | 默认展开 | 服务于 |
+ * |---|---|---|---|
+ * | `inbox/` | 2 | 是（depth 0 且 ≤ 8） | 判据 7：关掉面板后补的那一次，新文件落在**已展开**的目录里，看见它不需要任何展开逻辑 |
+ * | `notes/` | 9 | 否（> 8） | 判据 1/2/3/5/6：当前笔记的家，脚本手动展开；也是「新目录」的父目录 |
+ * | `deep/` | 1（`sub/` 折叠） | 是 | 判据 3 的反面素材：没动过的目录不许被自动重扫弹开 |
+ *
+ * 判据 1 要的「新子目录」不在夹具里——它由脚本自己 `mkdir` 出来，
+ * 因为「树里先是没它、切回来才有」才是那条判据的全部内容。
+ */
+export function prepareProbeVault() {
+  const root = PROBE_VAULT
+  assertTempVault(root)
+  fs.mkdirSync(root, { recursive: true })
+  // 整块清：上一轮脚本造出来的 `notes/新来的/` 是个空目录，留着会让
+  // 「树里没有这个目录」的前置断言在第二次运行时恒假（B-32）。
+  wipeVault(root)
+  clearTrash(root)
+
+  const files = {
+    'inbox/one.md': '# 第一封\n\n收件箱里的第一封。\n',
+    'inbox/two.md': '# 第二封\n\n收件箱里的第二封。\n',
+    'notes/alpha.md': '# alpha\n\n当前笔记：自动重扫时编辑器不许动。\n',
+    'notes/beta.md': '# beta\n\n非当前笔记：用来验「外部删除后自己消失」。\n',
+    'notes/gamma.md': '# gamma\n\n改名的那一篇。\n',
+    'deep/sub/leaf.md': '# leaf\n\n`deep/sub` 默认折叠（depth 1）。\n',
+  }
+  // 9 个子项 → `notes` 默认折叠（`depth === 0 && children <= 8` 才自动展开）。
+  // 判据 2/3 的断言必须先手动展开它，否则「树里没有」证明不了任何事。
+  for (let i = 0; i < 6; i += 1) {
+    files[`notes/fill-${i}.md`] = `# fill-${i}\n\n填充篇。\n`
+  }
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(root, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content, 'utf8')
+  }
   return { root, count: Object.keys(files).length }
 }

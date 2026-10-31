@@ -18,6 +18,7 @@ import { useSearch } from './hooks/useSearch'
 import { useSkipList } from './hooks/useSkipList'
 import { useSidebar } from './hooks/useSidebar'
 import { useTrash } from './hooks/useTrash'
+import { useTreeProbe } from './hooks/useTreeProbe'
 import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { revalidate } from './lib/revalidate'
@@ -550,7 +551,12 @@ export default function App() {
   )
 
   /**
-   * 重扫一次库：让**树与磁盘对齐**。两个入口（侧栏头部 / 忽略规则面板）共用它。
+   * 重扫一次库：让**树与磁盘对齐**。三个入口（侧栏头部 / 忽略规则面板 /
+   * 聚焦探针）共用它。
+   *
+   * 返回值是「这次扫描到底发生了没有」：`false` = 被闸门挡住、或扫描失败。
+   * 聚焦探针（`useTreeProbe`）靠它决定要不要重建基线——**失败不刷基线**，
+   * 否则库目录临时读不了的那一次会把「读不到」记成基线，恢复之后再也探不到。
    *
    * # 为什么必须是「整库重扫」而不是「重新读配置」
    *
@@ -577,10 +583,10 @@ export default function App() {
    * `setVault(null)` 会让用户正在看的树瞬间消失，而他只是点了一下刷新。
    * 错误走顶栏横幅，树留在原地。
    */
-  const rescanVault = useCallback(async () => {
-    if (!vault) return
+  const rescanVault = useCallback(async (): Promise<boolean> => {
+    if (!vault) return false
     // 闸门必须在 `await` **之前**同步置位。见 `rescanGate` 的注释。
-    if (rescanGate.current) return
+    if (rescanGate.current) return false
     rescanGate.current = true
     setRescanning(true)
     const root = vault.root
@@ -592,8 +598,10 @@ export default function App() {
       applyVault(result, { keepTrash: true })
       setMissingNote(watching !== null && !hasPath(result.tree, watching) ? watching : null)
       setError(null)
+      return true
     } catch (err) {
       setError(describeError(err))
+      return false
     } finally {
       rescanGate.current = false
       setRescanning(false)
@@ -993,6 +1001,53 @@ export default function App() {
   }, [vault, activeNote])
 
   /**
+   * 自动重扫的避让条件：**有东西盖在树上、或正在写盘**时不探。
+   *
+   * 为什么不是「探了也不影响」：树换了对象，`FileTree` 的节点虽然按
+   * `key={child.path}` 复用（展开态不丢），但面板里那些**正在被读的内容**
+   * 会与树对不上——回收站翻到第 2 页、忽略规则面板正展示「当前生效的规则」、
+   * 名字输入框正在等一个回车。这些时刻让树在背后换掉，用户看到的是
+   * 「我读到的说明」与「我看到的树」互相矛盾。
+   *
+   * 命中时探针**记 pending**，门开了补一次（判据 7）——不是丢掉这一次。
+   *
+   * `encodingRunning` 也算：批量转存正在逐篇改磁盘编码，此刻重扫既没有意义，
+   * 又会把索引失效一次。
+   *
+   * 名字输入框（`prompt`）本身就是模态（`.prompt-backdrop`），所以「面板开着」
+   * 与「输入框聚焦」在这里是同一个条件，不另设第二道判断。
+   */
+  const probeBlocked =
+    trashOpen ||
+    paletteOpen ||
+    searchOpen ||
+    encodingOpen ||
+    encodingConfirmOpen ||
+    encodingRunning ||
+    skipOpen ||
+    ignoreOpen ||
+    prompt !== null ||
+    menu !== null ||
+    deleteTarget !== null ||
+    purgeOpen ||
+    reloadConfirm ||
+    transcodeOpen
+
+  /**
+   * 树自己刷新：窗口**真的离开过**之后，比一次目录指纹，变了就重扫。
+   *
+   * 它复用 `rescanVault`（不另写扫描路径），因此继承 ADR-017 的全部约束：
+   * 不 flush、不重取回收站、不动 `activeNote`。`missingNote` 照旧由
+   * `rescanVault` 算——文件被外部删掉时，聚焦就能看到提示，不用先点按钮。
+   */
+  const { onFocus: onTreeFocus, onBlur: onTreeBlur } = useTreeProbe({
+    vault,
+    rescanning,
+    blocked: probeBlocked,
+    rescan: rescanVault,
+  })
+
+  /**
    * 窗口重新获得焦点时，核对当前这篇在磁盘上还是不是我们以为的那一版。
    *
    * # 为什么是「聚焦时校验」而不是 watcher
@@ -1086,17 +1141,34 @@ export default function App() {
     // `window` 的 focus 是 CDP 能可靠派发的那个事件（`Page.bringToFront`
     // 不会）。`visibilitychange` 补的是「最小化再还原」：部分 WebView2
     // 版本上它不伴随 window focus。
-    const run = () => checkRef.current()
+    //
+    // # 只有这一套监听
+    //
+    // 聚焦之后要做的两件事都从这里出发：校验**当前这一篇**（内容，ADR-011）
+    // 与探一次**整库的形状**（树，ADR-018）。分两个 effect 各挂一套的话，
+    // 一次聚焦会跑两遍——在探针这边那是两次整树 readdir，在内容这边是两次
+    // 读盘 + 两次 setState。
+    //
+    // `blur` 只服务探针：它要判「离开过多久」（`AWAY_MIN_MS`）。内容校验
+    // 不需要它——聚焦时问一次磁盘就够了。
+    const run = () => {
+      checkRef.current()
+      onTreeFocus()
+    }
+    const away = () => onTreeBlur()
     const onVisible = () => {
       if (document.visibilityState === 'visible') run()
+      else away()
     }
     window.addEventListener('focus', run)
+    window.addEventListener('blur', away)
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       window.removeEventListener('focus', run)
+      window.removeEventListener('blur', away)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [])
+  }, [onTreeFocus, onTreeBlur])
 
   /**
    * 接受磁盘上的版本（横幅上的「重新加载」）。

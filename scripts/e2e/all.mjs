@@ -31,6 +31,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
  * - `rescan` 紧跟 `tree`：两条都在改同一类东西（树里有没有那一项），而
  *   `rescan` 的判据里有一半是「重扫前后树对不对得上」。排在 `outline` /
  *   `keys` 之前，是因为它自己会重启应用、且需要一个没被别的脚本动过的库。
+ * - `tree-probe` 紧跟 `rescan`：它验的是「聚焦时自动重扫」，与 `rescan`
+ *   共用同一条 `rescanVault`，排在它后面能第一时间发现「手动那条被改坏了」。
+ *   它有自己的夹具库（`knowisle-e2e-probe`），不依赖 `rescan` 的残留。
  * - 其余各自一个夹具库，互不干扰。
  */
 const STEPS = [
@@ -38,6 +41,7 @@ const STEPS = [
   ['e2e:trash-restore', 'cdp-trash-restore.mjs', '回收站：恢复的降级与撞名'],
   ['e2e:tree', 'cdp-tree.mjs', '文件树：删除 + 新建 / 重命名'],
   ['e2e:rescan', 'cdp-rescan.mjs', '重新扫描：树对齐 / 状态保留 / 对账'],
+  ['e2e:tree-probe', 'cdp-tree-probe.mjs', '树自己刷新：聚焦探针 / 避让 / 不误触发'],
   ['e2e:outline', 'cdp-outline.mjs', '大纲：跟随光标 / 折叠 / 计数'],
   ['e2e:keys', 'cdp-keys.mjs', '快捷键：新建 / 保存 / 加粗 / 斜体'],
   ['e2e:theme', 'cdp-theme.mjs', '主题：三态切换 / 对比度 / 闪烁'],

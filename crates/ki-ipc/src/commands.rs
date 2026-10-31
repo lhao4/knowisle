@@ -19,8 +19,8 @@ use ki_core::{
 };
 use ki_vault::trash as trash_ops;
 use ki_vault::{
-    create_note, delete_note, read_note, rename_note, scan_vault, transcode_to_utf8, write_note,
-    ScanOptions,
+    create_note, delete_note, dir_fingerprint, read_note, rename_note, scan_vault,
+    transcode_to_utf8, write_note, ScanOptions,
 };
 
 use crate::{autosave, search};
@@ -78,6 +78,40 @@ pub async fn vault_scan(root: String) -> Result<ScanResult, KiError> {
         let scan = scan_vault(&root, &ScanOptions::default())?;
         search::spawn_after_scan(&root, &scan);
         Ok(scan)
+    })
+    .await
+}
+
+/// 整棵树的**形状指纹**：所有目录的相对路径 + 每个目录下的条目名集合，哈希成 hex。
+///
+/// # 它只回答一个问题
+///
+/// 「自上次扫描之后，磁盘上有没有多 / 少 / 改名过任何目录或笔记？」
+/// 内容变化**不归它管**：那是 `note_status` + 聚焦校验的事，两者刻意不互相调用。
+///
+/// # 为什么是名字集合，不是目录 mtime（ADR-018 门禁②）
+///
+/// 门禁②实测：只比对库根 mtime 抓不到子目录里的任何增删；而项目自己的保存是
+/// `tmp → fsync → rename`，**每次保存都改所在目录的 mtime**——拿 mtime 当指纹，
+/// 自己敲一个字就会被判成「外部变了」。名字集合对这两件事都免疫：保存不改名字，
+/// 外部新建 / 删除 / 改名都改名字。
+///
+/// # 代价
+///
+/// 只 `read_dir`：不 stat 文件、不读正文。10k 篇 / 100 目录的实测见 ADR-018。
+///
+/// # 失败
+///
+/// 库根读不出来时返回错误。调用方**不许**在失败时刷新基线——库目录临时不可读
+/// 时刷了基线，恢复之后就再也探不到了。
+#[tauri::command]
+#[specta::specta]
+pub async fn vault_fingerprint(root: String) -> Result<String, KiError> {
+    run_blocking(move || {
+        let root = PathBuf::from(root);
+        // 与 `vault_scan` 同一份规则：否则 `.knowisle` 里写索引会触发自己重扫。
+        let rules = ki_vault::ignore::load(&root);
+        dir_fingerprint(&root, &rules)
     })
     .await
 }

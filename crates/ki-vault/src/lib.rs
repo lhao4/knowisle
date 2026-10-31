@@ -32,6 +32,7 @@
 pub mod autosave;
 pub mod encoding;
 pub mod fileops;
+pub mod fingerprint;
 pub mod ignore;
 pub mod naming;
 pub mod path;
@@ -45,6 +46,7 @@ pub mod write;
 pub use autosave::{SaveThrottle, AUTOSAVE_INTERVAL};
 pub use encoding::{Decoded, EncodeError, Encoding, Undecodable};
 pub use fileops::{create_note, delete_note, rename_note};
+pub use fingerprint::dir_fingerprint;
 pub use ignore::{config_path, load as load_ignore_rules, CONFIG_FILE};
 pub use naming::normalize_note_name;
 pub use path::{resolve_for_write, resolve_in_vault, to_posix, ResolvedVault};

@@ -36,7 +36,7 @@ pub use commands::{
     app_ping, note_create, note_delete, note_edit, note_flush, note_read, note_rename, note_save,
     note_rebase, note_status, note_transcode_batch, note_transcode_cancel,
     note_transcode_progress, note_transcode_to_utf8, trash_list, trash_purge, trash_restore,
-    vault_encoding_stats, vault_scan, vault_search, vault_skipped_notes,
+    vault_encoding_stats, vault_fingerprint, vault_scan, vault_search, vault_skipped_notes,
 };
 
 use tauri_specta::{Builder, ErrorHandlingMode};
@@ -55,6 +55,7 @@ pub fn ipc_builder<R: tauri::Runtime>() -> Builder<R> {
     Builder::<R>::new()
         .commands(tauri_specta::collect_commands![
             vault_scan,
+            vault_fingerprint,
             vault_search,
             vault_encoding_stats,
             vault_skipped_notes,

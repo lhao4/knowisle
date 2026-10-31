@@ -23,6 +23,7 @@
     "e2e:trash-page": "node scripts/e2e/cdp-trash-page.mjs",
     "e2e:tree": "node scripts/e2e/cdp-tree.mjs",
     "e2e:rescan": "node scripts/e2e/cdp-rescan.mjs",
+    "e2e:tree-probe": "node scripts/e2e/cdp-tree-probe.mjs",
     "e2e:outline": "node scripts/e2e/cdp-outline.mjs",
     "e2e:keys": "node scripts/e2e/cdp-keys.mjs",
     "e2e:theme": "node scripts/e2e/cdp-theme.mjs",

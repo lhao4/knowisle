@@ -571,7 +571,11 @@ fn should_descend(entry: &DirEntry, matcher: &ignore::Matcher) -> bool {
     }
 }
 
-fn is_note(path: &Path) -> bool {
+/// 这个路径是不是一篇笔记（按扩展名，大小写不敏感）。
+///
+/// `pub(crate)`：目录指纹（[`crate::fingerprint`]）必须用**同一条**判据，
+/// 否则会出现「树里有这篇、指纹不认」的静默分叉。
+pub(crate) fn is_note(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {

@@ -101,6 +101,20 @@ export const IGNORE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-ignore-rules')
  */
 export const RESCAN_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-rescan')
 
+/**
+ * 「树自己刷新」（B-09 ②，ADR-018）的夹具库。
+ *
+ * 单独一个库，理由与上面几条相同，而且这里更硬：脚本会**从 Node 侧**
+ * 在子目录里新建 / 删除 / 改名笔记，还会反复「切走切回」——判据全是
+ * 「切回来之后树里有什么」，而树里有什么取决于磁盘起点。与 `RESCAN_VAULT`
+ * 共用会让本脚本的起点被上一个脚本（它会删 `notes/beta.md`、改名
+ * `notes/gamma.md`）改掉（B-32）。
+ *
+ * 规模刻意小（30 篇 / 4 个目录）：探针每次聚焦要 readdir 一遍全库，
+ * 夹具越大，10 次「切走切回」越慢，而判据与规模无关。
+ */
+export const PROBE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-probe')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 
