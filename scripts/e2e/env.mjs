@@ -87,6 +87,20 @@ export const SKIP_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-skip-list')
  */
 export const IGNORE_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-ignore-rules')
 
+/**
+ * 「重新扫描」（B-09 ①，ADR-017）的夹具库。
+ *
+ * 单独一个库，理由与上面几条相同，但这里更硬：脚本会**从 Node 侧**
+ * 新建目录 / 删当前笔记 / 改名当前笔记 / 把库目录整个改名，还会往回收目录里
+ * 直接造 250 条记录（判据 5 要翻到第 2 页）。与任何别的脚本共用库，都会让
+ * 「重扫前磁盘上是什么」依赖上一个脚本跑没跑过（B-32）。
+ *
+ * 规模也是判据的一部分：`bulk/` 2000 篇只为一个目的——让重扫之后的索引同步
+ * 窗口足够宽，宽到能在里面打开搜索面板（判据 7）。树里它是折叠的（> 8 个子项），
+ * 不占渲染。
+ */
+export const RESCAN_VAULT = path.join(os.tmpdir(), 'knowisle-e2e-rescan')
+
 /** 脚本产物（验收报告 JSON、截图）。**只写不读**：脚本不许依赖这里的残留。 */
 export const OUT_DIR = path.join(REPO, '.tmp')
 

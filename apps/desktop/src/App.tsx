@@ -22,6 +22,7 @@ import { ONBOARDED_KEY, shouldAutoPick } from './lib/first-run'
 import type { OutlineItem } from './lib/outline'
 import { revalidate } from './lib/revalidate'
 import { useTheme } from './lib/theme'
+import { hasPath } from './lib/tree'
 import { truncationNotice } from './lib/truncation'
 import {
   appPing,
@@ -164,8 +165,30 @@ export default function App() {
   const [ignoreOpen, setIgnoreOpen] = useState(false)
   /** 面板容器。挂载时聚焦、Esc 与 Tab 环都挂在它上面。 */
   const ignorePanelRef = useRef<HTMLDivElement>(null)
-  /** 面板里那个「重新扫描」在飞。 */
-  const [ignoreRescanning, setIgnoreRescanning] = useState(false)
+  /**
+   * 「重新扫描」在飞。
+   *
+   * 两个入口共用它（侧栏头部 / 忽略规则面板）：分开两个 state 的话，
+   * 「面板里在扫、侧栏又点了一下」就挡不住，而两次扫描会让索引失效两次。
+   */
+  const [rescanning, setRescanning] = useState(false)
+  /**
+   * 重扫的互斥闸门。
+   *
+   * **不能用 `rescanning` 这个 state 当锁**：`setRescanning(true)` 要等下一次
+   * 渲染才生效，而同一个任务里连点的五下会全部走进 `onClick`——门禁③实测
+   * 改前连点 5 次发出 **5 次** IPC。ref 在 `await` 之前同步置位，第二下
+   * 进来时它已经是 true。
+   */
+  const rescanGate = useRef(false)
+  /**
+   * 重扫之后「当前这篇不在新树里」的那条路径。`null` = 没有要提示的。
+   *
+   * 它是**提示**，不是动作：不关编辑器、不动缓冲区、不清撤销栈（ADR-017）。
+   * 换到别的笔记时它自然不再显示（渲染时要求与 `activeNote.path` 相等），
+   * 切回来还在——因为「它不在树里」这个事实没变。
+   */
+  const [missingNote, setMissingNote] = useState<string | null>(null)
 
   /**
    * 主题。
@@ -485,11 +508,17 @@ export default function App() {
    * 回收站也在这里刷新：删完 / 清空完都会走一次扫描，而徽标上的数字必须
    * 与那次磁盘变化同步——否则用户删了一篇，侧栏还写着「回收站 0」。
    *
-   * # `keepTrash`：恢复一条时唯一要跳过的那一步
+   * # `keepTrash`：两个调用点，同一条理由
    *
-   * 恢复也要重扫（树里要出现那篇笔记），但**不能**重取回收站：整页重取会
-   * 把正在看第 5 页的用户弹回第 1 页，而 keyset 存在的全部理由就是不让这件
-   * 事发生。那一行由 `settleRestore` 本地移除，`total` 跟着减 1。
+   * 1. **恢复一条**：恢复也要重扫（树里要出现那篇笔记），但**不能**重取
+   *    回收站——整页重取会把正在看第 5 页的用户弹回第 1 页，而 keyset 存在
+   *    的全部理由就是不让这件事发生。那一行由 `settleRestore` 本地移除，
+   *    `total` 跟着减 1。
+   * 2. **重扫**（ADR-017）：回收站不在「树对齐」的语义里。用户点的是刷新
+   *    侧栏，凭什么把他正在翻的那一页收走。
+   *
+   * 代价写在 ADR-017 里：跳过一次刷新之后，回收站徽标会短暂变旧（它只在
+   * 自己的动作里变）。可接受——重扫不增删回收站条目。
    */
   const applyVault = useCallback(
     (result: ScanResult | null, options?: { keepTrash?: boolean }) => {
@@ -521,7 +550,7 @@ export default function App() {
   )
 
   /**
-   * 重扫一次库（忽略规则面板里那个按钮）。
+   * 重扫一次库：让**树与磁盘对齐**。两个入口（侧栏头部 / 忽略规则面板）共用它。
    *
    * # 为什么必须是「整库重扫」而不是「重新读配置」
    *
@@ -530,19 +559,46 @@ export default function App() {
    *
    * 面板不关：重扫完 `vault` 换了新对象，面板立刻显示新的规则。关掉再让
    * 用户点开一次，等于让他怀疑自己刚才那一下有没有生效。
+   *
+   * # 三件事刻意不做（ADR-017）
+   *
+   * 1. **不 flush**：重扫是读操作。`flushActiveNote` 在文件已经没了时必然
+   *    失败（乐观锁把「不存在」也算冲突），于是用户点「刷新」的瞬间会多出
+   *    一条与刷新无关的错误横幅；文件还在时它又平白写一次盘。两头都不该做。
+   * 2. **不重取回收站**（`keepTrash`）：回收站不在「树对齐」的语义里。
+   *    `useTrash.refresh` 永远从 `cursor = null` 重取，会把正在翻第 5 页的
+   *    用户弹回第 1 页；keyset 分页存在的全部理由就是不让这件事发生。
+   * 3. **不动 `activeNote` 的 path / docId**：改名跟随是另一件事。重扫只
+   *    报告事实（那一篇还在不在树里），怎么处置由用户决定。
+   *
+   * # 失败不清树
+   *
+   * `vaultScan` 抛错时**不调用** `applyVault`：库目录被删 / 没权限时，
+   * `setVault(null)` 会让用户正在看的树瞬间消失，而他只是点了一下刷新。
+   * 错误走顶栏横幅，树留在原地。
    */
   const rescanVault = useCallback(async () => {
     if (!vault) return
-    setIgnoreRescanning(true)
+    // 闸门必须在 `await` **之前**同步置位。见 `rescanGate` 的注释。
+    if (rescanGate.current) return
+    rescanGate.current = true
+    setRescanning(true)
+    const root = vault.root
+    // 对账对象取**开始重扫时**正在编辑的那一篇：扫完再读 `activeNote` 会拿到
+    // 用户在这期间切过去的那一篇，提示就说错了人。
+    const watching = activeNote?.path ?? null
     try {
-      applyVault(await vaultScan(vault.root))
+      const result = await vaultScan(root)
+      applyVault(result, { keepTrash: true })
+      setMissingNote(watching !== null && !hasPath(result.tree, watching) ? watching : null)
       setError(null)
     } catch (err) {
       setError(describeError(err))
     } finally {
-      setIgnoreRescanning(false)
+      rescanGate.current = false
+      setRescanning(false)
     }
-  }, [vault, applyVault])
+  }, [vault, activeNote, applyVault])
 
   /**
    * 侧栏域。它要知道另外两个域的全屏浮层：`Mod+N` 叠层会让 Esc 没有答案。
@@ -845,6 +901,8 @@ export default function App() {
       setOutline([])
       // 换库：上一轮的"露出来"和浮层都不再指向任何东西。
       setRevealPath(null)
+      // 对账提示也一样：上一条说的是上一个库里的某篇笔记。
+      setMissingNote(null)
       resetSidebarOverlays()
       localStorage.setItem(LAST_VAULT_KEY, result.root)
     } catch (err) {
@@ -1238,6 +1296,34 @@ export default function App() {
       )}
 
       {/*
+        重扫之后的对账：正在编辑的这一篇还在不在树里（ADR-017）。
+
+        # 为什么是「提示」而不是任何自动动作
+
+        重扫是用户为了「看看磁盘上现在有什么」点的，它不该顺手改变编辑器。
+        关掉这篇、清掉缓冲区、重建编辑器（清撤销栈）——三件事都会让用户
+        丢掉正在写的东西，而他的本意只是刷新一下侧栏。
+
+        # 为什么文案说「保存会被拒绝」
+
+        门禁②实测：文件被外部删掉之后，`note_status` 仍报 `dirty:false`、
+        `lastError:null`、`lastSavedMtime` 是旧值——槽位不知道文件没了。
+        而 `write_note_checked` 把「文件不存在」也算冲突（`diskMtime: null`），
+        所以保存**不会**静默把文件写回来，它会被拒绝。真正会复活那个路径的
+        是冲突横幅上的「用我的版本覆盖」。文案必须对得上这条实测契约，
+        否则它就是在教用户一个不存在的危险（§2.C 的「修」与「说出来」）。
+      */}
+      {missingNote !== null && activeNote !== null && missingNote === activeNote.path && (
+        <div className="banner banner--warn banner--missing" role="alert">
+          <span>
+            {noteName(missingNote)} 不在树里了：磁盘上可能被其它程序删除或改名。
+            你可以继续编辑（撤销也还在），但直接保存会被拒绝（冲突）——
+            点「用我的版本覆盖」才会重新创建它。
+          </span>
+        </div>
+      )}
+
+      {/*
         截断横幅。数字取 `vault.limitEntries`，**不许写死**：上限是
         `ScanOptions.max_entries`，它不进 IPC，只能经 `ScanResult` 带出来。
         文案在 `lib/truncation.ts`（判据 5 的断言在那里）。
@@ -1264,6 +1350,29 @@ export default function App() {
                   title={createDir === '' ? '在 Vault 根目录新建' : `在 ${createDir} 新建`}
                 >
                   ＋ 新建
+                </button>
+                {/*
+                  重扫的**常驻**入口。在它之前，「重新扫描」只存在于忽略规则
+                  面板里——用户带着「我在别的编辑器里新建了一篇」来，不会想到
+                  去翻忽略规则。而 `describeError` 那句「保存前请重新扫描库」
+                  从 M3 起就在指一个没有落点的动作（ADR-017）。
+
+                  类名只挂 `rescan-btn`：`.trash-link` / `.ignore-link` 都是
+                  e2e 的定位钩子（`querySelector` 取第一个匹配），共享样式走
+                  各自的 CSS，不靠叠类名（第十三刀的返工）。
+                */}
+                <button
+                  type="button"
+                  className="btn btn--small rescan-btn"
+                  onClick={() => void rescanVault()}
+                  disabled={rescanning}
+                  aria-label={rescanning ? '扫描中…' : '重新扫描'}
+                  title="重新扫描这个库：外部新建 / 删除 / 改名之后，用它让树与磁盘对齐（不会动正在编辑的笔记）"
+                >
+                  <span className="rescan-btn__icon" aria-hidden="true">
+                    ⟳
+                  </span>
+                  {rescanning ? '扫描中…' : '重新扫描'}
                 </button>
               </div>
               <div className="sidebar__root" title={vault.root}>
@@ -1723,7 +1832,7 @@ export default function App() {
         <IgnorePanel
           panelRef={ignorePanelRef}
           rules={vault.ignoreRules}
-          rescanning={ignoreRescanning}
+          rescanning={rescanning}
           onRescan={() => void rescanVault()}
           onClose={() => setIgnoreOpen(false)}
         />

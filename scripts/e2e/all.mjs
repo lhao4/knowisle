@@ -28,12 +28,16 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
  *   kill 会让后面脚本的 `--restart` 撞上一个正在退出的进程。
  * - `external` 紧随 `encoding`：同一条约束（要干净夹具库、不能排在
  *   `trash-page` 之后），且它自己也从 Node 侧改磁盘，与编码那条互不影响。
+ * - `rescan` 紧跟 `tree`：两条都在改同一类东西（树里有没有那一项），而
+ *   `rescan` 的判据里有一半是「重扫前后树对不对得上」。排在 `outline` /
+ *   `keys` 之前，是因为它自己会重启应用、且需要一个没被别的脚本动过的库。
  * - 其余各自一个夹具库，互不干扰。
  */
 const STEPS = [
   ['e2e:trash', 'cdp-trash.mjs', '回收站：删除 / 列表 / 恢复 / 清空'],
   ['e2e:trash-restore', 'cdp-trash-restore.mjs', '回收站：恢复的降级与撞名'],
   ['e2e:tree', 'cdp-tree.mjs', '文件树：删除 + 新建 / 重命名'],
+  ['e2e:rescan', 'cdp-rescan.mjs', '重新扫描：树对齐 / 状态保留 / 对账'],
   ['e2e:outline', 'cdp-outline.mjs', '大纲：跟随光标 / 折叠 / 计数'],
   ['e2e:keys', 'cdp-keys.mjs', '快捷键：新建 / 保存 / 加粗 / 斜体'],
   ['e2e:theme', 'cdp-theme.mjs', '主题：三态切换 / 对比度 / 闪烁'],

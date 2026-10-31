@@ -16,7 +16,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { QUICK_VAULT } from './env.mjs'
+import { QUICK_VAULT, RESCAN_VAULT } from './env.mjs'
 
 /**
  * 兜底：这些脚本会 `unlink` / `rmSync`，绝不允许被指向真人的库。
@@ -235,4 +235,79 @@ export function prepareQuickVault() {
   )
 
   return { root, count: files.length }
+}
+
+/* ───────────────────── 「重新扫描」的夹具（ADR-017） ───────────────────── */
+
+/**
+ * 造一个「重扫前后会变、但变得有据可查」的库。
+ *
+ * # 每个目录都对应一条判据，不是随便凑的
+ *
+ * | 目录 | 子项 | 默认展开 | 服务于 |
+ * |---|---|---|---|
+ * | `inbox/` | 2 | 是（depth 0 且 ≤ 8） | 判据 1 的反面：新文件落在已展开的目录里，看见它不需要任何展开逻辑 |
+ * | `notes/` | 20 | 否（> 8） | 判据 3：手动展开 → 重扫 → 仍展开；也是当前笔记的家 |
+ * | `deep/` | 2（`sub/` 折叠） | 是 | 判据 3 的反面：没动过的目录不许被重扫弹开 |
+ * | `bulk/` | 2000 | 否 | 判据 7：重扫会让索引失效，2000 篇的同步窗口足够宽（本机实测 ≈ 0.8 s），宽到能在里面开搜索 |
+ *
+ * 判据 1 要的「新目录」不在夹具里——它由脚本自己 `mkdir` 出来，
+ * 因为「树里先是没它、点完重扫才有」才是那条判据的全部内容。
+ *
+ * # 回收站直接造，不走 UI
+ *
+ * 判据 5 要「停在第 2 页」，而每页 200 条。用 UI 删 201 篇要跑 201 次
+ * 「右键 → 删除 → 确认 + 整库重扫」，那是分钟级且每步都可能被前一步的
+ * 状态影响。回收站的磁盘契约很窄（`trash/<ms>-<名>` + `trash-manifest/<entry>.json`），
+ * 直接照它写 250 条既快又确定。
+ */
+export function prepareRescanVault() {
+  const root = RESCAN_VAULT
+  assertTempVault(root)
+  fs.mkdirSync(root, { recursive: true })
+  // 整块清（不只是 `.md`）：上一轮的 `新来的/` 是个空目录，留着会让
+  // 「树里没有这个目录」这条前置断言在第二次运行时恒假（B-32）。
+  wipeVault(root)
+  clearTrash(root)
+
+  const files = {
+    'inbox/one.md': '# 第一封\n\n收件箱里的第一封。\n',
+    'inbox/two.md': '# 第二封\n\n收件箱里的第二封。\n',
+    'notes/alpha.md': '# alpha\n\n当前笔记：重扫的对账对象。\n',
+    'notes/beta.md': '# beta\n\n非当前笔记：用来验「外部删除后树里消失」。\n',
+    'notes/gamma.md': '# gamma\n\n改名的那一篇。\n',
+    'deep/other.md': '# other\n\n第二层之外的一篇。\n',
+    'deep/sub/leaf.md': '# leaf\n\n`deep/sub` 默认折叠（depth 1）。\n',
+  }
+  for (let i = 0; i < 17; i += 1) {
+    files[`notes/note-${String(i).padStart(2, '0')}.md`] = `# note-${i}\n\n第 ${i} 篇。\n`
+  }
+  for (let i = 0; i < 2000; i += 1) {
+    files[`bulk/bulk-${String(i).padStart(3, '0')}.md`] = `# bulk-${i}\n\n索引同步的填充篇。\n`
+  }
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(root, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content, 'utf8')
+  }
+
+  // 250 条回收站记录：每页 200，「加载更多」之后才有第 2 页。
+  const trashDir = path.join(root, '.knowisle', 'trash')
+  const manifestDir = path.join(root, '.knowisle', 'trash-manifest')
+  fs.mkdirSync(trashDir, { recursive: true })
+  fs.mkdirSync(manifestDir, { recursive: true })
+  const base = 1_700_000_000_000
+  for (let i = 0; i < 250; i += 1) {
+    const stamp = base + i
+    const name = `旧稿-${String(i).padStart(3, '0')}.md`
+    const entry = `${stamp}-${name}`
+    fs.writeFileSync(path.join(trashDir, entry), `# 旧稿 ${i}\n`, 'utf8')
+    fs.writeFileSync(
+      path.join(manifestDir, `${entry}.json`),
+      JSON.stringify({ origin: `notes/${name}`, deletedAt: stamp }),
+      'utf8',
+    )
+  }
+
+  return { root, count: Object.keys(files).length }
 }

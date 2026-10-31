@@ -533,6 +533,26 @@ body {
   border-bottom: 1px solid var(--ki-border-subtle);
 }
 
+/*
+ * 「重新扫描」。外观整份继承 `.btn.btn--small`（与「＋ 新建」同一套），
+ * 这里只补两件事：靠右（`margin-left: auto`）与图标和文字之间的 4px。
+ *
+ * **不加旋转动画**：一个会一直转的图标会让侧栏每帧都有视觉变化，而侧栏的
+ * 红线是「不加会持续触发重绘的东西」（CM6 每帧重测量）。「扫描中…」这四个字
+ * 已经把状态说清楚了。
+ */
+.rescan-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.rescan-btn__icon {
+  font-size: 12px;
+  line-height: 1;
+}
+
 .tree {
   flex: 1 1 auto;
   min-height: 0;
